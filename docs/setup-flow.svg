@@ -1,0 +1,294 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1070" width="1400" height="1070" role="img" aria-label="What you write versus what I2AS does: you write a driver class, a Virtual Instrument class with declared readings and controls, a devices.yaml naming instruments and limits, and optionally a procedure that turns roles and parameters into plans; the fixed framework builds the Station from that config, snapshots its declarations into StationInfo, and renders them unchanged into GUI panels, the capability manifest and the MCP tool schemas an agent reads.">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b45309"/>
+    </marker>
+    <marker id="arrB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arrP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1400" height="1070" rx="12" fill="#ffffff" stroke="#e2e8f0"/>
+
+  <g font-family="'Segoe UI', Helvetica, Arial, sans-serif" fill="#1f2937" font-size="12">
+
+    <text x="700" y="32" text-anchor="middle" font-size="16" font-weight="600">Setting up a station: what you write, what the framework builds, what the agent sees</text>
+
+    <!-- ===================== column headers ===================== -->
+    <rect x="30" y="52" width="440" height="30" rx="6" fill="#fdfaf3" stroke="#d97706"/>
+    <text x="250" y="72" text-anchor="middle" font-weight="600" fill="#92400e">1 · YOU WRITE — four things, per instrument and per experiment</text>
+
+    <rect x="510" y="52" width="380" height="30" rx="6" fill="#eef2f7" stroke="#1d4ed8"/>
+    <text x="700" y="72" text-anchor="middle" font-weight="600" fill="#1e3a8a">2 · THE FRAMEWORK — fixed, same for every setup</text>
+
+    <rect x="930" y="52" width="440" height="30" rx="6" fill="#f3eefb" stroke="#7c3aed"/>
+    <text x="1150" y="72" text-anchor="middle" font-weight="600" fill="#5b21b6">3 · WHAT THE AGENT AND THE GUI SEE</text>
+
+    <!-- ===================== LEFT: driver ===================== -->
+    <g>
+      <rect x="30" y="100" width="440" height="118" rx="10" fill="#fdfaf3" stroke="#d97706"/>
+      <circle cx="52" cy="122" r="11" fill="#d97706"/>
+      <text x="52" y="126" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700">a</text>
+      <text x="70" y="126" font-weight="600">Driver — L0 · i2as/drivers/lakeshore_335.py</text>
+      <text x="70" y="143" font-size="11" fill="#4b5563">Plain Python over VISA or serial. Only if yours is not shipped yet.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="48" y="166">class Lakeshore335:</text>
+        <text x="48" y="182">&#160;&#160;&#160;&#160;def get_temperature(self) -> float: ...&#160;&#160;# SCPI in</text>
+        <text x="48" y="198">&#160;&#160;&#160;&#160;def set_setpoint(self, kelvin: float): ...</text>
+      </g>
+      <text x="70" y="212" font-size="10.5" fill="#4b5563">Knows nothing above it. A simulated twin lets the stack run without hardware.</text>
+    </g>
+
+    <!-- ===================== LEFT: virtual instrument ===================== -->
+    <g>
+      <rect x="30" y="236" width="440" height="288" rx="10" fill="#fdfaf3" stroke="#d97706"/>
+      <circle cx="52" cy="258" r="11" fill="#d97706"/>
+      <text x="52" y="262" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700">b</text>
+      <text x="70" y="262" font-weight="600">Virtual Instrument — L1 · i2as/virtual_instruments/…</text>
+      <text x="70" y="279" font-size="11" fill="#4b5563">The declaration. Every unit, sentence and class here is what the agent reads.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="48" y="302">class SampleTemperatureControllerVI(TemperatureBase):</text>
+        <text x="48" y="322">&#160;&#160;&#160;&#160;@monitored(unit=<tspan fill="#b45309" font-weight="700">"K"</tspan>, description=</text>
+        <text x="48" y="338">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;<tspan fill="#b45309" font-weight="700">"Temperature read from the control sensor"</tspan>)</text>
+        <text x="48" y="354">&#160;&#160;&#160;&#160;def temperature(self) -> float:</text>
+        <text x="48" y="370">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;return self._main.get_temperature()&#160;&#160;# driver</text>
+        <text x="48" y="392">&#160;&#160;&#160;&#160;@control(action_class=<tspan fill="#b45309" font-weight="700">"run_control"</tspan>, params={</text>
+        <text x="48" y="408">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;"target_K": ParamSpec(float, unit=<tspan fill="#b45309" font-weight="700">"K"</tspan>,</text>
+        <text x="48" y="424">&#160;&#160;&#160;&#160;&#160;&#160;description=<tspan fill="#b45309" font-weight="700">"Temperature to ramp the controller to"</tspan>)})</text>
+        <text x="48" y="440">&#160;&#160;&#160;&#160;def set_temperature(self, target_K: float): ...</text>
+        <text x="48" y="462">&#160;&#160;&#160;&#160;control_limits = {"set_temperature":</text>
+        <text x="48" y="478">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;{"target_K": <tspan fill="#1d4ed8" font-weight="700">"max_temperature_K"</tspan>}}&#160;&#160;# from yaml</text>
+      </g>
+      <text x="70" y="500" font-size="10.5" fill="#4b5563">@monitored is a reading with a unit; @control a typed action with a class.</text>
+      <text x="70" y="514" font-size="10.5" fill="#4b5563">Conformance tests refuse a VI that leaves any blank. Drivers are injected, not imported.</text>
+    </g>
+
+    <!-- ===================== LEFT: devices.yaml ===================== -->
+    <g>
+      <rect x="30" y="542" width="440" height="252" rx="10" fill="#f0f5ff" stroke="#1d4ed8"/>
+      <circle cx="52" cy="564" r="11" fill="#1d4ed8"/>
+      <text x="52" y="568" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700">c</text>
+      <text x="70" y="568" font-weight="600">Setup config · configs/&lt;my_setup&gt;/devices.yaml + monitor.yaml</text>
+      <text x="70" y="585" font-size="11" fill="#4b5563">Which instruments this rack has, at which addresses, with which limits.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="48" y="608">real_drivers:</text>
+        <text x="48" y="624">&#160;&#160;lakeshore_vti: {class: i2as.drivers….Lakeshore335,</text>
+        <text x="48" y="640">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;address: "GPIB0::12::INSTR"}</text>
+        <text x="48" y="660">virtual_instruments:</text>
+        <text x="48" y="676">&#160;&#160;<tspan fill="#1d4ed8" font-weight="700">temperature</tspan>:</text>
+        <text x="48" y="692">&#160;&#160;&#160;&#160;class: i2as.virtual_instruments….TemperatureVI</text>
+        <text x="48" y="708">&#160;&#160;&#160;&#160;drivers: {main: lakeshore_vti}&#160;&#160;&#160;&#160;&#160;# role -> driver</text>
+        <text x="48" y="724">&#160;&#160;&#160;&#160;init_params: {<tspan fill="#1d4ed8" font-weight="700">min_temperature_K: 1.4</tspan>,</text>
+        <text x="48" y="740">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;<tspan fill="#1d4ed8" font-weight="700">max_temperature_K: 320.0</tspan>}</text>
+        <text x="48" y="756">&#160;&#160;&#160;&#160;metadata: {role: Sample temperature, model: "335"}</text>
+        <text x="48" y="776">monitor.yaml: tick_interval_ms, gateway_max_role: observer</text>
+      </g>
+    </g>
+    <text x="70" y="810" font-size="10.5" fill="#4b5563">Limits are setup properties, so they live in yaml, not code. Copy a shipped config to start.</text>
+
+
+    <!-- ===================== LEFT: procedure ===================== -->
+    <g>
+      <rect x="30" y="826" width="440" height="174" rx="10" fill="#fdfaf3" stroke="#d97706"/>
+      <circle cx="52" cy="848" r="11" fill="#d97706"/>
+      <text x="52" y="852" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="700">d</text>
+      <text x="70" y="852" font-weight="600">Procedure — L4 · i2as/procedures/my_sweep.py (four are shipped)</text>
+      <text x="70" y="869" font-size="11" fill="#4b5563">A recipe: names roles, not instruments; returns plans; never touches hardware.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="48" y="890">class MySweep(SweepMeasureProcedure):</text>
+        <text x="48" y="906">&#160;&#160;&#160;&#160;name = "My sweep"</text>
+        <text x="48" y="922">&#160;&#160;&#160;&#160;role_parameters = {"temperature_vi": RoleParam(</text>
+        <text x="48" y="938">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;candidates=lambda st: st.temperature_vi_names(),</text>
+        <text x="48" y="954">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;description=<tspan fill="#b45309" font-weight="700">"Controller this run sweeps"</tspan>)}</text>
+        <text x="48" y="970">&#160;&#160;&#160;&#160;sweep_parameters = {"rate": ParamSpec(float, unit=<tspan fill="#b45309" font-weight="700">"K/min"</tspan>)}</text>
+        <text x="48" y="986">&#160;&#160;&#160;&#160;def initiate(self) -> PhasePlan: …&#160;&#160;# targets + commands</text>
+      </g>
+    </g>
+    <text x="70" y="1016" font-size="10.5" fill="#4b5563">Drop the file in i2as/procedures/. Any named BaseProcedure subclass is discovered at launch.</text>
+
+    <!-- ===================== MIDDLE: the framework ===================== -->
+    <g>
+      <rect x="510" y="100" width="380" height="900" rx="12" fill="#eef2f7" stroke="#1d4ed8" stroke-width="1.5"/>
+
+      <!-- build_station -->
+      <rect x="526" y="116" width="348" height="196" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="540" y="136" font-weight="600" fill="#1e3a8a">build_station(config_dir) → Station</text>
+      <text x="540" y="154" font-size="11" fill="#374151">The one factory. Runs on the instrument thread, at launch:</text>
+      <g font-size="11" fill="#374151">
+        <text x="540" y="176">1. reads devices.yaml and monitor.yaml</text>
+        <text x="540" y="193">2. imports each driver class, opens its address</text>
+        <text x="540" y="210">3. imports each VI class, injects its drivers by role,</text>
+        <text x="552" y="226">passes init_params — limits, coil constants, tolerances</text>
+        <text x="540" y="243">4. registers every VI in the Station by its yaml name</text>
+        <text x="540" y="260">5. an instrument that fails to connect is registered</text>
+        <text x="552" y="276">offline, never aborts the build; the GUI offers reconnect</text>
+      </g>
+      <text x="540" y="300" font-size="10.5" fill="#4b5563">i2as --config my_setup · i2as-doctor validates the yaml first</text>
+
+      <line x1="700" y1="312" x2="700" y2="342" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+
+      <!-- Station + StationInfo -->
+      <rect x="526" y="344" width="348" height="112" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="540" y="364" font-weight="600" fill="#1e3a8a">Station · station_info() → StationInfo</text>
+      <text x="540" y="382" font-size="11" fill="#374151">The frozen declaration snapshot, built once per launch from</text>
+      <text x="540" y="397" font-size="11" fill="#374151">the VI classes and the yaml, with no instrument traffic:</text>
+      <text x="540" y="416" font-size="11" fill="#374151">every <tspan fill="#b45309" font-weight="600">reading</tspan> (unit, description) · every <tspan fill="#b45309" font-weight="600">control</tspan> (params,</text>
+      <text x="540" y="431" font-size="11" fill="#374151">units, action class) · every <tspan fill="#1d4ed8" font-weight="600">configured bound</tspan> · UI groups</text>
+      <text x="540" y="448" font-size="10.5" fill="#4b5563">JSON-safe, so it crosses threads and processes unchanged.</text>
+
+      <line x1="700" y1="456" x2="700" y2="486" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+
+      <!-- the engine, one box -->
+      <rect x="526" y="488" width="348" height="150" rx="8" fill="#e2e8f0" stroke="#64748b"/>
+      <text x="540" y="508" font-weight="600" fill="#1e293b">The engine — deterministic, never edited per setup</text>
+      <g font-size="11" fill="#374151">
+        <text x="540" y="528">Orchestrator (single writer, one tick loop, state machine)</text>
+        <text x="540" y="544">Procedure base classes · the four shipped procedures</text>
+        <text x="540" y="560">Data manager (one HDF5 file per run) · run queue</text>
+        <text x="540" y="576">Session layer · agent gateway · permission matrix</text>
+        <text x="540" y="592">GUI · MCP adapter · request spool · analysis worker</text>
+      </g>
+      <text x="540" y="614" font-size="10.5" fill="#4b5563">Polls the VIs, dispatches commands within the bounds,</text>
+      <text x="540" y="628" font-size="10.5" fill="#4b5563">answers every action with a verdict. Same code on every rack.</text>
+
+      <line x1="700" y1="638" x2="700" y2="668" stroke="#334155" stroke-width="1.5" marker-end="url(#arr)"/>
+
+      <!-- rendering -->
+      <rect x="526" y="670" width="348" height="108" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="540" y="690" font-weight="600" fill="#1e3a8a">Rendered, never hand-written</text>
+      <text x="540" y="708" font-size="11" fill="#374151">StationInfo is turned into three surfaces by code that adds</text>
+      <text x="540" y="723" font-size="11" fill="#374151">no words of its own: GUI panels, the capability manifest,</text>
+      <text x="540" y="738" font-size="11" fill="#374151">and one MCP tool per (instrument, @control).</text>
+      <text x="540" y="758" font-size="10.5" fill="#4b5563">Conformance tests diff the three, so a GUI button and an</text>
+      <text x="540" y="772" font-size="10.5" fill="#4b5563">agent tool can never disagree about what the station can do.</text>
+      <!-- run catalog -->
+      <rect x="526" y="826" width="348" height="158" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="540" y="846" font-weight="600" fill="#1e3a8a">discover_procedures() → run catalog → run_builder</text>
+      <text x="540" y="864" font-size="11" fill="#374151">At launch, every named BaseProcedure subclass found in</text>
+      <text x="540" y="879" font-size="11" fill="#374151">i2as/procedures/ goes into the catalog {class name → class}.</text>
+      <text x="540" y="898" font-size="11" fill="#374151">A run request names the class. build_procedure() resolves</text>
+      <text x="540" y="913" font-size="11" fill="#374151">each role against the Station, validates every param against</text>
+      <text x="540" y="928" font-size="11" fill="#374151">its ParamSpec and the setup limits, and refuses by name</text>
+      <text x="540" y="943" font-size="11" fill="#374151">if it cannot honour the run — at queue time, not an hour in.</text>
+      <text x="540" y="962" font-size="10.5" fill="#4b5563">The engine (above) pulls the built run from the queue and</text>
+      <text x="540" y="976" font-size="10.5" fill="#4b5563">dispatches its plans through the Station, within the bounds.</text>
+    </g>
+
+
+    <!-- ===================== arrows left -> middle ===================== -->
+    <g stroke-width="1.5" fill="none">
+      <path d="M470,160 L484,160 L484,200 L526,200" stroke="#b45309" marker-end="url(#arrA)"/>
+      <path d="M470,380 L490,380 L490,216 L526,216" stroke="#b45309" marker-end="url(#arrA)"/>
+      <path d="M470,668 L496,668 L496,232 L526,232" stroke="#1d4ed8" marker-end="url(#arrB)"/>
+      <path d="M470,910 L526,910" stroke="#b45309" marker-end="url(#arrA)"/>
+    </g>
+    <text x="498" y="904" font-size="9.5" fill="#b45309" text-anchor="middle">class</text>
+    <text x="500" y="196" font-size="9.5" fill="#b45309">driver</text>
+    <text x="500" y="212" font-size="9.5" fill="#b45309">VI</text>
+    <text x="500" y="228" font-size="9.5" fill="#1d4ed8">yaml</text>
+
+    <!-- ===================== RIGHT: MCP tool ===================== -->
+    <g>
+      <rect x="930" y="100" width="440" height="250" rx="10" fill="#f3eefb" stroke="#7c3aed"/>
+      <text x="944" y="122" font-weight="600" fill="#5b21b6">MCP tool, as the agent receives it from tools/list</text>
+      <text x="944" y="139" font-size="11" fill="#4b5563">One tool per (instrument, @control). Name = yaml key + "__" + method.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="948" y="162">{ "name": "<tspan fill="#1d4ed8" font-weight="700">temperature</tspan>__set_temperature",</text>
+        <text x="948" y="178">&#160;&#160;"action_class": "<tspan fill="#b45309" font-weight="700">run_control</tspan>",</text>
+        <text x="948" y="194">&#160;&#160;"inputSchema": {"properties": {"target_K": {</text>
+        <text x="948" y="210">&#160;&#160;&#160;&#160;"type": "number", "unit": "<tspan fill="#b45309" font-weight="700">K</tspan>",</text>
+        <text x="948" y="226">&#160;&#160;&#160;&#160;"minimum": <tspan fill="#1d4ed8" font-weight="700">1.4</tspan>, "maximum": <tspan fill="#1d4ed8" font-weight="700">320.0</tspan>,</text>
+        <text x="948" y="242">&#160;&#160;&#160;&#160;"description": "<tspan fill="#b45309" font-weight="700">Temperature to ramp the</tspan></text>
+        <text x="948" y="258">&#160;&#160;&#160;&#160;&#160;&#160;<tspan fill="#b45309" font-weight="700">controller to</tspan> (K). Configured limit</text>
+        <text x="948" y="274">&#160;&#160;&#160;&#160;&#160;&#160;<tspan fill="#1d4ed8" font-weight="700">max_temperature_K</tspan>: 1.4 to 320.0 K." }}}}</text>
+      </g>
+      <text x="944" y="298" font-size="11" fill="#374151">The agent reads the unit, the bound and the sentence you wrote. A call outside</text>
+      <text x="944" y="313" font-size="11" fill="#374151">the bound is refused by the schema before a command is built. Whether it may</text>
+      <text x="944" y="328" font-size="11" fill="#374151">call the tool at all is its role against the action class (gradual exposure).</text>
+      <text x="944" y="343" font-size="10.5" fill="#4b5563">Readings arrive the same way: temperature = 4.20 K, plus the sentence you wrote.</text>
+    </g>
+
+    <!-- ===================== RIGHT: manifest ===================== -->
+    <g>
+      <rect x="930" y="368" width="440" height="128" rx="10" fill="#f3eefb" stroke="#7c3aed"/>
+      <text x="944" y="390" font-weight="600" fill="#5b21b6">Capability manifest — "what can this system do?" as JSON</text>
+      <text x="944" y="408" font-size="11" fill="#374151">Every instrument, grouped as its VI declared, with readings, controls,</text>
+      <text x="944" y="423" font-size="11" fill="#374151">bounds and the metadata block from the yaml (role, manufacturer, model).</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="948" y="446">python -m i2as.core.capability_manifest configs/my_setup</text>
+        <text x="948" y="462">i2as-ctl manifest&#160;&#160;&#160;&#160;&#160;# no engine, no GUI, no bus traffic</text>
+      </g>
+      <text x="944" y="484" font-size="10.5" fill="#4b5563">Validated against a published JSON Schema; safe to hand to any client.</text>
+    </g>
+
+    <!-- ===================== RIGHT: GUI panel ===================== -->
+    <g>
+      <rect x="930" y="514" width="440" height="150" rx="10" fill="#f3eefb" stroke="#7c3aed"/>
+      <text x="944" y="536" font-weight="600" fill="#5b21b6">GUI panel — the physicist's view of the same declaration</text>
+      <rect x="948" y="548" width="404" height="96" rx="6" fill="#ffffff" stroke="#c4b5fd"/>
+      <text x="960" y="566" font-size="11" font-weight="600">Temperature control</text>
+      <text x="960" y="584" font-size="11" fill="#374151">temperature</text>
+      <text x="1130" y="584" font-size="11" text-anchor="end" font-weight="600">4.20 <tspan fill="#b45309">K</tspan></text>
+      <text x="960" y="601" font-size="11" fill="#374151">setpoint</text>
+      <text x="1130" y="601" font-size="11" text-anchor="end" font-weight="600">4.20 <tspan fill="#b45309">K</tspan></text>
+      <rect x="1160" y="572" width="180" height="24" rx="4" fill="#f8fafc" stroke="#94a3b8"/>
+      <text x="1250" y="588" text-anchor="middle" font-size="11">target_K  [ <tspan fill="#1d4ed8" font-weight="600">1.4 … 320.0</tspan> ]</text>
+      <rect x="1160" y="604" width="180" height="24" rx="4" fill="#ddd6fe" stroke="#7c3aed"/>
+      <text x="1250" y="620" text-anchor="middle" font-size="11" font-weight="600">Set temperature</text>
+      <text x="960" y="636" font-size="10.5" fill="#4b5563">group, order and labels from ui_groups; the tooltip is the same description</text>
+    </g>
+
+    <!-- ===================== arrows middle -> right ===================== -->
+    <g stroke="#7c3aed" stroke-width="1.5" fill="none">
+      <path d="M874,700 L902,700 L902,225 L930,225" marker-end="url(#arrP)"/>
+      <path d="M902,432 L930,432" marker-end="url(#arrP)"/>
+      <path d="M902,589 L930,589" marker-end="url(#arrP)"/>
+      <path d="M874,910 L930,910" marker-end="url(#arrP)"/>
+    </g>
+
+    <!-- ===================== RIGHT: why the strings matter ===================== -->
+    <g>
+      <rect x="930" y="682" width="440" height="112" rx="10" fill="#fdfaf3" stroke="#d97706"/>
+      <text x="944" y="704" font-weight="600" fill="#92400e">Why the strings matter</text>
+      <text x="944" y="723" font-size="11" fill="#374151">An LLM agent has no other description of your rack. The sentence on a</text>
+      <text x="944" y="738" font-size="11" fill="#374151">@monitored is how it knows what a number means; the unit on a ParamSpec</text>
+      <text x="944" y="753" font-size="11" fill="#374151">is how it knows 4.2 is kelvin, not amps; the bound in devices.yaml is the</text>
+      <text x="944" y="768" font-size="11" fill="#374151">wall it cannot walk through. Write them as you would for a new lab member.</text>
+      <text x="944" y="786" font-size="10.5" fill="#4b5563">Nothing between your file and the agent adds, edits or summarises a word.</text>
+    </g>
+
+
+    <!-- ===================== RIGHT: procedure tools ===================== -->
+    <g>
+      <rect x="930" y="826" width="440" height="174" rx="10" fill="#f3eefb" stroke="#7c3aed"/>
+      <text x="944" y="848" font-weight="600" fill="#5b21b6">Procedure, as the agent runs it</text>
+      <text x="944" y="865" font-size="11" fill="#4b5563">Your class name and ParamSpecs are the arguments; a role offers only this rack's VIs.</text>
+      <g font-family="ui-monospace, Consolas, 'Courier New', monospace" font-size="11" fill="#374151" xml:space="preserve" style="white-space:pre">
+        <text x="948" y="888">run_procedure / queue_procedure</text>
+        <text x="948" y="904">{ "procedure": "<tspan fill="#b45309" font-weight="700">MySweep</tspan>",</text>
+        <text x="948" y="920">&#160;&#160;"params": { "temperature_vi": "<tspan fill="#1d4ed8" font-weight="700">temperature</tspan>",</text>
+        <text x="948" y="936">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;"rate": 2.0, "start_K": 4.2, "end_K": 300.0 } }</text>
+        <text x="948" y="956">validate_run&#160;&#160;&#160;# "may I run this, how long?" — no dispatch</text>
+        <text x="948" y="972">probe_run&#160;&#160;&#160;&#160;&#160;&#160;# a real, cheap run of the recipe first</text>
+      </g>
+      <text x="944" y="992" font-size="10.5" fill="#4b5563">Both are run_control: a session-role agent may start them, an observer may only validate.</text>
+    </g>
+
+    <!-- ===================== legend ===================== -->
+    <g font-size="11">
+      <rect x="30" y="1036" width="14" height="14" rx="3" fill="#fdfaf3" stroke="#d97706"/>
+      <text x="52" y="1047" fill="#374151">you write it in Python</text>
+      <rect x="200" y="1036" width="14" height="14" rx="3" fill="#f0f5ff" stroke="#1d4ed8"/>
+      <text x="222" y="1047" fill="#374151">you write it in YAML, per rack</text>
+      <rect x="410" y="1036" width="14" height="14" rx="3" fill="#e2e8f0" stroke="#64748b"/>
+      <text x="432" y="1047" fill="#374151">fixed framework code</text>
+      <text x="600" y="1047" fill="#374151"><tspan fill="#b45309" font-weight="700">amber text</tspan> came from your VI class · <tspan fill="#1d4ed8" font-weight="700">blue text</tspan> came from your devices.yaml · everything else is generated</text>
+    </g>
+  </g>
+</svg>

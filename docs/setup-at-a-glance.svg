@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-label="You describe the rack once in four files: a driver, a virtual instrument, a devices.yaml and optionally a procedure. I2AS builds the Station and runs the engine. The physicist's GUI, the agent's MCP tools and the JSON manifest all show the same declaration, unchanged.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <marker id="ap" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="560" rx="14" fill="#ffffff" stroke="#e2e8f0"/>
+
+  <g font-family="'Segoe UI', Helvetica, Arial, sans-serif" fill="#1f2937">
+
+    <text x="600" y="40" text-anchor="middle" font-size="20" font-weight="600">Describe the rack once. I2AS shows it to everyone.</text>
+
+    <!-- ================= column headers ================= -->
+    <text x="220" y="84" text-anchor="middle" font-size="13" font-weight="700" fill="#92400e" letter-spacing="1.5">YOU WRITE</text>
+    <text x="600" y="84" text-anchor="middle" font-size="13" font-weight="700" fill="#1e3a8a" letter-spacing="1.5">I2AS BUILDS AND RUNS</text>
+    <text x="990" y="84" text-anchor="middle" font-size="13" font-weight="700" fill="#5b21b6" letter-spacing="1.5">EVERYONE SEES THE SAME</text>
+
+    <!-- ================= LEFT: four cards ================= -->
+    <!-- card 1: driver -->
+    <g>
+      <rect x="60" y="100" width="320" height="72" rx="12" fill="#fdfaf3" stroke="#d97706" stroke-width="1.5"/>
+      <!-- plug glyph -->
+      <rect x="82" y="122" width="26" height="28" rx="5" fill="none" stroke="#b45309" stroke-width="2"/>
+      <line x1="90" y1="112" x2="90" y2="122" stroke="#b45309" stroke-width="2.5"/>
+      <line x1="100" y1="112" x2="100" y2="122" stroke="#b45309" stroke-width="2.5"/>
+      <line x1="95" y1="150" x2="95" y2="160" stroke="#b45309" stroke-width="2.5"/>
+      <text x="126" y="130" font-size="16" font-weight="600">Driver</text>
+      <text x="126" y="152" font-size="13" fill="#4b5563">speaks to the hardware</text>
+      <text x="366" y="118" text-anchor="end" font-size="10.5" fill="#92400e">Python · only if not shipped</text>
+    </g>
+
+    <!-- card 2: virtual instrument -->
+    <g>
+      <rect x="60" y="184" width="320" height="100" rx="12" fill="#fdfaf3" stroke="#d97706" stroke-width="2.5"/>
+      <!-- gauge glyph -->
+      <path d="M78,244 A20,20 0 0 1 118,244" fill="none" stroke="#b45309" stroke-width="2.5"/>
+      <line x1="98" y1="244" x2="110" y2="230" stroke="#b45309" stroke-width="2.5"/>
+      <circle cx="98" cy="244" r="3" fill="#b45309"/>
+      <text x="126" y="212" font-size="16" font-weight="600">Virtual Instrument</text>
+      <text x="126" y="234" font-size="13" fill="#4b5563">every reading and action, declared with</text>
+      <text x="126" y="252" font-size="13" fill="#4b5563">a <tspan fill="#b45309" font-weight="700">unit</tspan>, a <tspan fill="#b45309" font-weight="700">sentence</tspan>, an <tspan fill="#b45309" font-weight="700">action class</tspan></text>
+      <text x="126" y="272" font-size="11" fill="#92400e">the part that matters most</text>
+      <text x="366" y="202" text-anchor="end" font-size="10.5" fill="#92400e">Python</text>
+    </g>
+
+    <!-- card 3: devices.yaml -->
+    <g>
+      <rect x="60" y="296" width="320" height="72" rx="12" fill="#f0f5ff" stroke="#1d4ed8" stroke-width="1.5"/>
+      <!-- document glyph -->
+      <path d="M84,318 h18 l8,8 v26 h-26 z" fill="none" stroke="#1d4ed8" stroke-width="2"/>
+      <line x1="90" y1="336" x2="104" y2="336" stroke="#1d4ed8" stroke-width="2"/>
+      <line x1="90" y1="344" x2="104" y2="344" stroke="#1d4ed8" stroke-width="2"/>
+      <text x="126" y="326" font-size="16" font-weight="600">devices.yaml</text>
+      <text x="126" y="348" font-size="13" fill="#4b5563">this rack: instruments, addresses, <tspan fill="#1d4ed8" font-weight="700">limits</tspan></text>
+      <text x="366" y="314" text-anchor="end" font-size="10.5" fill="#1e3a8a">YAML · one per rack</text>
+    </g>
+
+    <!-- card 4: procedure -->
+    <g>
+      <rect x="60" y="380" width="320" height="72" rx="12" fill="#fdfaf3" stroke="#d97706" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <!-- flask glyph -->
+      <path d="M90,402 h14 v12 l12,22 h-38 l12,-22 z" fill="none" stroke="#b45309" stroke-width="2" stroke-linejoin="round"/>
+      <line x1="86" y1="402" x2="108" y2="402" stroke="#b45309" stroke-width="2.5"/>
+      <text x="126" y="410" font-size="16" font-weight="600">Procedure</text>
+      <text x="126" y="432" font-size="13" fill="#4b5563">the experiment as a recipe: roles + parameters</text>
+      <text x="366" y="398" text-anchor="end" font-size="10.5" fill="#92400e">Python · optional, four shipped</text>
+    </g>
+
+    <!-- ================= arrows into the middle ================= -->
+    <g stroke="#334155" stroke-width="2" fill="none">
+      <path d="M380,136 C420,136 420,236 458,236"/>
+      <path d="M380,234 C420,234 420,236 458,236"/>
+      <path d="M380,332 C420,332 420,236 458,236"/>
+      <path d="M380,416 C420,416 420,380 458,380" marker-end="url(#a)"/>
+      <line x1="440" y1="236" x2="458" y2="236" marker-end="url(#a)"/>
+    </g>
+
+    <!-- ================= MIDDLE: one box ================= -->
+    <g>
+      <rect x="460" y="100" width="280" height="352" rx="16" fill="#eef2f7" stroke="#1d4ed8" stroke-width="2"/>
+
+      <rect x="480" y="120" width="240" height="120" rx="10" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="600" y="150" text-anchor="middle" font-size="16" font-weight="600" fill="#1e3a8a">Station</text>
+      <text x="600" y="174" text-anchor="middle" font-size="13" fill="#4b5563">built from your files at launch</text>
+      <text x="600" y="198" text-anchor="middle" font-size="13" fill="#4b5563">keeps one frozen snapshot of</text>
+      <text x="600" y="216" text-anchor="middle" font-size="13" fill="#4b5563">everything you declared</text>
+
+      <line x1="600" y1="240" x2="600" y2="268" stroke="#334155" stroke-width="2" marker-end="url(#a)"/>
+
+      <rect x="480" y="270" width="240" height="160" rx="10" fill="#e2e8f0" stroke="#64748b"/>
+      <text x="600" y="300" text-anchor="middle" font-size="16" font-weight="600" fill="#1e293b">Engine</text>
+      <text x="600" y="326" text-anchor="middle" font-size="13" fill="#374151">one thread touches hardware</text>
+      <text x="600" y="346" text-anchor="middle" font-size="13" fill="#374151">one door for every action</text>
+      <text x="600" y="366" text-anchor="middle" font-size="13" fill="#374151">one verdict for every command</text>
+      <text x="600" y="386" text-anchor="middle" font-size="13" fill="#374151">runs your procedure within your limits</text>
+      <text x="600" y="414" text-anchor="middle" font-size="11" fill="#64748b">fixed code · the same on every rack</text>
+    </g>
+
+    <!-- ================= arrows out to the right ================= -->
+    <g stroke="#7c3aed" stroke-width="2" fill="none">
+      <path d="M740,180 C780,180 780,150 818,150" marker-end="url(#ap)"/>
+      <path d="M740,180 C780,180 780,276 818,276" marker-end="url(#ap)"/>
+      <path d="M740,180 C780,180 780,402 818,402" marker-end="url(#ap)"/>
+    </g>
+    <text x="779" y="110" text-anchor="middle" font-size="11" fill="#5b21b6">rendered,</text>
+    <text x="779" y="124" text-anchor="middle" font-size="11" fill="#5b21b6">never rewritten</text>
+
+    <!-- ================= RIGHT: three surfaces ================= -->
+    <!-- GUI -->
+    <g>
+      <rect x="820" y="100" width="320" height="100" rx="12" fill="#f3eefb" stroke="#7c3aed" stroke-width="1.5"/>
+      <!-- window glyph -->
+      <rect x="842" y="126" width="30" height="24" rx="3" fill="none" stroke="#6d28d9" stroke-width="2"/>
+      <line x1="842" y1="133" x2="872" y2="133" stroke="#6d28d9" stroke-width="2"/>
+      <text x="886" y="130" font-size="16" font-weight="600">Physicist · GUI</text>
+      <text x="886" y="152" font-size="13" fill="#4b5563">panels, buttons, limits on the inputs</text>
+      <text x="886" y="176" font-size="12" fill="#6b7280">temperature  <tspan font-weight="700" fill="#1f2937">4.20</tspan> <tspan fill="#b45309" font-weight="700">K</tspan>   [ Set temperature ]</text>
+    </g>
+
+    <!-- Agent -->
+    <g>
+      <rect x="820" y="226" width="320" height="100" rx="12" fill="#f3eefb" stroke="#7c3aed" stroke-width="2.5"/>
+      <!-- chat glyph -->
+      <path d="M842,250 h30 v20 h-18 l-8,7 v-7 h-4 z" fill="none" stroke="#6d28d9" stroke-width="2" stroke-linejoin="round"/>
+      <text x="886" y="256" font-size="16" font-weight="600">Agent · MCP tools</text>
+      <text x="886" y="278" font-size="13" fill="#4b5563">one tool per action, with your words in it</text>
+      <text x="886" y="302" font-size="12" fill="#6b7280"><tspan fill="#1d4ed8" font-weight="700">temperature</tspan>__set_temperature</text>
+      <text x="886" y="318" font-size="12" fill="#6b7280">target_K · <tspan fill="#b45309" font-weight="700">K</tspan> · <tspan fill="#1d4ed8" font-weight="700">1.4 – 320</tspan> · <tspan fill="#b45309" font-weight="700">run_control</tspan></text>
+    </g>
+
+    <!-- Manifest -->
+    <g>
+      <rect x="820" y="352" width="320" height="100" rx="12" fill="#f3eefb" stroke="#7c3aed" stroke-width="1.5"/>
+      <!-- braces glyph -->
+      <text x="838" y="410" font-size="24" font-weight="600" fill="#6d28d9" font-family="ui-monospace, Consolas, monospace">{ }</text>
+      <text x="886" y="382" font-size="16" font-weight="600">Anyone · JSON manifest</text>
+      <text x="886" y="404" font-size="13" fill="#4b5563">"what can this system do?"</text>
+      <text x="886" y="428" font-size="12" fill="#6b7280">same readings, actions, units, bounds</text>
+    </g>
+
+    <!-- ================= the one-line trace ================= -->
+    <rect x="60" y="476" width="1080" height="56" rx="12" fill="#fffbeb" stroke="#f59e0b"/>
+    <text x="600" y="499" text-anchor="middle" font-size="14" fill="#1f2937">Follow one string: <tspan fill="#b45309" font-weight="700">"Temperature to ramp the controller to"</tspan> is written once, in the VI. The bound <tspan fill="#1d4ed8" font-weight="700">320 K</tspan> is written once, in the yaml.</text>
+    <text x="600" y="520" text-anchor="middle" font-size="14" fill="#1f2937">The physicist's tooltip, the agent's tool and the manifest all carry both, verbatim. <tspan font-weight="600">What you write is what everyone knows.</tspan></text>
+  </g>
+</svg>
