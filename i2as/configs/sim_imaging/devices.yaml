@@ -1,0 +1,85 @@
+# Simulated widefield-imaging station: a magnet, a two-axis sample stage and
+# a camera. The magnet and the camera share the sim environment "imaging"
+# (the sim-coupling standard, drivers/README.md): the "@imaging" suffix on
+# both addresses is what lets the simulated sample respond to the simulated
+# field. The stage joins no environment; nothing else responds to it.
+data_directory: "C:/CryoData"
+
+real_drivers:
+  ips_z:
+    class: i2as.drivers.sim_oxford_ips120.SimOxfordIPS120
+    address: "SIM::IPS_Z@imaging"
+  xy_stage:
+    class: i2as.drivers.sim_xy_stage.SimXYStage
+    address: "SIM::XYSTAGE"
+  widefield_camera:
+    class: i2as.drivers.sim_camera.SimCamera
+    address: "SIM::CAMERA@imaging"
+
+virtual_instruments:
+  magnet_z:
+    class: i2as.virtual_instruments.magnet.superconducting_magnet.SuperconductingMagnetVI
+    drivers: {main: ips_z}
+    vi_type: system
+    init_params:
+      # The same coil constant as the sim environment's, so the field this
+      # VI reports is the field the sim camera sees.
+      amperes_per_tesla: 10.0
+      max_current: 90.0
+      min_current: -90.0
+      default_ramp_rate: 5.0
+      ramp_segments:
+        - {max_current_A: 40.0, rate_A_per_min: 5.0}
+        - {max_current_A: 70.0, rate_A_per_min: 3.0}
+        - {max_current_A: 90.0, rate_A_per_min: 1.0}
+    metadata:
+      role: Out-of-plane field at the sample
+      manufacturer: Oxford Instruments
+      model: IPS120-10
+  # One stage VI per axis (the Stage VI standard): both on the one driver,
+  # each with its own travel limit. Limits are setup properties — the
+  # region of the sample holder that is safe to scan — so they live here.
+  stage_x:
+    class: i2as.virtual_instruments.stage.stage_axis.StageAxisVI
+    drivers: {main: xy_stage}
+    vi_type: system
+    init_params:
+      axis: x
+      min_position_m: -0.010
+      max_position_m: 0.010
+      speed_m_per_s: 0.005
+      tolerance_m: 1.0e-6
+    metadata:
+      role: Sample stage, x axis
+      manufacturer: I2AS
+      model: SimXYStage
+  stage_y:
+    class: i2as.virtual_instruments.stage.stage_axis.StageAxisVI
+    drivers: {main: xy_stage}
+    vi_type: system
+    init_params:
+      axis: y
+      min_position_m: -0.010
+      max_position_m: 0.010
+      speed_m_per_s: 0.005
+      tolerance_m: 1.0e-6
+    metadata:
+      role: Sample stage, y axis
+      manufacturer: I2AS
+      model: SimXYStage
+  camera:
+    class: i2as.virtual_instruments.measurement.camera.CameraMeasurementVI
+    drivers: {main: widefield_camera}
+    vi_type: measurement
+    init_params:
+      # Region of interest the scalar columns (roi_mean, roi_std) are taken
+      # over, in sensor pixels [x0, y0, width, height]: the central quarter,
+      # away from the illumination fall-off at the edges.
+      roi: [32, 32, 64, 64]
+      # The exposure range this camera accepts (control-validation standard).
+      min_exposure_s: 1.0e-5
+      max_exposure_s: 10.0
+    metadata:
+      role: Widefield magneto-optical camera
+      manufacturer: I2AS
+      model: SimCamera

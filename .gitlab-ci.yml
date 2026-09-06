@@ -1,0 +1,34 @@
+# I2AS CI for GitLab.
+#
+# Mirrors .github/workflows/ci.yml: both are thin wrappers that call the same
+# Makefile targets, so checks added to the Makefile apply to both CI systems
+# without editing either file. The image tag below must match the
+# python-version there — a version split between the two hosts (or between CI
+# and a developer machine) hides failures that only one of them can see.
+
+image: python:3.12
+
+variables:
+  QT_QPA_PLATFORM: "offscreen"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+
+checks:
+  script:
+    # libgl1-mesa-dri/libglx-mesa0: pyqtgraph's GraphicsView paints through an
+    # OpenGL viewport even under QT_QPA_PLATFORM=offscreen, so Qt needs
+    # Mesa's software rasterizer (llvmpipe) to actually render — without it
+    # the GUI suite segfaults on this Debian-based image (GitHub's Ubuntu
+    # runner ships it preinstalled, which is why this was invisible there).
+    - apt-get update && apt-get install -y --no-install-recommends
+      make libegl1 libgl1 libglib2.0-0 libfontconfig1 libxkbcommon0 libdbus-1-3
+      libgl1-mesa-dri libglx-mesa0
+    - make install
+    - make lint
+    - make contracts
+    - make test
+    - make test-instrument-inline
+    - make typecheck || true # advisory, never fails the pipeline

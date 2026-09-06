@@ -1,0 +1,80 @@
+# Default data directory (outside I2AS folder)
+data_directory: "C:/CryoData"
+
+real_drivers:
+  ips_z:
+    class: i2as.drivers.sim_oxford_ips120.SimOxfordIPS120
+    address: "SIM::IPS_Z"
+  lakeshore_vti:
+    class: i2as.drivers.sim_lakeshore_335.SimLakeshore335
+    address: "SIM::LS335"
+  keithley_6221:
+    class: i2as.drivers.sim_keithley_6221.SimKeithley6221
+    address: "SIM::K6221"
+  keithley_2182a:
+    class: i2as.drivers.sim_keithley_2182a.SimKeithley2182A
+    address: "SIM::K2182A"
+
+virtual_instruments:
+  magnet_z:
+    class: i2as.virtual_instruments.magnet.superconducting_magnet.SuperconductingMagnetVI
+    drivers: {main: ips_z}
+    vi_type: system
+    init_params:
+      amperes_per_tesla: 10.0
+      max_current: 90.0
+      min_current: -90.0
+      default_ramp_rate: 5.0
+      ramp_segments:
+        - {max_current_A: 40.0, rate_A_per_min: 5.0}
+        - {max_current_A: 70.0, rate_A_per_min: 3.0}
+        - {max_current_A: 90.0, rate_A_per_min: 1.0}
+    metadata:
+      role: Z-axis magnet
+      manufacturer: Oxford Instruments
+      model: IPS120-10
+  temperature:
+    class: i2as.virtual_instruments.temperature.lakeshore_335_sample_temperature_controller.Lakeshore335SampleTemperatureControllerVI
+    drivers: {main: lakeshore_vti}
+    vi_type: system
+    init_params:
+      default_ramp_rate: 2.0
+      tolerance: 0.5
+      # Setup limits enforced on user @control actions (control-validation standard)
+      min_temperature_K: 1.4
+      max_temperature_K: 320.0
+      max_ramp_rate_K_per_min: 20.0
+    metadata:
+      role: Sample-space temperature controller
+      manufacturer: Lakeshore
+      model: 335
+  dc_measurement:
+    class: i2as.virtual_instruments.measurement.dc_separate_measurement.DCSeparateMeasurementVI
+    drivers: {source: keithley_6221, meter: keithley_2182a}
+    vi_type: measurement
+    init_params:
+      # Excitation ceiling enforced on every @control that commands current
+      # (control-validation standard). 105 mA is the Keithley 6221's own
+      # maximum output — this simulated bench has no sample-specific limit
+      # documented, so the bound is the instrument's, which is what stops a
+      # mistyped exponent rather than an operator's legitimate choice.
+      max_source_current_A: 0.105
+    metadata:
+      role: DC source-and-measure (source + nanovoltmeter pair)
+      manufacturer: Keithley
+      model: 6221 + 2182A
+
+# Trend checks (the Trend check standard, core/trend_checks.py): advisory
+# judgements over the trend-history store, evaluated on their own slow timer
+# and published as advisory conditions — they report, never enforce. Each
+# entry watches one flat state key ("<vi_name>_<monitored_method>") and
+# fails when the window's min/max leave the band. The band here is this
+# setup's controller range; a real setup narrows it to the sample's own.
+trends:
+  refresh_interval_s: 60.0
+  store_live_stale_ticks: 10
+  checks:
+    - key: temperature_temperature
+      low: 1.0
+      high: 320.0
+      window_s: 3600.0

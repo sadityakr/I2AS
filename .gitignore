@@ -1,0 +1,56 @@
+# ── Whitelist approach: ignore everything, then carve out tracked items ──
+
+# Ignore all files and folders at the root
+/*
+/.*
+
+# Always track these files
+!/.gitignore
+!/pyproject.toml
+!/README.md
+!/LICENSE
+!/Makefile
+!/GLOSSARY.md
+!/CLAUDE.md
+
+# The MCP server declaration: it names `python -m i2as.mcp` and nothing
+# machine-specific, so every checkout gets the same wiring. The adapter finds
+# the running application through the descriptor that application publishes,
+# never through a path written here.
+!/.mcp.json
+
+# CI configuration (GitHub Actions now; .gitlab-ci.yml is ready for the GitLab migration)
+!/.github/
+!/.gitlab-ci.yml
+
+# Tracked folders
+!/i2as/
+!/data/
+!/docs/
+!/tests/
+!/scripts/
+
+# Claude Code project skills/agents are tracked (git history is the safety net);
+# the rest of .claude/ (local settings) stays untracked — this repo is public.
+!/.claude/
+/.claude/*
+!/.claude/skills/
+!/.claude/agents/
+
+# Exclude compiled Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Exclude log files (keep directory placeholder)
+i2as/logs/*.log
+i2as/logs/*.log.*
+i2as/logs/*.jsonl
+i2as/logs/*.jsonl.*
+
+# Exclude real experiment data; only sample files are tracked
+data/*.h5
+!data/sample_*.h5
+
+# Instrument manuals are copyrighted vendor material — keep local only
+i2as/configs/*/manuals/

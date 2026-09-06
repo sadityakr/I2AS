@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "i2as": {
+      "command": "python",
+      "args": ["-m", "i2as.mcp"],
+      "env": {
+        "I2AS_MCP_ROLE": "observer",
+        "I2AS_MCP_ACTOR_ID": "claude-code"
+      }
+    }
+  }
+}
