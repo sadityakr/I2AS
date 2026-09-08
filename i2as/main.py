@@ -25,12 +25,12 @@ from i2as.core.config import (
     read_safety_config,
     read_trends_config,
 )
+from i2as.core.procedure_catalog import build_procedure_infos, discover_run_catalog
 from i2as.core.station import Station, build_station_with_fallback
 from i2as.core.trend_check_runner import TrendCheckRunner
 from i2as.core.trend_checks import declared_checks
 from i2as.gui import app_settings
 from i2as.gui.monitor_window import MonitorWindow
-from i2as.gui.procedure_discovery import discover_procedures
 from i2as.gui.theme import PLOT_AXIS, PLOT_BG, build_stylesheet
 from i2as.session.agent_feed import AgentFeed
 from i2as.session.eln.publisher import ElnPublisher
@@ -341,7 +341,7 @@ def main(
     # i2as.procedures — whoever owns discovery hands the catalog down, so
     # a client that speaks the control contract can name a run by class and
     # the run queue can resolve a stored spec back to its class.
-    run_catalog: dict[str, type] = {cls.__name__: cls for cls in discover_procedures()}
+    run_catalog: dict[str, type] = discover_run_catalog()
 
     # The instrument stack is built by the InstrumentHost, not here: which
     # THREAD owns the Station and the Orchestrator is the host's decision, and
@@ -354,6 +354,11 @@ def main(
     def _build_station() -> Station:
         """Build the Station from the first usable startup config."""
         station, used_path, warnings = build_station_with_fallback(candidates)
+        # The Station publishes what the catalog declares but may not build it
+        # (contract C4), so the declarations are rendered here — where the
+        # catalog is owned — and handed down. This is what puts procedures in
+        # StationInfo, and so in the manifest every client reads.
+        station.declare_procedures(build_procedure_infos(station, run_catalog))
         build["used_path"] = used_path
         build["warnings"] = warnings
         if on_station_built is not None:

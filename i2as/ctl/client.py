@@ -50,8 +50,11 @@ from i2as.core.instrument_host import InstrumentHost
 from i2as.core.paths import measurement_root
 from i2as.core.request_spool import RequestSpool, spool_directory
 from i2as.core.config import read_safety_config, read_tick_interval_ms
+from i2as.core.procedure_catalog import (
+    build_procedure_infos,
+    discover_run_catalog,
+)
 from i2as.core.station import Station, build_station
-from i2as.ctl.discovery import discover_run_catalog
 from i2as.session.agent_feed import AgentFeed
 from i2as.session.gateway import Gateway, Role, ToolContext
 from i2as.session.gateway.tools import ToolError
@@ -651,7 +654,9 @@ def _open_offline(
     catalog = discover_run_catalog()
 
     def _build() -> Station:
-        return build_station(config_path)
+        station = build_station(config_path)
+        station.declare_procedures(build_procedure_infos(station, catalog))
+        return station
 
     def _options(_station: Station) -> dict[str, Any]:
         safety = read_safety_config(config_path)

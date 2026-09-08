@@ -37,6 +37,7 @@ from i2as.core.events import (
     InstrumentInfo,
     LifecycleState,
     MonitoredInfo,
+    ProcedureInfo,
     StationInfo,
 )
 from i2as.core.exceptions import (
@@ -283,6 +284,12 @@ class Station:
         # disconnect — so the next read rebuilds.
         self._station_info: StationInfo | None = None
         self._station_info_seq: int = 0
+
+        # The procedure declarations this station carries, set by whoever owns
+        # the run catalog (see declare_procedures). Frozen contract messages,
+        # never classes: contract C4 keeps the Station below procedures, so it
+        # publishes what they declare without knowing what one is.
+        self._procedures: tuple[ProcedureInfo, ...] = ()
 
     # ------------------------------------------------------------------
     # VI registration and access
@@ -792,6 +799,29 @@ class Station:
     # The station declaration snapshot (core/events.py's StationInfo)
     # ------------------------------------------------------------------
 
+    def declare_procedures(self, procedures: Sequence[ProcedureInfo]) -> None:
+        """Give this station the procedure declarations it publishes.
+
+        The Station sits BELOW procedures — contract C4 forbids it from
+        importing ``core.procedure``, because a Station must work whether or
+        not anything is ever run on it. So it does not discover or render
+        procedure declarations; it is handed them, already frozen, by whoever
+        owns the run catalog (the application entry point, the CLI, the
+        manifest command), and publishes them in ``station_info()`` beside the
+        instruments. See ``core.procedure_catalog``, which builds them.
+
+        This is what lets a client that holds only the mirrored snapshot — the
+        agent gateway above all — discover what the station can be asked to
+        RUN, and with which parameters, rather than only what each instrument
+        can be told to do.
+
+        Args:
+            procedures: The declarations, in catalog order. Replaces any
+                previously declared; passing an empty sequence clears them.
+        """
+        self._procedures = tuple(procedures)
+        self._invalidate_station_info()
+
     def station_info(self) -> StationInfo:
         """Return the frozen declaration snapshot of this whole station.
 
@@ -813,6 +843,10 @@ class Station:
         ``tests/test_conformance.py`` builds this against spied drivers to
         keep it that way.
 
+        The procedures come from ``declare_procedures()`` rather than from
+        this layer, which may not import them; everything else is assembled
+        here.
+
         The snapshot is cached and rebuilt when the station's membership
         changes — a VI joining the live registry or degrading to the offline
         one, i.e. every connect and disconnect — so repeated reads are free
@@ -832,6 +866,7 @@ class Station:
                     self._instrument_info(vi_name)
                     for vi_name in self._configured_vi_names()
                 ),
+                procedures=self._procedures,
                 seq=self._station_info_seq,
                 ts=time.time(),
             )

@@ -442,7 +442,7 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "C20: the reference client is a leaf entry point — i2as.ctl imports core, the session layer and the troubleshoot toolbox, plus i2as.procedures for the run catalog it discovers; never the GUI, drivers or VIs"
+name = "C20: the reference client is a leaf entry point — i2as.ctl imports core, the session layer and the troubleshoot toolbox, plus i2as.procedures through core.procedure_catalog for the run catalog; never the GUI, drivers or VIs"
 type = "forbidden"
 # i2as.ctl is an ENTRY POINT, like i2as.main: it owns discovery. A run
 # travels as a class NAME, and neither the engine (C5) nor the session layer

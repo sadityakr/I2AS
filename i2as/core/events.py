@@ -1020,6 +1020,159 @@ class InstrumentInfo(_ContractMessage):
 
 
 @dataclass(frozen=True)
+class ProcedureFormBlock(_ContractMessage):
+    """One guarded block of a procedure's form, as declared.
+
+    The wire form of ``core.plan.ConditionalGroup`` — see the
+    **conditional-parameter standard** there for why a procedure's form
+    travels as a rulebook rather than as a method to re-run. Every block the
+    form could ever show is carried, each with the condition it appears
+    under, so a client holding nothing but this snapshot can resolve the form
+    for any set of answers without calling the engine.
+
+    Attributes:
+        key: The rendered group's stable identity. Blocks sharing one merge
+            into a single group, which is how a group whose contents are
+            partly conditional is declared.
+        title: The rendered group's heading.
+        params: One JSON-rendered ``ParamSpec`` per parameter, in declared
+            order. Each carries ``name``, ``kind`` (the scalar type name),
+            ``unit``, ``description``, ``default``, ``min``, ``max``,
+            ``choices`` (``None`` when not enumerated), ``structural``
+            (whether changing it changes which blocks apply) and
+            ``widget_hint``.
+        when: The guard, as ``{parameter: [accepted values]}``. Empty means
+            the block is unconditional. Conditions are ANDed across
+            parameters and ORed within one parameter's values.
+    """
+
+    key: str
+    title: str = ""
+    params: tuple[dict[str, Any], ...] = ()
+    when: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate the strings and JSON-check the parameters and the guard.
+
+        Raises:
+            TypeError: If a string field has the wrong type, if ``params`` is
+                not a sequence of JSON-safe mappings, or if ``when`` is not a
+                mapping of JSON-safe value lists.
+            ValueError: If ``key`` is empty.
+        """
+        _checked_strings("ProcedureFormBlock", key=self.key, title=self.title)
+        if not self.key:
+            raise ValueError("ProcedureFormBlock.key must be a non-empty str")
+        if isinstance(self.params, (Mapping, str)) or not isinstance(
+            self.params, (list, tuple)
+        ):
+            raise TypeError("ProcedureFormBlock.params must be a sequence of dicts")
+        object.__setattr__(
+            self, "params", tuple(_checked_mapping(spec) for spec in self.params)
+        )
+        if not isinstance(self.when, Mapping):
+            raise TypeError("ProcedureFormBlock.when must be a mapping")
+        guard: dict[str, Any] = {}
+        for name, accepted in self.when.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError(
+                    "ProcedureFormBlock.when keys must be non-empty strings"
+                )
+            if isinstance(accepted, (str, bytes, Mapping)) or not isinstance(
+                accepted, (list, tuple)
+            ):
+                raise TypeError(
+                    f"ProcedureFormBlock.when[{name!r}] must be a list of "
+                    f"accepted values"
+                )
+            guard[name] = [_jsonable(value) for value in accepted]
+        object.__setattr__(self, "when", guard)
+
+
+@dataclass(frozen=True)
+class ProcedureInfo(_ContractMessage):
+    """Everything one procedure declares about how it is run.
+
+    The procedure-side counterpart of ``InstrumentInfo``, and for the same
+    reason: a client must be able to answer "what can this station be asked
+    to do, and with what?" from the declaration alone. Every procedure the
+    catalog holds appears, whether or not this rack can currently run it —
+    ``availability`` is what says so, exactly as it does for an instrument.
+
+    Attributes:
+        class_name: The procedure class's ``__name__``. This is the identifier
+            ``run_procedure``, ``queue_procedure`` and ``validate_run`` take:
+            a run travels as a class name plus its parameter values, and this
+            is that name.
+        name: The human-readable display name.
+        description: The one-line description.
+        run_kind: What kind of run this procedure's executions are recorded
+            as — ``"run"`` for a science run.
+        availability: Why this rack cannot currently run the procedure,
+            sorted; empty when it can. Mirrors ``InstrumentInfo.availability``:
+            a procedure that needs a measurement VI on a rack with none is
+            still declared, so a reader sees what the setup would run given
+            the missing instrument, rather than a silent gap.
+        sweep_axis: The declared ``SweepAxis`` as ``{key, unit, data_key,
+            description, default_start, default_end, default_steps}``, or
+            empty for a procedure that declares no axis.
+        roles: ``{parameter: role description}`` for each instrument role the
+            procedure discovers on the Station. The candidates themselves are
+            the parameter's choices in ``form``.
+        data_keys: ``{"sweep": [...], "measurement": [...], "default_x": ...}``
+            — the columns a finished run of this procedure writes, so a reader
+            knows what it would get back before starting one.
+        form: The whole parameter form as guarded blocks, in render order.
+            Resolve it with ``core.plan.resolve_form()``.
+    """
+
+    class_name: str
+    name: str = ""
+    description: str = ""
+    run_kind: str = "run"
+    availability: tuple[str, ...] = ()
+    sweep_axis: dict[str, Any] = field(default_factory=dict)
+    roles: dict[str, str] = field(default_factory=dict)
+    data_keys: dict[str, Any] = field(default_factory=dict)
+    form: tuple[ProcedureFormBlock, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Coerce every nested field, accepting instances or their dicts.
+
+        Raises:
+            TypeError: If a field has the wrong shape or carries a
+                non-JSON-safe value.
+            ValueError: If ``class_name`` is empty.
+        """
+        _checked_strings(
+            "ProcedureInfo",
+            class_name=self.class_name,
+            name=self.name,
+            description=self.description,
+            run_kind=self.run_kind,
+        )
+        if not self.class_name:
+            raise ValueError("ProcedureInfo.class_name must be a non-empty str")
+        if isinstance(self.availability, (Mapping, str)) or not isinstance(
+            self.availability, (list, tuple)
+        ):
+            raise TypeError("ProcedureInfo.availability must be a sequence of str")
+        object.__setattr__(
+            self, "availability", tuple(sorted(str(tag) for tag in self.availability))
+        )
+        for name in ("sweep_axis", "roles", "data_keys"):
+            value = getattr(self, name)
+            if not isinstance(value, Mapping):
+                raise TypeError(f"ProcedureInfo.{name} must be a mapping")
+            object.__setattr__(self, name, _jsonable(dict(value)))
+        object.__setattr__(
+            self,
+            "form",
+            _tuple_of(ProcedureFormBlock, self.form, "ProcedureInfo.form"),
+        )
+
+
+@dataclass(frozen=True)
 class StationInfo(_ContractMessage):
     """What the station is, as declared — the static half of the picture.
 
@@ -1038,6 +1191,12 @@ class StationInfo(_ContractMessage):
         tick_interval_s: The configured monitor tick period, in seconds.
         instruments: One ``InstrumentInfo`` per configured VI, live and
             offline alike, in config order.
+        procedures: One ``ProcedureInfo`` per procedure in the run catalog
+            this station was given, in catalog order — empty for a Station
+            built without one. Declared here, beside the instruments, because
+            a client that can only see the snapshot must be able to discover
+            what it can ask the station to RUN, not merely what the
+            instruments can each be told to do.
         seq: Monotonic sequence number, incremented on every rebuild.
         ts: Unix time the declaration was captured.
     """
@@ -1047,6 +1206,7 @@ class StationInfo(_ContractMessage):
     setup: str = ""
     tick_interval_s: float = 0.0
     instruments: tuple[InstrumentInfo, ...] = ()
+    procedures: tuple[ProcedureInfo, ...] = ()
     seq: int = 0
     ts: float = field(default_factory=time.time)
 
@@ -1068,6 +1228,11 @@ class StationInfo(_ContractMessage):
             self,
             "instruments",
             _tuple_of(InstrumentInfo, self.instruments, "StationInfo.instruments"),
+        )
+        object.__setattr__(
+            self,
+            "procedures",
+            _tuple_of(ProcedureInfo, self.procedures, "StationInfo.procedures"),
         )
 
 

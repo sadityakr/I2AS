@@ -78,7 +78,10 @@ def build_manifest(station: Station) -> dict[str, Any]:
 
     The whole of ``station.station_info()``, rendered to JSON, with one thing
     added: each instrument's capabilities resolved into its declared UI
-    groups. A group's ``monitored``/``controls`` name the members it declares,
+    groups. The ``procedures`` section is the station's own, rendered
+    unchanged: a procedure's form is already a resolvable declaration (the
+    **conditional-parameter standard**, ``core.plan``), so this module has
+    nothing to arrange — a reader resolves it with ``resolve_form()``. A group's ``monitored``/``controls`` name the members it declares,
     in declared order, and the instrument's ``ungrouped`` block names
     everything no group claims, after them. The full details stay in the
     instrument's own ``monitored``/``controls`` lists, ordered the same way —
@@ -101,6 +104,7 @@ def build_manifest(station: Station) -> dict[str, Any]:
         "seq": info.seq,
         "ts": info.ts,
         "instruments": [_instrument_json(entry) for entry in info.instruments],
+        "procedures": [entry.to_json() for entry in info.procedures],
     }
 
 
@@ -190,10 +194,19 @@ MANIFEST_SCHEMA: dict[str, Any] = {
     "description": (
         "Everything one I2AS station declares: each configured "
         "instrument's readings, actions, parameter specs, configured limits, "
-        "capability groups and safety flags."
+        "capability groups and safety flags, plus every procedure it can be "
+        "asked to run and the whole conditional parameter form each takes."
     ),
     "type": "object",
-    "required": ["schema", "setup", "tick_interval_s", "seq", "ts", "instruments"],
+    "required": [
+        "schema",
+        "setup",
+        "tick_interval_s",
+        "seq",
+        "ts",
+        "instruments",
+        "procedures",
+    ],
     "additionalProperties": False,
     "properties": {
         "schema": {"type": "string", "enum": [MANIFEST_SCHEMA_ID]},
@@ -213,6 +226,15 @@ MANIFEST_SCHEMA: dict[str, Any] = {
         "instruments": {
             "type": "array",
             "items": {"$ref": "#/$defs/instrument"},
+        },
+        "procedures": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/procedure"},
+            "description": (
+                "Every procedure the run catalog holds, runnable or not — "
+                "what this station can be asked to RUN, as opposed to what "
+                "each instrument can be told to do."
+            ),
         },
     },
     "$defs": {
@@ -317,6 +339,138 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "limit": {"type": "string"},
                 "min": {"type": ["number", "null"]},
                 "max": {"type": ["number", "null"]},
+            },
+        },
+        "procedure_param": {
+            "type": "object",
+            "description": (
+                "One procedure parameter, from its ParamSpec. Distinct from "
+                "an @control parameter: it is always declared, and it carries "
+                "'structural', which says whether changing it changes which "
+                "blocks of the form apply."
+            ),
+            "required": [
+                "name",
+                "kind",
+                "unit",
+                "description",
+                "default",
+                "min",
+                "max",
+                "choices",
+                "structural",
+                "widget_hint",
+            ],
+            "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "description": "Scalar type name: float, int, str or bool.",
+                },
+                "unit": {"type": "string"},
+                "description": {"type": "string"},
+                "default": {"description": "The declared default, a JSON scalar."},
+                "min": {"type": ["number", "null"]},
+                "max": {"type": ["number", "null"]},
+                "choices": {
+                    "type": ["object", "null"],
+                    "description": "Label -> value for an enumerated parameter.",
+                },
+                "structural": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether changing this value changes which blocks of "
+                        "the form apply, and so must be sent back as a "
+                        "selection to see the rest of the form."
+                    ),
+                },
+                "widget_hint": {"type": "string"},
+            },
+        },
+        "procedure_form_block": {
+            "type": "object",
+            "description": (
+                "One block of a procedure's form and the condition it appears "
+                "under. Blocks sharing a key merge into one group. A block "
+                "whose 'when' is empty is always present; otherwise every "
+                "named parameter must hold one of the listed values (ANDed "
+                "across parameters, ORed within one)."
+            ),
+            "required": ["key", "title", "params", "when"],
+            "additionalProperties": False,
+            "properties": {
+                "key": {"type": "string"},
+                "title": {"type": "string"},
+                "params": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/procedure_param"},
+                },
+                "when": {
+                    "type": "object",
+                    "description": "parameter -> accepted values.",
+                    "additionalProperties": {"type": "array"},
+                },
+            },
+        },
+        "procedure": {
+            "type": "object",
+            "description": (
+                "One procedure: the class name a run names, and the whole "
+                "conditional form it takes."
+            ),
+            "required": [
+                "class_name",
+                "name",
+                "description",
+                "run_kind",
+                "availability",
+                "sweep_axis",
+                "roles",
+                "data_keys",
+                "form",
+            ],
+            "additionalProperties": False,
+            "properties": {
+                "class_name": {
+                    "type": "string",
+                    "description": (
+                        "The identifier run_procedure, queue_procedure and "
+                        "validate_run take."
+                    ),
+                },
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "run_kind": {"type": "string"},
+                "availability": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Why this rack cannot currently run it; empty means it "
+                        "can."
+                    ),
+                },
+                "sweep_axis": {
+                    "type": "object",
+                    "description": (
+                        "The declared sweep axis, or {} for a procedure with "
+                        "none. Its generated parameters are in the form's "
+                        "sweep_axis block."
+                    ),
+                },
+                "roles": {
+                    "type": "object",
+                    "description": "role parameter -> what the instrument is for.",
+                    "additionalProperties": {"type": "string"},
+                },
+                "data_keys": {
+                    "type": "object",
+                    "description": "The columns a finished run writes.",
+                },
+                "form": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/procedure_form_block"},
+                },
             },
         },
         "instrument": {
@@ -560,6 +714,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2 if len(args) != 1 else 0
 
+    from i2as.core.procedure_catalog import (
+        build_procedure_infos,
+        discover_run_catalog,
+    )
     from i2as.core.station import build_station
 
     try:
@@ -567,6 +725,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 — a CLI reports, it does not traceback
         sys.stderr.write(f"cannot build a station from '{args[0]}': {exc}\n")
         return 1
+    # The Station is handed its procedure declarations rather than finding them
+    # (contract C4), so this command owns the catalog exactly as the
+    # application and the CLI client do — which is what makes the manifest it
+    # prints the same document an agent reads.
+    station.declare_procedures(
+        build_procedure_infos(station, discover_run_catalog())
+    )
 
     manifest = build_manifest(station)
     errors = validate_manifest(manifest)

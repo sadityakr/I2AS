@@ -18,7 +18,7 @@ from i2as.core.request_spool import RequestSpool
 from i2as.core.station import build_station
 from i2as.ctl.cli import EXIT_OK, EXIT_REFUSED, EXIT_UNREACHABLE, build_parser, main
 from i2as.ctl.client import CtlUnreachable, default_actor_id, open_client
-from i2as.ctl.discovery import discover_run_catalog
+from i2as.core.procedure_catalog import discover_run_catalog
 from i2as.session.gateway import Role, authorize_spooled
 from i2as.session.models import GUEST_USER_ID
 from i2as.session.store import SessionStore

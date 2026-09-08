@@ -112,6 +112,7 @@ from i2as.core.capability_manifest import build_manifest, validate_manifest
 from i2as.core.events import CommandName, StationInfo
 from i2as.core.orchestrator import Orchestrator
 from i2as.core.paths import log_directory
+from i2as.core.plan import blocks_from_json, resolve_form
 from i2as.session.eln.adapter import ElnError
 from i2as.session.eln.drafting import (
     DraftRequest,
@@ -1007,6 +1008,42 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
         "with each instrument's capabilities resolved into its declared groups.",
     ),
     _read_tool(
+        "list_procedures",
+        "Every procedure this station can be asked to run: the class name "
+        "run_procedure takes, what it does, the sweep axis it drives, the "
+        "columns it writes, and whether this rack can currently run it. The "
+        "compact index — call describe_procedure for one procedure's "
+        "parameters.",
+    ),
+    _read_tool(
+        "describe_procedure",
+        "One procedure's parameter form, resolved for a set of selections. "
+        "Returns the parameter groups to fill in, each parameter's type, unit, "
+        "bounds and default, and which of them are STRUCTURAL. A structural "
+        "parameter decides which other parameters exist — choosing a "
+        "measurement method changes the measurement parameters and the loop "
+        "options; choosing a loop parameter adds its values field — so send a "
+        "structural choice back in 'selections' to see the form it opens up. "
+        "Omit selections for the default form. Dispatches nothing.",
+        {
+            "procedure": {
+                "type": "string",
+                "description": (
+                    "Class name of the procedure, as listed by list_procedures."
+                ),
+            },
+            "selections": {
+                "type": "object",
+                "description": (
+                    "Values of the structural parameters chosen so far, as "
+                    "{parameter: value}. Anything unanswered takes its "
+                    "declared default."
+                ),
+            },
+        },
+        ("procedure",),
+    ),
+    _read_tool(
         "list_runs",
         "Every run recorded in an experiment: id, procedure, kind, status, "
         "times and parameters.",
@@ -1866,6 +1903,126 @@ def _station(context: ToolContext) -> StationInfo:
             {"rule": "missing_collaborator", "collaborator": "station"},
         )
     return context.station_source()
+
+
+def _tool_list_procedures(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``list_procedures`` from the mirrored declaration.
+
+    The compact index over ``StationInfo.procedures``: everything that
+    identifies a procedure and says whether it can be run, without the form,
+    which is what ``describe_procedure`` is for. A procedure this rack cannot
+    run is listed with its reason rather than hidden, exactly as an offline
+    instrument is.
+
+    Args:
+        args: Unused; the tool takes none.
+        context: The tool context.
+
+    Returns:
+        ``{"procedures": [...]}``, in catalog order.
+    """
+    return {
+        "procedures": [
+            {
+                "procedure": entry.class_name,
+                "name": entry.name,
+                "description": entry.description,
+                "run_kind": entry.run_kind,
+                "availability": list(entry.availability),
+                "sweep_axis": entry.sweep_axis.get("key", ""),
+                "data_keys": entry.data_keys,
+            }
+            for entry in _station(context).procedures
+        ]
+    }
+
+
+def _tool_describe_procedure(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``describe_procedure`` by resolving the declared form.
+
+    The whole point of declaring a procedure's form as data rather than as a
+    method (the **conditional-parameter standard**, ``core.plan``): this
+    resolves it right here, against the mirrored snapshot, with no Station and
+    no call to the engine. A read never blocks and never polls the engine, and
+    that holds for a form whose shape depends on what has been chosen just as
+    it does for a status read.
+
+    Args:
+        args: The call's arguments — ``procedure`` and optional
+            ``selections``.
+        context: The tool context.
+
+    Returns:
+        The resolved form: the groups to fill in, and the structural
+        selections this rendering stands on.
+
+    Raises:
+        ToolError: If no procedure of that name is declared, or the
+            declaration cannot be resolved.
+    """
+    name = str(args["procedure"])
+    declared = {entry.class_name: entry for entry in _station(context).procedures}
+    entry = declared.get(name)
+    if entry is None:
+        raise ToolError(
+            f"unknown procedure {name!r}: this station declares "
+            f"{sorted(declared)}",
+            {"rule": "unknown_run_class", "procedure": name},
+        )
+
+    selections = args.get("selections") or {}
+    if not isinstance(selections, Mapping):
+        raise ToolError(
+            "selections must be an object of {parameter: value}",
+            {"rule": "bad_argument", "argument": "selections"},
+        )
+
+    try:
+        blocks = blocks_from_json([block.to_json() for block in entry.form])
+        groups = resolve_form(blocks, selections)
+    except ValueError as exc:
+        raise ToolError(
+            f"cannot resolve {name!r}'s form: {exc}",
+            {"rule": "unresolvable_form", "procedure": name},
+        ) from exc
+
+    return {
+        "procedure": entry.class_name,
+        "name": entry.name,
+        "description": entry.description,
+        "availability": list(entry.availability),
+        "sweep_axis": entry.sweep_axis,
+        "data_keys": entry.data_keys,
+        # The answers this rendering stands on, defaults included: send them
+        # back with any change to get the form that choice opens up.
+        "selections": {
+            param: selections.get(param, spec.default)
+            for group in groups
+            for param, spec in group.params.items()
+            if spec.structural
+        },
+        "groups": [
+            {
+                "key": group.key,
+                "title": group.title,
+                "params": [
+                    {
+                        "name": param,
+                        "kind": spec.type.__name__,
+                        "unit": spec.unit,
+                        "description": spec.description,
+                        "default": spec.default,
+                        "min": spec.min,
+                        "max": spec.max,
+                        "choices": dict(spec.choices) if spec.choices else None,
+                        "structural": spec.structural,
+                    }
+                    for param, spec in group.params.items()
+                ],
+            }
+            for group in groups
+        ],
+    }
 
 
 def _tool_list_runs(args: Mapping[str, Any], context: ToolContext) -> Any:
@@ -2747,6 +2904,8 @@ SESSION_TOOL_FUNCTIONS: dict[str, Callable[[Mapping[str, Any], ToolContext], Any
     "read_status": _tool_read_status,
     "read_station_info": _tool_read_station_info,
     "read_manifest": _tool_read_manifest,
+    "list_procedures": _tool_list_procedures,
+    "describe_procedure": _tool_describe_procedure,
     "list_runs": _tool_list_runs,
     "read_run_columns": _tool_read_run_columns,
     "read_run_slice": _tool_read_run_slice,

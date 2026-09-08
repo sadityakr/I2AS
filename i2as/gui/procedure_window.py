@@ -34,7 +34,7 @@ from i2as.gui.eln_settings_dialog import ElnSettingsDialog, persist_eln_settings
 from i2as.gui.live_plot_panel import LivePlotPanel
 from i2as.gui.notification_banner import NotificationBanner
 from i2as.gui.form_autosave import FormAutosaveState
-from i2as.gui.procedure_discovery import discover_procedures
+from i2as.core.procedure_catalog import discover_run_catalog
 from i2as.gui.procedure_params_panel import ProcedureParamsPanel
 from i2as.gui.queue_panel import QueuePanel
 from i2as.gui.widget_lifecycle import hold_window, release_window
@@ -193,7 +193,7 @@ class ProcedureWindow(QMainWindow):
         root.addWidget(self._banner)
 
         # ── Fixed 2x2 quadrant grid ────────────────────────────────────
-        self._procedure_classes = discover_procedures()
+        self._procedure_classes = list(discover_run_catalog().values())
         self._params_panel = ProcedureParamsPanel(
             self._station, self._procedure_classes
         )

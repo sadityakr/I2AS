@@ -21,6 +21,7 @@ __all__ = [
     "When",
     "ConditionalGroup",
     "resolve_form",
+    "blocks_from_json",
     "validate_form",
     "UIGroup",
     "DataSchema",
@@ -822,6 +823,69 @@ def resolve_form(
                 )
             merged[block.key][name] = spec
     return [ParamGroup(key=key, title=titles[key], params=merged[key]) for key in ordered]
+
+
+def blocks_from_json(
+    blocks: Sequence[Mapping[str, Any]],
+) -> tuple[ConditionalGroup, ...]:
+    """Rebuild a form declaration from its wire rendering.
+
+    The inverse of the rendering in ``core.procedure_catalog``, and the reason
+    a client that has never seen a procedure class can still resolve its form:
+    the declaration crosses the thread bridge as the JSON inside
+    ``ProcedureInfo.form``, and this turns it back into the blocks
+    ``resolve_form()`` takes. It lives here, in the layer-free vocabulary,
+    because the session layer needs it and may not import ``i2as.procedures``
+    (contract C11) — so the conversion cannot live beside the renderer.
+
+    Args:
+        blocks: The rendered blocks, each ``{key, title, params, when}`` with
+            ``params`` a list of the parameter dicts ``ProcedureFormBlock``
+            carries.
+
+    Returns:
+        The blocks, in the given order.
+
+    Raises:
+        ValueError: If a parameter declares a ``kind`` that is not a scalar
+            type name — a rendering this vocabulary did not produce.
+    """
+    by_name = {one.__name__: one for one in _PARAM_TYPES}
+    rebuilt: list[ConditionalGroup] = []
+    for block in blocks:
+        params: dict[str, ParamSpec] = {}
+        for spec in block.get("params") or ():
+            kind = str(spec.get("kind", ""))
+            if kind not in by_name:
+                raise ValueError(
+                    f"parameter {spec.get('name')!r} declares kind {kind!r}, "
+                    f"which is not one of {sorted(by_name)}"
+                )
+            params[str(spec["name"])] = ParamSpec(
+                type=by_name[kind],
+                default=spec.get("default"),
+                unit=str(spec.get("unit", "")),
+                description=str(spec.get("description", "")),
+                min=spec.get("min"),
+                max=spec.get("max"),
+                choices=dict(spec["choices"]) if spec.get("choices") else None,
+                structural=bool(spec.get("structural", False)),
+                widget_hint=str(spec.get("widget_hint") or "") or None,
+            )
+        rebuilt.append(
+            ConditionalGroup(
+                key=str(block["key"]),
+                title=str(block.get("title") or block["key"]),
+                params=params,
+                when=When(
+                    {
+                        str(name): tuple(values)
+                        for name, values in (block.get("when") or {}).items()
+                    }
+                ),
+            )
+        )
+    return tuple(rebuilt)
 
 
 def validate_form(blocks: Sequence[ConditionalGroup]) -> list[str]:
