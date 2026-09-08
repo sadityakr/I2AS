@@ -41,6 +41,17 @@ def manifest(station):
     return build_manifest(station)
 
 
+@pytest.fixture(scope="module")
+def declared(station):
+    """The unabridged procedure declarations, by class name.
+
+    The manifest carries only a row per procedure; the form itself lives in
+    ``StationInfo.procedures``, which is what ``describe_procedure`` answers
+    from, so that is where the form's own invariants are checked.
+    """
+    return {entry.class_name: entry for entry in station.station_info().procedures}
+
+
 @pytest.fixture()
 def context(station):
     """A tool context whose only station is the mirrored declaration."""
@@ -104,19 +115,26 @@ class TestManifest:
             discover_run_catalog()
         )
 
-    def test_a_procedure_carries_the_sweep_range_it_needs(self, manifest) -> None:
-        # The gap this section closed: get_param_groups() excluded the
-        # sweep-axis parameters because the GUI draws them with its own widget,
-        # so the only complete description of FieldSweep omitted the field
-        # range it sweeps. An agent cannot run what it cannot see.
+    def test_a_row_names_the_procedure_without_carrying_its_form(
+        self, manifest
+    ) -> None:
+        # The manifest is an index: a reader takes it in whole to see what the
+        # station can be asked to do. Every procedure's full conditional form
+        # would be several times the size of every instrument declaration
+        # combined, to describe forms the reader has not chosen a procedure
+        # from yet.
+        for entry in manifest["procedures"]:
+            assert "form" not in entry
+            assert entry["class_name"]
+
+    def test_the_row_is_enough_to_choose_a_procedure(self, manifest) -> None:
         field_sweep = _procedure(manifest, "FieldSweep")
-        declared = {
-            param["name"] for block in field_sweep["form"] for param in block["params"]
-        }
-        assert {"field_start", "field_end", "field_steps"} <= declared
+        assert field_sweep["sweep_axis"]["key"] == "field"
+        assert "field_vi" in field_sweep["roles"]
+        assert field_sweep["data_keys"]["default_x"] == "field_T"
 
     def test_the_form_covers_every_parameter_this_rack_can_fill(
-        self, station, manifest
+        self, station, declared
     ) -> None:
         # Everything a caller must supply has to be in the form. The one
         # exception is an OPTIONAL role no instrument on this rack can fill
@@ -124,22 +142,20 @@ class TestManifest:
         # discovery standard drops it rather than offering a drop-down with
         # nothing in it, and the run proceeds without positioning a stage.
         catalog = discover_run_catalog()
-        for entry in manifest["procedures"]:
-            if entry["availability"]:
+        for class_name, entry in declared.items():
+            if entry.availability:
                 continue
-            cls = catalog[entry["class_name"]]
-            declared = {
-                param["name"]
-                for block in entry["form"]
-                for param in block["params"]
+            cls = catalog[class_name]
+            offered = {
+                param["name"] for block in entry.form for param in block.params
             }
             unfillable = {
                 name
                 for name, role in cls.role_parameters.items()
                 if not role.candidates(station)
             }
-            missing = set(cls.parameters) - declared - unfillable
-            assert not missing, f"{entry['class_name']} omits {sorted(missing)}"
+            missing = set(cls.parameters) - offered - unfillable
+            assert not missing, f"{class_name} omits {sorted(missing)}"
 
     def test_a_required_role_this_rack_cannot_fill_is_flagged(self, station) -> None:
         # A required role with no candidate refuses the run at construction, so
@@ -167,15 +183,27 @@ class TestManifest:
         info = build_procedure_infos(station, {"NoMagnet": NoMagnet})[0]
         assert "missing_role:field_vi" in info.availability
 
-    def test_a_guarded_block_names_the_parameter_that_opens_it(self, manifest) -> None:
-        blocks = _procedure(manifest, "FieldSweep")["form"]
-        guarded = [block for block in blocks if block["when"]]
+    def test_the_sweep_range_is_part_of_the_declaration(self, declared) -> None:
+        # The gap this closed: get_param_groups() excluded the sweep-axis
+        # parameters because the GUI draws them with its own widget, so the
+        # only complete description of FieldSweep omitted the field range it
+        # sweeps. An agent cannot run what it cannot see.
+        offered = {
+            param["name"]
+            for block in declared["FieldSweep"].form
+            for param in block.params
+        }
+        assert {"field_start", "field_end", "field_steps"} <= offered
+
+    def test_a_guarded_block_names_the_parameter_that_opens_it(self, declared) -> None:
+        blocks = declared["FieldSweep"].form
+        guarded = [block for block in blocks if block.when]
         assert guarded, "the generic sweep procedure's form is conditional"
         introduced = {
-            param["name"] for block in blocks for param in block["params"]
+            param["name"] for block in blocks for param in block.params
         }
         for block in guarded:
-            assert set(block["when"]) <= introduced
+            assert set(block.when) <= introduced
 
 
 class TestGatewayTools:
@@ -268,11 +296,11 @@ class TestGatewayTools:
         assert "loop1_values" in _params(described, "reading_loop")
 
 
-def test_manifest_and_gui_resolve_the_same_form(station, manifest) -> None:
+def test_wire_and_gui_resolve_the_same_form(station, declared) -> None:
     """The GUI's groups and an agent's are one declaration, not two.
 
     The whole point of the standard: ``get_param_groups`` is now the GUI's
-    filtered view of the same blocks the manifest publishes, so the two cannot
+    filtered view of the same blocks the station publishes, so the two cannot
     drift. Everything the GUI renders must appear, identically, in what an
     agent resolves off the wire.
     """
@@ -281,7 +309,10 @@ def test_manifest_and_gui_resolve_the_same_form(station, manifest) -> None:
     selections = {"loop1_parameter": "dc_measurement.current_A"}
     gui = FieldSweep.get_param_groups(station, selections)
     wire = resolve_form(
-        blocks_from_json(_procedure(manifest, "FieldSweep")["form"]), selections
+        blocks_from_json(
+            [block.to_json() for block in declared["FieldSweep"].form]
+        ),
+        selections,
     )
 
     from i2as.core.procedure import SWEEP_AXIS_GROUP_KEY

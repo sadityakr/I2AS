@@ -78,10 +78,20 @@ def build_manifest(station: Station) -> dict[str, Any]:
 
     The whole of ``station.station_info()``, rendered to JSON, with one thing
     added: each instrument's capabilities resolved into its declared UI
-    groups. The ``procedures`` section is the station's own, rendered
-    unchanged: a procedure's form is already a resolvable declaration (the
-    **conditional-parameter standard**, ``core.plan``), so this module has
-    nothing to arrange — a reader resolves it with ``resolve_form()``. A group's ``monitored``/``controls`` name the members it declares,
+    groups. The ``procedures`` section is an index rather than the whole
+    declaration: one compact row per procedure, without its parameter form.
+
+    A procedure's form is a conditional declaration (the
+    **conditional-parameter standard**, ``core.plan``) that names every block
+    it could ever show, which for the generic sweep procedures is several
+    times the size of every instrument declaration combined. Carrying all of
+    them here would have tripled a document whose whole value is that a reader
+    can take it in at once, to describe forms that reader has not yet chosen a
+    procedure from. So the manifest says what can be run and the row says what
+    it needs to be told; ``describe_procedure`` serves the form for the one
+    procedure a caller has settled on, resolved for their selections. The
+    declaration itself is unabridged in ``StationInfo.procedures``, which is
+    what that tool answers from. A group's ``monitored``/``controls`` name the members it declares,
     in declared order, and the instrument's ``ungrouped`` block names
     everything no group claims, after them. The full details stay in the
     instrument's own ``monitored``/``controls`` lists, ordered the same way —
@@ -104,7 +114,7 @@ def build_manifest(station: Station) -> dict[str, Any]:
         "seq": info.seq,
         "ts": info.ts,
         "instruments": [_instrument_json(entry) for entry in info.instruments],
-        "procedures": [entry.to_json() for entry in info.procedures],
+        "procedures": [_procedure_json(entry) for entry in info.procedures],
     }
 
 
@@ -158,6 +168,26 @@ def _instrument_json(instrument: Any) -> dict[str, Any]:
     return payload
 
 
+def _procedure_json(procedure: Any) -> dict[str, Any]:
+    """Render one ``ProcedureInfo`` as its manifest row.
+
+    Everything the declaration holds except ``form``: what the procedure is,
+    the identifier a run names it by, the axis it sweeps, the instrument roles
+    it fills, the columns it writes, and whether this rack can run it. That is
+    enough to choose a procedure; choosing its parameters is what
+    ``describe_procedure`` is for.
+
+    Args:
+        procedure: One entry of ``StationInfo.procedures``.
+
+    Returns:
+        The procedure's JSON object, without its parameter form.
+    """
+    payload = procedure.to_json()
+    payload.pop("form", None)
+    return payload
+
+
 def _ordered_by_group(
     entries: Sequence[Mapping[str, Any]], claimed: Sequence[str], trailing: Sequence[str]
 ) -> list[dict[str, Any]]:
@@ -194,8 +224,8 @@ MANIFEST_SCHEMA: dict[str, Any] = {
     "description": (
         "Everything one I2AS station declares: each configured "
         "instrument's readings, actions, parameter specs, configured limits, "
-        "capability groups and safety flags, plus every procedure it can be "
-        "asked to run and the whole conditional parameter form each takes."
+        "capability groups and safety flags, plus an index of every procedure "
+        "it can be asked to run."
     ),
     "type": "object",
     "required": [
@@ -233,7 +263,10 @@ MANIFEST_SCHEMA: dict[str, Any] = {
             "description": (
                 "Every procedure the run catalog holds, runnable or not — "
                 "what this station can be asked to RUN, as opposed to what "
-                "each instrument can be told to do."
+                "each instrument can be told to do. One row per procedure, "
+                "without its parameter form: call describe_procedure with a "
+                "class_name from here to get the parameters to fill in, "
+                "resolved for the selections made so far."
             ),
         },
     },
@@ -341,83 +374,12 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "max": {"type": ["number", "null"]},
             },
         },
-        "procedure_param": {
-            "type": "object",
-            "description": (
-                "One procedure parameter, from its ParamSpec. Distinct from "
-                "an @control parameter: it is always declared, and it carries "
-                "'structural', which says whether changing it changes which "
-                "blocks of the form apply."
-            ),
-            "required": [
-                "name",
-                "kind",
-                "unit",
-                "description",
-                "default",
-                "min",
-                "max",
-                "choices",
-                "structural",
-                "widget_hint",
-            ],
-            "additionalProperties": False,
-            "properties": {
-                "name": {"type": "string"},
-                "kind": {
-                    "type": "string",
-                    "description": "Scalar type name: float, int, str or bool.",
-                },
-                "unit": {"type": "string"},
-                "description": {"type": "string"},
-                "default": {"description": "The declared default, a JSON scalar."},
-                "min": {"type": ["number", "null"]},
-                "max": {"type": ["number", "null"]},
-                "choices": {
-                    "type": ["object", "null"],
-                    "description": "Label -> value for an enumerated parameter.",
-                },
-                "structural": {
-                    "type": "boolean",
-                    "description": (
-                        "Whether changing this value changes which blocks of "
-                        "the form apply, and so must be sent back as a "
-                        "selection to see the rest of the form."
-                    ),
-                },
-                "widget_hint": {"type": "string"},
-            },
-        },
-        "procedure_form_block": {
-            "type": "object",
-            "description": (
-                "One block of a procedure's form and the condition it appears "
-                "under. Blocks sharing a key merge into one group. A block "
-                "whose 'when' is empty is always present; otherwise every "
-                "named parameter must hold one of the listed values (ANDed "
-                "across parameters, ORed within one)."
-            ),
-            "required": ["key", "title", "params", "when"],
-            "additionalProperties": False,
-            "properties": {
-                "key": {"type": "string"},
-                "title": {"type": "string"},
-                "params": {
-                    "type": "array",
-                    "items": {"$ref": "#/$defs/procedure_param"},
-                },
-                "when": {
-                    "type": "object",
-                    "description": "parameter -> accepted values.",
-                    "additionalProperties": {"type": "array"},
-                },
-            },
-        },
         "procedure": {
             "type": "object",
             "description": (
-                "One procedure: the class name a run names, and the whole "
-                "conditional form it takes."
+                "One procedure the station can run: the class name a run "
+                "names it by, and what it needs to be told at a glance. Its "
+                "parameter form comes from describe_procedure."
             ),
             "required": [
                 "class_name",
@@ -428,7 +390,6 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "sweep_axis",
                 "roles",
                 "data_keys",
-                "form",
             ],
             "additionalProperties": False,
             "properties": {
@@ -466,10 +427,6 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "data_keys": {
                     "type": "object",
                     "description": "The columns a finished run writes.",
-                },
-                "form": {
-                    "type": "array",
-                    "items": {"$ref": "#/$defs/procedure_form_block"},
                 },
             },
         },
