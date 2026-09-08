@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +18,10 @@ __all__ = [
     "StepPlan",
     "ParamSpec",
     "ParamGroup",
+    "When",
+    "ConditionalGroup",
+    "resolve_form",
+    "validate_form",
     "UIGroup",
     "DataSchema",
     "DurationEstimate",
@@ -537,6 +541,380 @@ class ParamGroup:
                 )
         object.__setattr__(self, "params", dict(self.params))
 
+
+# ── Conditional parameters: the guarded-block form declaration ────────────────
+#
+# The **conditional-parameter standard**. A procedure's form is not a fixed
+# list of fields: choosing a measurement VI changes which measurement
+# parameters exist, and choosing a loop parameter changes which value field
+# appears beside it. Historically that was expressed as a METHOD the caller
+# re-ran with the current answers (``get_param_groups(station, selections)``),
+# which works for a GUI holding a live Station and fails for every client that
+# does not: a function cannot be put in a snapshot and shipped over a socket,
+# so the agent gateway — which holds only a mirrored ``StationInfo`` — could
+# never see a procedure's form at all.
+#
+# The fix is to publish the whole rulebook once instead of answering one
+# question at a time. A procedure declares every block of parameters it could
+# ever show, each carrying the condition under which it applies (``When``), and
+# ``resolve_form()`` — a pure function over that data — picks the active ones
+# for a given set of answers. The declaration is data, so it crosses the
+# thread bridge in ``StationInfo`` like every other declaration; the resolver
+# is pure, so the GUI, the CLI and the agent gateway all run the same one and
+# cannot disagree about what a procedure asks for.
+#
+# **Guards are equality, deliberately.** A ``When`` names parameters and the
+# values they must hold — nothing else. There is no comparison operator, no
+# negation and no expression language, because a guard language that grows
+# operators becomes a small programming language that no client can be trusted
+# to evaluate identically. Every dependency a procedure actually has is
+# "this parent is set to that value", and a dependency that cannot be written
+# that way is a sign the parameter should be split, not that the guard
+# language should grow.
+#
+# **Dependent choices need no second mechanism.** A parameter whose *choices*
+# depend on a parent (the loop selectors, whose options come from the selected
+# measurement VI) is declared as one guarded copy of that parameter per parent
+# value. "Which parameters exist" and "which choices a parameter offers" are
+# then the same construct, resolved by the same function.
+
+
+@dataclass(frozen=True)
+class When:
+    """The condition under which one ``ConditionalGroup`` is part of the form.
+
+    A guard names structural parameters and the values each must hold. The
+    conditions are ANDed across parameters and ORed within one parameter's
+    accepted values, so ``When({"measurement_vi": ("dc", "lockin")})`` is
+    satisfied by either VI, and adding a second key requires both. An empty
+    guard is satisfied by everything, which is what an unconditional block
+    carries.
+
+    A parameter the answers do not mention fails the guard rather than
+    passing it. That is not a special case at resolve time: ``resolve_form()``
+    fills a newly-active parameter's declared default into the answers before
+    re-evaluating, so a caller that supplies nothing still lands on the
+    default form rather than an empty one.
+
+    Attributes:
+        conditions: ``{parameter name: accepted values}``. Defensively copied,
+            with each value sequence frozen to a tuple. Empty means
+            unconditional.
+    """
+
+    conditions: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate the guard and defensively copy its conditions.
+
+        Raises:
+            TypeError: If ``conditions`` is not a dict, a key is not a string,
+                or a value is not a sequence.
+            ValueError: If a key is empty or a parameter accepts no value at
+                all — a guard nothing can satisfy is a declaration bug, not a
+                way to hide a block.
+        """
+        if not isinstance(self.conditions, dict):
+            raise TypeError(f"When.conditions must be a dict, got {self.conditions!r}")
+        frozen: dict[str, tuple[Any, ...]] = {}
+        for name, accepted in self.conditions.items():
+            if not isinstance(name, str):
+                raise TypeError(f"When.conditions key must be a str, got {name!r}")
+            if not name:
+                raise ValueError("When.conditions key must be a non-empty str")
+            if isinstance(accepted, (str, bytes)) or not isinstance(
+                accepted, (list, tuple)
+            ):
+                raise TypeError(
+                    f"When.conditions[{name!r}] must be a list or tuple of "
+                    f"accepted values, got {accepted!r}"
+                )
+            if not accepted:
+                raise ValueError(
+                    f"When.conditions[{name!r}] accepts no value, so nothing "
+                    f"can satisfy this guard"
+                )
+            frozen[name] = tuple(accepted)
+        object.__setattr__(self, "conditions", frozen)
+
+    @property
+    def parameters(self) -> tuple[str, ...]:
+        """Return the parameter names this guard reads, in declaration order.
+
+        Returns:
+            The guarded parameter names; empty for an unconditional guard.
+        """
+        return tuple(self.conditions)
+
+    def holds(self, selections: Mapping[str, Any]) -> bool:
+        """Whether *selections* satisfies this guard.
+
+        Args:
+            selections: The answers so far, as ``{parameter name: value}``.
+
+        Returns:
+            ``True`` when every named parameter is present and holds one of
+            its accepted values. An unconditional guard always holds.
+        """
+        for name, accepted in self.conditions.items():
+            if name not in selections:
+                return False
+            value = selections[name]
+            if not any(_same_value(value, one) for one in accepted):
+                return False
+        return True
+
+    def to_json(self) -> dict[str, list[Any]]:
+        """Render the guard as JSON-safe data.
+
+        Returns:
+            ``{parameter: [accepted values]}``, empty for an unconditional
+            guard.
+        """
+        return {name: list(accepted) for name, accepted in self.conditions.items()}
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    """Compare two selection values without conflating bools with numbers.
+
+    ``True == 1`` in Python, which would let a boolean answer satisfy a guard
+    written for a numeric choice (and the reverse). Every other comparison is
+    plain equality, so a float answer still matches an int-declared choice.
+
+    Args:
+        left: One value.
+        right: The other.
+
+    Returns:
+        Whether the two count as the same selection.
+    """
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    return bool(left == right)
+
+
+@dataclass(frozen=True)
+class ConditionalGroup:
+    """One block of a procedure's form, and the condition it appears under.
+
+    A form declaration is an ordered sequence of these. Blocks sharing a
+    ``key`` merge into one rendered ``ParamGroup`` — that is how a group whose
+    contents are partly conditional is written: an unconditional block naming
+    the selector, then a guarded block per selection naming what that
+    selection adds. Declaration order is the render order, so a block is
+    declared where its parameters belong, not appended at the end.
+
+    Attributes:
+        key: The rendered ``ParamGroup``'s stable identity. Blocks sharing one
+            merge, so the same key may appear on several blocks.
+        title: The rendered group's heading. The first active block with a
+            given key supplies it.
+        params: This block's parameters, by name. Defensively copied.
+        when: The condition under which the block is part of the form.
+            Defaults to unconditional.
+    """
+
+    key: str
+    title: str
+    params: dict[str, ParamSpec]
+    when: When = field(default_factory=When)
+
+    def __post_init__(self) -> None:
+        """Validate the block and defensively copy its parameters.
+
+        Raises:
+            TypeError: If ``key``/``title`` is not a string, ``params`` is not
+                a dict of ``ParamSpec``, or ``when`` is not a ``When``.
+            ValueError: If ``key``/``title`` or a parameter name is empty.
+        """
+        for name, val in (("key", self.key), ("title", self.title)):
+            if not isinstance(val, str):
+                raise TypeError(f"ConditionalGroup.{name} must be a str, got {val!r}")
+            if not val:
+                raise ValueError(f"ConditionalGroup.{name} must be a non-empty str")
+
+        if not isinstance(self.params, dict):
+            raise TypeError(
+                f"ConditionalGroup.params must be a dict, got {self.params!r}"
+            )
+        for name, spec in self.params.items():
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"ConditionalGroup.params key must be a str, got {name!r}"
+                )
+            if not name:
+                raise ValueError("ConditionalGroup.params key must be a non-empty str")
+            if not isinstance(spec, ParamSpec):
+                raise TypeError(
+                    f"ConditionalGroup.params[{name!r}] must be a ParamSpec, "
+                    f"got {spec!r}"
+                )
+        if not isinstance(self.when, When):
+            raise TypeError(f"ConditionalGroup.when must be a When, got {self.when!r}")
+        object.__setattr__(self, "params", dict(self.params))
+
+
+def resolve_form(
+    blocks: Sequence[ConditionalGroup], selections: Mapping[str, Any] | None = None
+) -> list[ParamGroup]:
+    """Resolve a guarded form declaration against one set of answers.
+
+    The evaluator half of the **conditional-parameter standard**, and the one
+    every client runs: the GUI on each structural change, the CLI and the
+    agent gateway on a described procedure. It is pure — no Station, no
+    instrument, no I/O — which is what lets a client holding nothing but a
+    mirrored declaration answer "what does this procedure ask for?" without
+    calling the engine.
+
+    Resolution is staged, because guards cascade: selecting a measurement VI
+    decides which loop parameters are offered, and selecting one of those
+    decides which value field appears. Each pass activates the blocks whose
+    guards now hold and fills the declared default of every parameter those
+    blocks introduce and the caller did not answer; the next pass sees those
+    defaults. Answers are only ever added, never overwritten, so activation
+    is monotonic and the loop settles in at most one pass per block. A caller
+    passing nothing therefore lands on the fully-defaulted form, which is what
+    ``get_param_groups(station, None)`` has always returned.
+
+    Args:
+        blocks: The form declaration, in render order.
+        selections: The answers so far. ``None`` and ``{}`` both mean "use
+            every default".
+
+    Returns:
+        The active blocks merged into ``ParamGroup``s: one group per distinct
+        key, in the order the key first appears, holding the active blocks'
+        parameters in declaration order.
+
+    Raises:
+        ValueError: If two active blocks sharing a key declare the same
+            parameter name. Which of the two a client rendered would decide
+            what the run does, so this is refused rather than resolved by
+            precedence.
+    """
+    effective: dict[str, Any] = dict(selections or {})
+    active: list[tuple[int, ConditionalGroup]] = []
+    remaining = list(enumerate(blocks))
+
+    while True:
+        newly = [entry for entry in remaining if entry[1].when.holds(effective)]
+        if not newly:
+            break
+        for entry in newly:
+            remaining.remove(entry)
+            for name, spec in entry[1].params.items():
+                effective.setdefault(name, spec.default)
+        active.extend(newly)
+
+    ordered: list[str] = []
+    titles: dict[str, str] = {}
+    merged: dict[str, dict[str, ParamSpec]] = {}
+    for _index, block in sorted(active, key=lambda entry: entry[0]):
+        if block.key not in merged:
+            ordered.append(block.key)
+            titles[block.key] = block.title
+            merged[block.key] = {}
+        for name, spec in block.params.items():
+            if name in merged[block.key]:
+                raise ValueError(
+                    f"two active blocks of group {block.key!r} both declare "
+                    f"the parameter {name!r}"
+                )
+            merged[block.key][name] = spec
+    return [ParamGroup(key=key, title=titles[key], params=merged[key]) for key in ordered]
+
+
+def validate_form(blocks: Sequence[ConditionalGroup]) -> list[str]:
+    """Check a guarded form declaration for the faults that make it unusable.
+
+    Returns errors rather than raising, mirroring ``validate_manifest()`` and
+    ``validate_config_dir()``: a declaration is checked once, at build time,
+    and its author wants every fault at once. Being checkable at all is the
+    point of declaring the form as data — the same faults inside a method that
+    computes the form can only surface as a wrong or looping form under the
+    one selection that triggers them, which in a lab is discovered mid-run.
+
+    Three faults are checked:
+
+    * A guard naming a parameter no block declares. Nothing can ever satisfy
+      it, so the block is dead and its parameters silently absent.
+    * A cycle in the guard graph — a parameter whose presence depends,
+      directly or through other blocks, on itself. ``resolve_form()`` does not
+      hang on one (activation is monotonic), it simply never activates the
+      blocks in the cycle, which is worse: the form comes back quietly
+      incomplete.
+    * A block that declares no parameters, which renders an empty group box.
+
+    Args:
+        blocks: The form declaration to check.
+
+    Returns:
+        Human-readable error strings, each naming the block it concerns. An
+        empty list means the declaration is sound.
+    """
+    errors: list[str] = []
+    introduced_by: dict[str, list[int]] = {}
+    for index, block in enumerate(blocks):
+        if not block.params:
+            errors.append(f"block {index} ({block.key!r}) declares no parameters")
+        for name in block.params:
+            introduced_by.setdefault(name, []).append(index)
+
+    for index, block in enumerate(blocks):
+        for name in block.when.parameters:
+            if name not in introduced_by:
+                errors.append(
+                    f"block {index} ({block.key!r}) is guarded on {name!r}, "
+                    f"which no block declares"
+                )
+
+    # Edge i -> j when block j's guard reads a parameter block i introduces:
+    # j cannot be resolved until i has been. A cycle is a block whose own
+    # activation is a precondition of itself.
+    edges: dict[int, set[int]] = {index: set() for index in range(len(blocks))}
+    for index, block in enumerate(blocks):
+        for name in block.when.parameters:
+            for source in introduced_by.get(name, ()):
+                if source != index:
+                    edges[source].add(index)
+
+    for index in _cyclic_nodes(edges):
+        errors.append(
+            f"block {index} ({blocks[index].key!r}) is part of a guard cycle: "
+            f"its parameters can never appear"
+        )
+    return errors
+
+
+def _cyclic_nodes(edges: Mapping[int, set[int]]) -> list[int]:
+    """Return the nodes that lie on a cycle, by iterative peeling.
+
+    Repeatedly drops nodes with no incoming edge; whatever survives is
+    exactly the set reachable only from within a cycle. Iterative rather than
+    a recursive depth-first search so a pathological declaration cannot
+    exhaust the stack.
+
+    Args:
+        edges: Adjacency as ``{node: successors}``, keyed by every node.
+
+    Returns:
+        The surviving node ids, ascending.
+    """
+    incoming = {node: 0 for node in edges}
+    for successors in edges.values():
+        for node in successors:
+            incoming[node] += 1
+
+    queue = [node for node, count in incoming.items() if count == 0]
+    seen: set[int] = set()
+    while queue:
+        node = queue.pop()
+        seen.add(node)
+        for successor in edges[node]:
+            incoming[successor] -= 1
+            if incoming[successor] == 0:
+                queue.append(successor)
+    return sorted(node for node in edges if node not in seen)
 
 @dataclass(frozen=True)
 class UIGroup:

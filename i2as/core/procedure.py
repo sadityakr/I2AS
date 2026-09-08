@@ -15,6 +15,7 @@ from i2as.core.exceptions import I2ASConfigError
 from i2as.core.gates import Gate
 from i2as.core.plan import (
     Command,
+    ConditionalGroup,
     DataSchema,
     ParamGroup,
     ParamSpec,
@@ -23,6 +24,8 @@ from i2as.core.plan import (
     StepCost,
     StepPlan,
     Target,
+    When,
+    resolve_form,
 )
 from i2as.core.station import Station
 from i2as.core.sweep_builder import SweepAxis, build_axis_sweep, sweep_axis_param_specs
@@ -81,6 +84,13 @@ class RoleParam:
     candidates: Callable[[Any], list[str]]
     description: str
     required: bool = True
+
+
+#: The key of the group holding a ``sweep_axis``'s generated parameters. The
+#: GUI drops it from ``get_param_groups()`` because it renders those parameters
+#: through ``SweepAxisWidget``; every other client keeps it, because the sweep
+#: range is exactly what a caller must supply to run the procedure.
+SWEEP_AXIS_GROUP_KEY = "sweep_axis"
 
 
 class BaseProcedure:
@@ -211,49 +221,98 @@ class BaseProcedure:
         }
 
     @classmethod
-    def get_param_groups(
-        cls, station: Station, selections: Mapping[str, Any] | None = None
-    ) -> list[ParamGroup]:
-        """Return the ordered ``ParamGroup`` list the GUI renders for this procedure.
+    def declaration_form(cls, station: Station) -> tuple[ConditionalGroup, ...]:
+        """Return this procedure's whole form as guarded blocks — the rulebook.
 
-        This is the hook the GUI form builder calls instead of reading the three
-        class dicts directly. The default implementation returns the static
-        Sweep / System / Measurement groups, in that order, SKIPPING any that
-        declare no parameters. The ``sweep_axis`` hidden parameters are
-        deliberately NOT in any group: the GUI renders them through the separate
-        ``SweepAxisWidget`` (linear / segments / CSV), exactly as before.
+        The **conditional-parameter standard**'s declaration half (see
+        ``core.plan``), and the method a procedure overrides to describe a form
+        whose shape depends on what has been chosen. It is called ONCE, with no
+        answers, and must name every block the form could ever show together
+        with the condition each appears under; ``resolve_form()`` then picks
+        the active ones for a given set of answers.
 
-        ``station`` and ``selections`` are unused by this default, but are part
-        of the signature so a Wave-5 subclass can override this method to
-        compute its groups dynamically — e.g. deriving measurement groups from
-        the station's configured measurement VI, or re-deriving the whole form
-        from a ``structural`` selection the user has changed (hence
-        ``selections``, the current values of any structural parameters).
+        Declaring the form rather than computing it is what lets every client
+        see it. The result is plain data, so the Station puts it in
+        ``StationInfo`` and it crosses the thread bridge to a GUI mirror, the
+        CLI and the agent gateway alike; a method that computes a form from a
+        live Station can only ever be run by a client that holds one, which is
+        why procedures were invisible to agents while this was
+        ``get_param_groups``. It is also checkable: ``validate_form()`` finds a
+        guard cycle or a guard on a parameter nothing declares at build time,
+        rather than leaving it to surface under the one selection that
+        triggers it.
+
+        The default implementation declares the static Instruments / Sweep /
+        System / Measurement groups unconditionally, skipping any that hold no
+        parameters, preceded by the ``sweep_axis`` group when the class
+        declares an axis.
 
         Args:
-            station: The active Station instance (unused by the default).
-            selections: Current values of the form's structural parameters, or
-                ``None`` before any have been chosen (unused by the default).
+            station: The active Station — the source of every station-dependent
+                choice list (role candidates, measurement VIs). Read for
+                declarations only: this issues no instrument traffic, which is
+                what lets ``StationInfo`` carry the result.
 
         Returns:
-            The non-empty parameter groups, in Sweep, System, Measurement order.
+            The form declaration, in render order.
         """
+        blocks: list[ConditionalGroup] = []
+        if cls.sweep_axis:
+            blocks.append(
+                ConditionalGroup(
+                    key=SWEEP_AXIS_GROUP_KEY,
+                    title=cls.sweep_axis.description or "Sweep axis",
+                    params=sweep_axis_param_specs(cls.sweep_axis),
+                )
+            )
         candidates = (
-            ("instruments", "Instruments", cls._role_param_specs(station, selections)),
+            ("instruments", "Instruments", cls._role_param_specs(station)),
             ("sweep", "Sweep", cls.sweep_parameters),
             ("system", "System", cls.system_parameters),
             ("measurement", "Measurement", cls.measurement_parameters),
         )
-        return [
-            ParamGroup(key=key, title=title, params=params)
+        blocks.extend(
+            ConditionalGroup(key=key, title=title, params=dict(params))
             for key, title, params in candidates
             if params
+        )
+        return tuple(blocks)
+
+    @classmethod
+    def get_param_groups(
+        cls, station: Station, selections: Mapping[str, Any] | None = None
+    ) -> list[ParamGroup]:
+        """Return the parameter groups the GUI renders for these selections.
+
+        The GUI's view of :meth:`declaration_form`, and now derived from it
+        rather than a second description of the same form: this resolves the
+        declaration against *selections* and drops the ``sweep_axis`` group,
+        whose parameters the GUI renders through the separate
+        ``SweepAxisWidget`` (linear / segments / CSV) instead of as plain
+        fields. That exclusion is the ONE difference between what the GUI
+        renders and what the declaration holds, which is why it lives here as
+        a single filter rather than as a form the sweep parameters are missing
+        from — an agent reading the declaration needs the sweep range, and
+        omitting it was how ``field_start`` came to be undiscoverable.
+
+        Args:
+            station: The active Station.
+            selections: Current values of the form's structural parameters, or
+                ``None`` before any have been chosen. Every unanswered
+                parameter takes its declared default, so ``None`` yields the
+                default form.
+
+        Returns:
+            The active parameter groups, in declared order.
+        """
+        return [
+            group
+            for group in resolve_form(cls.declaration_form(station), selections)
+            if group.key != SWEEP_AXIS_GROUP_KEY
         ]
 
     @classmethod
-    def _role_param_specs(
-        cls, station: Station, selections: Mapping[str, Any] | None = None
-    ) -> dict[str, ParamSpec]:
+    def _role_param_specs(cls, station: Station) -> dict[str, ParamSpec]:
         """Build this procedure's role parameters against a live Station.
 
         The rendering half of the role-discovery standard (see
@@ -263,27 +322,26 @@ class BaseProcedure:
         candidate contributes no widget; a REQUIRED one is refused at
         construction instead, where the message can say what to configure.
 
+        A role parameter is not ``structural`` — changing one swaps which
+        instrument fills a role, never which parameters exist — so its default
+        is the station's first candidate and the operator's own choice is
+        carried by the answers, not by re-deriving the spec around it.
+
         Args:
             station: The active Station, which supplies the candidates.
-            selections: Current structural-parameter values, so a role the
-                user already chose stays chosen across a re-render.
 
         Returns:
             ``{param_name: ParamSpec}``, empty when this procedure declares
             no roles or the station has none of them.
         """
-        selections = selections or {}
         specs: dict[str, ParamSpec] = {}
         for name, role in cls.role_parameters.items():
             names = role.candidates(station)
             if not names:
                 continue
-            selected = selections.get(name)
-            if selected not in names:
-                selected = names[0]
             specs[name] = ParamSpec(
                 type=str,
-                default=selected,
+                default=names[0],
                 choices={vi_name: vi_name for vi_name in names},
                 description=role.description,
             )
@@ -1336,166 +1394,258 @@ class SweepMeasureProcedure(BaseProcedure):
     # ------------------------------------------------------------------
 
     @classmethod
-    def get_param_groups(
-        cls, station: Station, selections: Mapping[str, Any] | None = None
-    ) -> list[ParamGroup]:
-        """Build the form: the static Sweep/System groups + measurement select.
+    def declaration_form(cls, station: Station) -> tuple[ConditionalGroup, ...]:
+        """Declare the whole form: every measurement method and every loop.
 
-        Appends the dynamic groups after the class's static groups: a
-        "Measurement method" group with the structural ``measurement_vi``
-        selector, a single "Reading loop" group holding the two generic loop
-        slots (each a ``{slot}_parameter`` drop-down over every loopable
-        parameter the station's reading path advertises, plus that
-        parameter's values input — per-choice ``{slot}_pick_{value}``
-        checkboxes when enumerated, a ``{slot}_values`` text field otherwise),
-        and a group carrying the selected VI's own ``measurement_parameters``.
-        Nothing loopable on this station means no Reading loop group at all.
+        The generic sweep procedure is where the **conditional-parameter
+        standard** earns its keep. Three things about this form depend on what
+        has been chosen: the selected measurement VI decides which parameter
+        group appears, it also decides which parameters the two loop slots
+        offer, and each slot's selection then decides which value field appears
+        beside it. That is a two-level cascade, and it used to be expressed by
+        recomputing the form from the current answers — which no client
+        without a live Station could do.
+
+        Declared instead, it is one block per reachable choice rather than one
+        form per reachable combination: a selector, then per measurement VI a
+        guarded loop-selector block and a guarded parameters block, then per
+        (VI, loopable parameter) a guarded value block. The count grows with
+        the rack's instruments, not with the product of every selection, and
+        ``resolve_form()`` picks the active ones.
+
+        The blocks are emitted VI by VI so that whichever VI is selected, the
+        groups resolve in the same order the GUI has always drawn them:
+        Measurement method, Reading loop, then the VI's own parameters.
 
         Args:
-            station: The active Station (supplies the measurement VIs).
-            selections: Current structural-param values; ``measurement_vi`` picks
-                the VI whose parameters group is shown (defaults to the first),
-                the ``loopN_*`` values carry the reading loop.
+            station: The active Station, which supplies the measurement VIs,
+                their selector labels, their parameters and their loopable
+                reading parameters. Declarations only — no bus traffic.
 
         Returns:
-            The ordered ``ParamGroup`` list the GUI renders.
+            The form declaration, in render order.
 
         Raises:
-            I2ASConfigError: If the station has no measurement VIs, or a
-                measurement param name collides with a procedure param.
+            I2ASConfigError: If the station exposes no measurement VI, or none
+                whose parameter names this procedure can accept.
         """
         names = station.measurement_vi_names()
         if not names:
             raise I2ASConfigError(
                 f"{cls.name!r} needs a measurement VI, but this station has none."
             )
-        selections = selections or {}
-        selected = selections.get("measurement_vi")
-        if selected not in names:
-            selected = names[0]
 
-        # Static Sweep/System groups (Measurement is empty for a generic proc).
-        groups = super().get_param_groups(station, selections)
+        # A VI whose parameter names collide with this procedure's own cannot be
+        # run by it, so it is not offered. Skipping it beats raising: on a rack
+        # of several measurement VIs, one badly-named instrument would
+        # otherwise make the procedure — and the station declaration that
+        # carries it — unbuildable for all of them. Refusing the whole rack for
+        # one instrument's naming is a worse answer than not listing it.
+        usable: list[str] = []
+        for vi_name in names:
+            collisions = cls._measurement_param_collisions(station, vi_name)
+            if collisions:
+                logger.warning(
+                    "%r cannot offer measurement VI %r: its parameter(s) %s "
+                    "collide with the procedure's own",
+                    cls.name,
+                    vi_name,
+                    collisions,
+                )
+                continue
+            usable.append(vi_name)
+        if not usable:
+            raise I2ASConfigError(
+                f"{cls.name!r}: every measurement VI on this station has "
+                f"parameter names colliding with the procedure's own."
+            )
 
-        # (a) The measurement-method selector. Labels are the VI's SHORT
-        # selector_label (keeps the drop-down / column narrow); the
-        # collected/mapped value is the bare VI name. The GUI carries the
+        blocks = list(super().declaration_form(station))
+
+        # (a) The measurement-method selector, the top of the cascade. Labels
+        # are the VI's SHORT selector_label (keeps the drop-down / column
+        # narrow); the collected value is the bare VI name. The GUI carries the
         # vi_name in a per-item tooltip for disambiguation when two VIs share a
         # label. Falls back to the VI name if two selector labels collide (a
         # dict key would otherwise be lost).
         choices: dict[str, str] = {}
-        for name in names:
-            label = station.measurement_selector_label(name)
-            key = label if label and label not in choices else name
-            choices[key] = name
-        select_spec = ParamSpec(
-            type=str,
-            default=selected,
-            choices=choices,
-            structural=True,
-            description="Measurement method to run at each sweep point",
-        )
-        groups.append(
-            ParamGroup(
+        for vi_name in usable:
+            label = station.measurement_selector_label(vi_name)
+            key = label if label and label not in choices else vi_name
+            choices[key] = vi_name
+        blocks.append(
+            ConditionalGroup(
                 key="measurement_select",
                 title="Measurement method",
-                params={"measurement_vi": select_spec},
+                params={
+                    "measurement_vi": ParamSpec(
+                        type=str,
+                        default=usable[0],
+                        choices=choices,
+                        structural=True,
+                        description="Measurement method to run at each sweep point",
+                    )
+                },
             )
         )
-        vi = station.get_vi(selected)
 
-        # (b) The reading loop, rendered ABOVE the VI's own parameter group.
-        # Two generic slots, each a loopable parameter (anything the station's
-        # reading path advertises via reading_setters) plus its values input. The
-        # values input is spec-driven: an enumerated parameter renders one
-        # checkbox per choice ("{slot}_pick_{value}"), a free parameter a
-        # comma-separated text field ("{slot}_values"). Everything here is
-        # structural — changing any of it changes which columns the run
-        # produces. Nothing loopable on this station -> no group, zero change.
-        registry = cls._loopable_registry(station, selected)
-        if registry:
-            loop_group_params: dict[str, ParamSpec] = {}
-            slot_choices: dict[str, str] = {"Off": ""}
-            for qualified, (slot_vi, param_name, spec, _setter) in registry.items():
-                display = (
-                    f"{param_name} ({spec.unit})"
-                    if spec.unit
-                    else f"{param_name} ({slot_vi})"
+        for vi_name in usable:
+            blocks.extend(cls._reading_loop_blocks(station, vi_name))
+            blocks.append(cls._measurement_params_block(station, vi_name))
+        return tuple(blocks)
+
+    @classmethod
+    def _measurement_param_collisions(cls, station: Station, vi_name: str) -> list[str]:
+        """Return the measurement parameters of *vi_name* this procedure owns.
+
+        A measurement VI's parameters are merged into one flat form beside the
+        procedure's own, so a shared name would make the value ambiguous —
+        which knob does ``current_A`` set? Reported rather than raised so the
+        caller can decide whether to drop one instrument or refuse the lot.
+
+        Args:
+            station: The active Station.
+            vi_name: The measurement VI to check.
+
+        Returns:
+            The colliding parameter names, sorted; empty when there are none.
+        """
+        vi_specs = station.get_vi(vi_name).active_measurement_parameters
+        return sorted((set(cls.parameters) | _STRUCTURAL_PARAM_NAMES) & set(vi_specs))
+
+    @classmethod
+    def _reading_loop_blocks(
+        cls, station: Station, vi_name: str
+    ) -> list[ConditionalGroup]:
+        """Declare the Reading loop group for one measurement VI.
+
+        Two generic slots, each a loopable parameter of the station's reading
+        path plus its values input. Both the slot's CHOICES and the shape of
+        its values input are conditional, and both are expressed the same way —
+        as a guarded copy of the parameter — so dependent choices need no
+        mechanism of their own: the slot selector is declared once per
+        measurement VI, guarded on that VI, and the value input once per
+        (VI, loopable parameter), guarded on both.
+
+        The blocks are ordered slot 1's selector, slot 1's value inputs, then
+        slot 2's, so the group resolves to the same field order the GUI has
+        always drawn (only one value block per slot is ever active).
+
+        Args:
+            station: The active Station.
+            vi_name: The measurement VI these blocks are guarded on.
+
+        Returns:
+            The guarded blocks, or an empty list when this VI's reading path
+            advertises nothing loopable — which is how a station with no
+            loopable parameter gets no Reading loop group at all.
+        """
+        registry = cls._loopable_registry(station, vi_name)
+        if not registry:
+            return []
+
+        slot_choices: dict[str, str] = {"Off": ""}
+        for qualified, (slot_vi, param_name, spec, _setter) in registry.items():
+            display = (
+                f"{param_name} ({spec.unit})" if spec.unit else f"{param_name} ({slot_vi})"
+            )
+            if display in slot_choices:
+                display = qualified
+            slot_choices[display] = qualified
+
+        blocks: list[ConditionalGroup] = []
+        for slot, ordinal in (("loop1", "1"), ("loop2", "2")):
+            blocks.append(
+                ConditionalGroup(
+                    key="reading_loop",
+                    title="Reading loop",
+                    params={
+                        f"{slot}_parameter": ParamSpec(
+                            type=str,
+                            default="",
+                            choices=dict(slot_choices),
+                            structural=True,
+                            description=(
+                                f"Loop {ordinal} parameter, repeated at every "
+                                f"sweep point (slot 1 is the outer level)"
+                            ),
+                        )
+                    },
+                    when=When({"measurement_vi": (vi_name,)}),
                 )
-                if display in slot_choices:
-                    display = qualified
-                slot_choices[display] = qualified
-            for slot, ordinal in (("loop1", "1"), ("loop2", "2")):
-                selected_slot = selections.get(f"{slot}_parameter")
-                if selected_slot not in registry:
-                    selected_slot = ""
-                loop_group_params[f"{slot}_parameter"] = ParamSpec(
-                    type=str,
-                    default=selected_slot,
-                    choices=dict(slot_choices),
-                    structural=True,
-                    description=(
-                        f"Loop {ordinal} parameter, repeated at every sweep "
-                        f"point (slot 1 is the outer level)"
-                    ),
-                )
-                if not selected_slot:
-                    continue
-                _vi_name, param_name, spec, _setter = registry[selected_slot]
+            )
+            for qualified, (_vi_name, _param, spec, _setter) in registry.items():
+                # Everything below is structural — changing any of it changes
+                # which columns the run produces.
                 if spec.choices is not None:
-                    for choice_label, value in spec.choices.items():
-                        loop_group_params[f"{slot}_pick_{value}"] = ParamSpec(
+                    params = {
+                        f"{slot}_pick_{value}": ParamSpec(
                             type=bool,
-                            default=bool(selections.get(f"{slot}_pick_{value}")),
+                            default=False,
                             structural=True,
                             description=f"Include {choice_label}",
                         )
+                        for choice_label, value in spec.choices.items()
+                    }
                 else:
-                    loop_group_params[f"{slot}_values"] = ParamSpec(
-                        type=str,
-                        default=str(selections.get(f"{slot}_values") or ""),
-                        structural=True,
-                        widget_hint="array",
-                        description=(
-                            "Comma-separated values; one value sets it once, "
-                            "two or more loop it at every sweep point"
+                    params = {
+                        f"{slot}_values": ParamSpec(
+                            type=str,
+                            default="",
+                            structural=True,
+                            widget_hint="array",
+                            description=(
+                                "Comma-separated values; one value sets it "
+                                "once, two or more loop it at every sweep point"
+                            ),
+                        )
+                    }
+                blocks.append(
+                    ConditionalGroup(
+                        key="reading_loop",
+                        title="Reading loop",
+                        params=params,
+                        when=When(
+                            {
+                                "measurement_vi": (vi_name,),
+                                f"{slot}_parameter": (qualified,),
+                            }
                         ),
                     )
-            groups.append(
-                ParamGroup(
-                    key="reading_loop",
-                    title="Reading loop",
-                    params=loop_group_params,
                 )
-            )
+        return blocks
 
-        # (c) The selected VI's own parameters. Renders active_measurement_
-        # parameters, not the full measurement_parameters: the externally-
-        # configured standard's self-description (MeasurementInstrumentBase)
-        # hides the parameters the external tool owns so the operator is
-        # never shown an inert excitation/analysis/routing knob. The title
-        # carries a marker in that mode so the operator sees WHY they're gone.
-        vi_specs: dict[str, ParamSpec] = dict(vi.active_measurement_parameters)
-        collisions = sorted(
-            (set(cls.parameters) | _STRUCTURAL_PARAM_NAMES) & set(vi_specs)
-        )
-        if collisions:
-            raise I2ASConfigError(
-                f"{cls.name!r}: measurement VI {selected!r} parameter(s) "
-                f"{collisions} collide with the procedure's own parameters."
-            )
-        title = station.measurement_label(selected)
+    @classmethod
+    def _measurement_params_block(
+        cls, station: Station, vi_name: str
+    ) -> ConditionalGroup:
+        """Declare one measurement VI's own parameter group, guarded on it.
+
+        Renders ``active_measurement_parameters``, not the full
+        ``measurement_parameters``: the externally-configured standard's
+        self-description (``MeasurementInstrumentBase``) hides the parameters
+        the external tool owns so the operator is never shown an inert
+        excitation/analysis/routing knob. The title carries a marker in that
+        mode so the operator sees WHY they are gone.
+
+        Args:
+            station: The active Station.
+            vi_name: The measurement VI whose parameters this block holds.
+
+        Returns:
+            The guarded block, keyed ``measurement:<vi_name>`` so each VI's
+            group keeps its own identity across a re-render.
+        """
+        vi = station.get_vi(vi_name)
+        title = station.measurement_label(vi_name)
         if vi.configured_externally:
             title = f"{title} — externally configured"
-        groups.append(
-            ParamGroup(
-                key=f"measurement:{selected}",
-                title=title,
-                params=vi_specs,
-            )
+        return ConditionalGroup(
+            key=f"measurement:{vi_name}",
+            title=title,
+            params=dict(vi.active_measurement_parameters),
+            when=When({"measurement_vi": (vi_name,)}),
         )
-
-        return groups
 
     @classmethod
     def live_plot_measurement_keys(
