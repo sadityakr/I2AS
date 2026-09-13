@@ -13,6 +13,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QStandardPaths
 
+from i2as.core.paths import user_state_dir
+
 _ORGANISATION = "I2AS"
 _APPLICATION = "I2AS"
 
@@ -23,6 +25,10 @@ _ACTIVE_CONFIG_SOURCE_KEY = "ActiveConfig/source"
 _CURRENT_USER_KEY = "CurrentUser/user_id"
 _GATEWAY_ENABLED_KEY = "Gateway/enabled"
 _GATEWAY_MAX_ROLE_KEY = "Gateway/max_role"
+_REMOTE_ENABLED_KEY = "RemoteAccess/enabled"
+_REMOTE_HOST_KEY = "RemoteAccess/host"
+_REMOTE_PORT_KEY = "RemoteAccess/port"
+_REMOTE_PUBLIC_URL_KEY = "RemoteAccess/public_url"
 
 
 def get_settings() -> QSettings:
@@ -209,3 +215,92 @@ def set_gateway_max_role(role: str) -> None:
         role: A ``Role`` value string, as chosen in the Connections dialog.
     """
     get_settings().setValue(_GATEWAY_MAX_ROLE_KEY, str(role))
+
+
+# ── Remote access: the HTTP MCP endpoint ─────────────────────────────────
+
+
+def access_keys_path() -> Path:
+    """Return the file the HTTP endpoint's access keys live in.
+
+    ``%LOCALAPPDATA%/I2AS/mcp_keys.json`` on Windows — the per-installation
+    state root beside the gateway descriptor, because a key is a credential
+    for THIS machine's app and must not travel with a synced profile.
+    Monkeypatchable test seam.
+
+    Returns:
+        The ``Path`` (may not exist yet; the store creates it on first key).
+    """
+    return user_state_dir() / "mcp_keys.json"
+
+
+def remote_access_enabled() -> bool:
+    """Return whether the Connections dialog last left the HTTP endpoint on.
+
+    Returns:
+        ``True`` once the dialog has switched it on; ``False`` otherwise —
+        remote access is never on by default.
+    """
+    value = get_settings().value(_REMOTE_ENABLED_KEY)
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in {"true", "1"} if value is not None else False
+
+
+def set_remote_access_enabled(enabled: bool) -> None:
+    """Persist whether the HTTP endpoint should listen on next launch.
+
+    Args:
+        enabled: The Connections dialog's toggle.
+    """
+    get_settings().setValue(_REMOTE_ENABLED_KEY, bool(enabled))
+
+
+def remote_access_host() -> str:
+    """Return the address the HTTP endpoint binds; the loopback address by default."""
+    value = get_settings().value(_REMOTE_HOST_KEY)
+    return str(value) if value else "127.0.0.1"
+
+
+def set_remote_access_host(host: str) -> None:
+    """Persist the bind address for the HTTP endpoint.
+
+    Args:
+        host: ``"127.0.0.1"`` or ``"0.0.0.0"``.
+    """
+    get_settings().setValue(_REMOTE_HOST_KEY, str(host))
+
+
+def remote_access_port() -> int:
+    """Return the HTTP endpoint's port; ``8765`` until the dialog sets one."""
+    value = get_settings().value(_REMOTE_PORT_KEY)
+    try:
+        port = int(value) if value is not None else 8765
+    except (TypeError, ValueError):
+        port = 8765
+    return port if 1 <= port <= 65535 else 8765
+
+
+def set_remote_access_port(port: int) -> None:
+    """Persist the HTTP endpoint's port.
+
+    Args:
+        port: The TCP port.
+    """
+    get_settings().setValue(_REMOTE_PORT_KEY, int(port))
+
+
+def remote_access_public_url() -> str | None:
+    """Return the public URL the operator published for the endpoint, if any."""
+    value = get_settings().value(_REMOTE_PUBLIC_URL_KEY)
+    text = str(value).strip() if value else ""
+    return text or None
+
+
+def set_remote_access_public_url(url: str | None) -> None:
+    """Persist (or clear) the public URL the operator's tunnel hands out.
+
+    Args:
+        url: The externally reachable ``https://…`` address, or ``None``.
+    """
+    get_settings().setValue(_REMOTE_PUBLIC_URL_KEY, (url or "").strip())

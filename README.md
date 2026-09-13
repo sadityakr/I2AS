@@ -115,6 +115,17 @@ i2as-ctl status                             # the engine's latest snapshot
 
 The `.mcp.json` in this repository registers that MCP server for Claude Code with the observer role. Raising the ceiling is a decision made in the setup's `monitor.yaml` (`gateway_max_role`, `spool_max_role`), never by the agent.
 
+### Remote access: the same tools at a URL
+
+`python -m i2as.mcp` serves MCP on stdio, which means the client has to launch it, on this machine. A client on the web (ChatGPT, Open WebUI, a hosted agent) cannot. For those the running app can also serve the gateway over MCP's Streamable HTTP transport, from the Monitor window's **Connections → Gateway Settings…** dialog:
+
+1. Turn the gateway on, then tick **Serve the gateway over HTTP**. The app listens on `http://127.0.0.1:8765/mcp` (the port and the bind address are yours to change).
+2. Press **New key…** to issue an access key. A key *is* an agent: it names the actor id stamped on everything that connection does and the role it connects with, capped by the setup's ceiling like any other client. The secret is shown once; only its digest is kept, and a key is revoked by name.
+3. To reach the endpoint from outside this machine, run whatever forwards to it — ngrok, cloudflared, Tailscale, a reverse proxy — and paste the `https://…` address it gives you into **Public URL**. I2AS runs no tunnel and holds no tunnel account: what makes the lab PC reachable is the operator's choice.
+4. Pick the client in **Client config** and copy the text. Claude Code takes the URL plus an `Authorization: Bearer <key>` header; Open WebUI takes the URL with the key as its bearer token; ChatGPT's connectors cannot send a header, so for them the key travels in the URL as `…/mcp/<key>` with authentication set to none — treat that URL as the password it is.
+
+The endpoint is the stdlib and nothing else: one `POST` per JSON-RPC message, a `GET` that streams the app's events as server-sent events, a `DELETE` that ends a session. Every key holds exactly one connection to the local-socket gateway server, opened on first use, so a web client is seen by the physicist's window exactly as the stdio adapter is: the same `hello`, the same verdicts, the same Agents panel. A request without a valid key is `401`; a browser origin that is neither local nor the published public URL is `403`.
+
 ## Layout
 
 | Package | Layer |
@@ -125,7 +136,7 @@ The `.mcp.json` in this repository registers that MCP server for Claude Code wit
 | `i2as/procedures` | L4 — measurement procedures (field sweep, temperature sweep, imaging, time series) |
 | `i2as/session` | L6 — experiment manager, run queue, agent gateway, agent feed, ELN |
 | `i2as/gui` | the operator's window |
-| `i2as/mcp`, `i2as/ctl` | agent transports: MCP adapter and command-line client |
+| `i2as/mcp`, `i2as/ctl` | agent transports: MCP adapter (stdio and HTTP), access keys, and the command-line client |
 | `i2as/analysis` | analysis recipes and the analysis worker |
 | `i2as/troubleshoot` | `i2as-doctor`, an offline toolbox for drivers and configs |
 

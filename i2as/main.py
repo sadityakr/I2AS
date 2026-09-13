@@ -616,9 +616,24 @@ def main(
         tool_context=ToolContext(experiments=session_manager, run_catalog=run_catalog),
         feed=app.experiment_feeds.current,
         ceiling=gateway_ceiling,
+        key_store=app_settings.access_keys_path(),
     )
     if gateway_enabled:
         app.gateway_controller.start(gateway_role)
+        # Remote access — the HTTP MCP endpoint — is a client of the socket
+        # server just started, and is only ever on because the Connections
+        # dialog switched it on; a port already taken is logged, not fatal,
+        # because the station must come up whether or not a web client can
+        # reach it.
+        if app_settings.remote_access_enabled():
+            try:
+                app.gateway_controller.start_http(
+                    host=app_settings.remote_access_host(),
+                    port=app_settings.remote_access_port(),
+                    public_url=app_settings.remote_access_public_url(),
+                )
+            except (OSError, RuntimeError):
+                logger.exception("the HTTP MCP endpoint could not start")
     # Stopping on quit is what keeps the descriptor honest: a gateway.json
     # left behind names a socket that is gone and a token that means
     # nothing, and an adapter reading it reports "cannot connect" instead
