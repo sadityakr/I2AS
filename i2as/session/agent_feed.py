@@ -35,7 +35,10 @@ Field                   Type           Meaning
 ``request_id``          str            The correlation id the two trails join on.
 ``command``             str | null     ``CommandName`` value; null on an event record.
 ``tool``                str | null     The **Tool spec**'s name; tool records only.
-``args``                obj | null     The arguments; command and tool records only.
+``args``                obj | null     The arguments; command, tool and (since
+                                       schema 3) verdict records — the verdict
+                                       echoes them, so a reader of the answer
+                                       alone knows what was asked.
 ``event``               str | null     The event's ``kind``; event records only.
 ``detail``              obj | null     The event's payload, or a verdict's or a
                                        tool answer's ``detail``.
@@ -110,8 +113,13 @@ __all__ = [
 #: changes; adding a field is a bump, renaming or retyping one is forbidden.
 #: Version 2 added ``tool`` and the ``"tool"`` record kind; every version-1
 #: field kept its name and its type, so a version-1 reader still reads a
-#: version-2 file and simply meets a record kind it does not know.
-SCHEMA_VERSION = 2
+#: version-2 file and simply meets a record kind it does not know. Version 3
+#: fills ``args`` on verdict records too (the verdict echoes the command's
+#: arguments — ``events.Verdict.args``), so a verdict recorded off the
+#: engine's stream for an actor that never passed through a gateway (a
+#: spooled request) still says what was asked; the key already existed on
+#: every record, so a version-2 reader reads a version-3 file unchanged.
+SCHEMA_VERSION = 3
 
 #: A command a non-operator actor submitted, with its arguments.
 RECORD_COMMAND = "command"
@@ -281,12 +289,25 @@ class AgentFeed:
         whether or not it came through a gateway.
 
         Args:
-            engine: Anything exposing ``verdict_emitted`` and
-                ``event_emitted`` — the Orchestrator today, a transport
-                proxy later.
+            engine: Anything exposing the two contract streams under the
+                engine's names (``verdict_emitted`` / ``event_emitted``) or
+                a client adapter's (``verdict`` / ``event`` — an
+                ``OrchestratorProxy``, whose signals deliver on the client's
+                thread whichever thread the engine runs on). The engine's
+                names are tried first, because ``event`` is also QObject's
+                own virtual handler and every QObject answers to it.
+
+        Raises:
+            AttributeError: If *engine* offers neither name for a stream.
         """
-        engine.verdict_emitted.connect(self.record_verdict)
-        engine.event_emitted.connect(self.record_event)
+        verdict_stream = getattr(engine, "verdict_emitted", None)
+        if verdict_stream is None:
+            verdict_stream = engine.verdict
+        event_stream = getattr(engine, "event_emitted", None)
+        if event_stream is None:
+            event_stream = engine.event
+        verdict_stream.connect(self.record_verdict)
+        event_stream.connect(self.record_event)
         logger.info(
             "Agent feed attached for experiment %r: %s",
             self.experiment_id,
@@ -377,6 +398,7 @@ class AgentFeed:
                 actor=verdict.actor.to_json(),
                 request_id=verdict.request_id,
                 command=verdict.command.value,
+                args=dict(verdict.args),
                 detail=dict(verdict.detail) if verdict.detail else None,
                 verdict={"code": verdict.code.value, "reason": verdict.reason},
             )

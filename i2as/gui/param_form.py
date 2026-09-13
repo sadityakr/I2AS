@@ -2,18 +2,23 @@
 
 This is the ONLY place that names Qt widget classes for procedure parameters.
 Layer L4 (procedures) declares parameters as ``ParamSpec`` value objects and
-never mentions a widget; the GUI's ProcedureWindow owns the surrounding layout
-and the ``SweepAxisWidget``; and this module bridges the two. Adding a new input
-kind (a new ParamSpec shape) means adding a branch here and nowhere else.
+never mentions a widget; the GUI's ProcedureWindow owns the surrounding layout;
+and this module bridges the two. Adding a new input kind (a new ParamSpec
+shape) means adding a branch here and nowhere else — a ``list`` spec renders
+as ``TableParamWidget`` over its declared columns, a ``"file"`` hint as
+``FilePathWidget``, and every setter here is the inverse of its collector.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QCheckBox,
     QComboBox,
     QFormLayout,
@@ -39,9 +44,22 @@ __all__ = [
     "build_form_layout",
     "build_group_box",
     "collect_value",
+    "FilePathWidget",
+    "TableParamWidget",
+    "format_value",
     "get_widget_raw",
     "set_widget_raw",
+    "set_widget_value",
 ]
+
+
+#: Width (px) of each column of a table parameter: short numbers, kept
+#: compact so a three-column table fits the Sweep column.
+_TABLE_COLUMN_WIDTH = 72
+#: The least and the most a table parameter takes; between them the
+#: columns stretch to the width the form can give.
+_TABLE_MIN_WIDTH = 150
+_TABLE_MAX_WIDTH = 240
 
 
 class LoopValuesWidget(QWidget):
@@ -132,12 +150,251 @@ class LoopValuesWidget(QWidget):
 
 
 
+class TableParamWidget(QWidget):
+    """The generic editor for a ``ParamSpec(type=list)``: one row per entry.
+
+    Rendered from the spec's ``columns`` alone — a header per column with
+    its unit, a tooltip with its description, and a new row seeded with each
+    column's default — so a procedure that declares a table (a piecewise
+    sweep's segments, say) gets an editor with no widget of its own. Its
+    value is what ``collect_value`` returns: a list of one dict per row,
+    each cell coerced by its column's type.
+
+    Args:
+        param_name: The parameter's name, for the table's objectName.
+        spec: The list ``ParamSpec`` (``spec.columns`` is required).
+        parent: Optional Qt parent widget.
+    """
+
+    def __init__(
+        self, param_name: str, spec: ParamSpec, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        if not spec.columns:
+            raise ValueError(f"{param_name!r}: a table parameter declares columns")
+        self._spec = spec
+        self._columns: list[tuple[str, ParamSpec]] = list(spec.columns.items())
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._table = QTableWidget(0, len(self._columns))
+        self._table.setObjectName(f"param_{param_name}_table")
+        # The header is the bare column name so it fits a narrow column; the
+        # unit and the description are one hover away, like every other
+        # field's.
+        self._table.setHorizontalHeaderLabels([name for name, _col in self._columns])
+        for index, (_name, col) in enumerate(self._columns):
+            item = self._table.horizontalHeaderItem(index)
+            if item is not None:
+                tooltip = build_param_tooltip(col)
+                item.setToolTip(f"Unit: {col.unit}. {tooltip}" if col.unit else tooltip)
+        self._table.verticalHeader().setVisible(False)
+        # The columns share whatever width the table gets, between a floor
+        # that keeps three short numbers legible when the form is squeezed
+        # and a ceiling that stops a narrow column's table from growing past
+        # its cap. A Maximum-policy column then shrinks the table before it
+        # overflows the form, instead of clipping the last column.
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        total = len(self._columns) * _TABLE_COLUMN_WIDTH + 24
+        self._table.setMinimumWidth(min(total, _TABLE_MIN_WIDTH))
+        self._table.setMaximumWidth(min(total, _TABLE_MAX_WIDTH))
+        self._table.setMaximumHeight(160)
+        self._table.cellClicked.connect(self._on_cell_clicked)
+        layout.addWidget(self._table)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(4)
+        self._add_btn = QPushButton()
+        self._add_btn.setObjectName(f"param_{param_name}_add_btn")
+        self._add_btn.setIcon(qta.icon("fa5s.plus", color=TEXT_PRIMARY))
+        self._add_btn.setToolTip("Add a row")
+        self._add_btn.setMaximumWidth(32)
+        self._add_btn.clicked.connect(self.add_row)
+        self._remove_btn = QPushButton()
+        self._remove_btn.setObjectName(f"param_{param_name}_remove_btn")
+        self._remove_btn.setIcon(qta.icon("fa5s.minus", color=TEXT_PRIMARY))
+        self._remove_btn.setToolTip("Remove the selected row")
+        self._remove_btn.setMaximumWidth(32)
+        self._remove_btn.clicked.connect(self.remove_row)
+        buttons.addWidget(self._add_btn)
+        buttons.addWidget(self._remove_btn)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        self.set_rows(spec.default if isinstance(spec.default, list) else [])
+
+    def _on_cell_clicked(self, row: int, column: int) -> None:
+        """Open the clicked cell for editing on a single click, like a spreadsheet."""
+        item = self._table.item(row, column)
+        if item is not None and item.flags() & Qt.ItemFlag.ItemIsEditable:
+            self._table.editItem(item)
+
+    def add_row(self, values: Mapping[str, Any] | None = None) -> None:
+        """Append one row, seeded with the column defaults or *values*.
+
+        A new row continues the previous one where the columns allow it: a
+        column whose name matches another column's name with ``start`` and
+        ``end`` swapped (a segment's ``start`` follows the previous ``end``)
+        is seeded from the row above, so a contiguous table needs no value
+        typed twice.
+
+        Args:
+            values: ``{column: value}`` to seed with; missing columns take
+                their declared default.
+        """
+        row = self._table.rowCount()
+        previous = self._row_dict(row - 1) if row > 0 and values is None else None
+        self._table.insertRow(row)
+        for index, (name, col) in enumerate(self._columns):
+            if values is not None and name in values:
+                value = values[name]
+            elif previous is not None and name == "start" and "end" in previous:
+                value = previous["end"]
+            elif previous is not None and name == "step" and "step" in previous:
+                value = previous["step"]
+            else:
+                value = col.default
+            self._table.setItem(row, index, QTableWidgetItem(format_value(value)))
+
+    def remove_row(self) -> None:
+        """Remove the selected row, or the last one when none is selected."""
+        row = self._table.currentRow()
+        if row < 0:
+            row = self._table.rowCount() - 1
+        if row >= 0:
+            self._table.removeRow(row)
+
+    def _row_dict(self, row: int) -> dict[str, Any] | None:
+        """Return one row's typed values, or ``None`` when a cell is unparseable."""
+        try:
+            return self._parse_row(row)
+        except (ValueError, TypeError):
+            return None
+
+    def _parse_row(self, row: int) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for index, (name, col) in enumerate(self._columns):
+            item = self._table.item(row, index)
+            raw = item.text().strip() if item is not None else ""
+            if col.type is bool:
+                values[name] = raw.lower() in ("true", "1", "yes")
+            elif col.choices:
+                if raw not in col.choices:
+                    raise ValueError(
+                        f"row {row + 1}, {name}: {raw!r} is not one of "
+                        f"{sorted(col.choices)}"
+                    )
+                values[name] = col.choices[raw]
+            else:
+                try:
+                    values[name] = col.type(raw)
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"row {row + 1}, {name}: cannot parse {raw!r} as "
+                        f"{col.type.__name__}"
+                    ) from None
+        return values
+
+    def get_rows(self) -> list[dict[str, Any]]:
+        """Return the table's value: one typed dict per row.
+
+        Raises:
+            ValueError: If a cell cannot be parsed by its column's type; the
+                message names the row and the column.
+        """
+        return [self._parse_row(row) for row in range(self._table.rowCount())]
+
+    def set_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Replace the table's contents with *rows*.
+
+        Args:
+            rows: One mapping per row; missing columns take their default.
+        """
+        self._table.setRowCount(0)
+        for row in rows:
+            self.add_row(row)
+
+    def get_raw(self) -> str:
+        """Return the rows as a JSON string, for the form's session cache."""
+        raw: list[dict[str, str]] = []
+        for row in range(self._table.rowCount()):
+            raw.append(
+                {
+                    name: (self._table.item(row, index).text() if self._table.item(row, index) else "")
+                    for index, (name, _col) in enumerate(self._columns)
+                }
+            )
+        return json.dumps(raw)
+
+    def set_raw(self, raw: str) -> None:
+        """Restore the rows from ``get_raw()``'s JSON; anything else clears."""
+        try:
+            rows = json.loads(raw) if raw else []
+        except ValueError:
+            rows = []
+        self._table.setRowCount(0)
+        for row in rows:
+            if isinstance(row, dict):
+                self.add_row({name: row.get(name, "") for name, _col in self._columns})
+
+
+class FilePathWidget(QWidget):
+    """A path field with a Browse button — the ``widget_hint="file"`` rendering.
+
+    Offers ``text()`` / ``setText()`` like the ``QLineEdit`` it wraps, so the
+    collection and caching paths treat it as the text field it is.
+
+    Args:
+        param_name: The parameter's name, for the inner field's objectName.
+        default: The initial path.
+        parent: Optional Qt parent widget.
+    """
+
+    def __init__(
+        self, param_name: str, default: str = "", parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._field = QLineEdit(default)
+        self._field.setObjectName(f"param_{param_name}_path")
+        self._field.setPlaceholderText("Path to a file")
+        self._field.setMinimumWidth(90)
+        # An icon, not a caption: the field is the value and gets the width.
+        browse = QPushButton()
+        browse.setObjectName(f"param_{param_name}_browse_btn")
+        browse.setIcon(qta.icon("fa5s.folder-open", color=TEXT_PRIMARY))
+        browse.setToolTip("Browse for a file")
+        browse.setMaximumWidth(32)
+        browse.clicked.connect(self._on_browse)
+        row.addWidget(self._field)
+        row.addWidget(browse)
+
+    def _on_browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select a file", "", "All files (*)")
+        if path:
+            self._field.setText(path)
+
+    def text(self) -> str:
+        """Return the path as typed."""
+        return self._field.text()
+
+    def setText(self, text: str) -> None:  # noqa: N802 — QLineEdit's own name
+        """Set the path."""
+        self._field.setText(text)
+
+
 def build_param_widget(param_name: str, spec: ParamSpec) -> QWidget:
     """Create the input widget for one parameter, chosen by its ``ParamSpec``.
 
+    * ``spec.type is list`` -> ``TableParamWidget`` over ``spec.columns``.
     * ``spec.choices`` (label -> value dict) -> ``QComboBox`` of the labels,
       preselected to the label whose value equals ``spec.default``.
     * ``spec.type is bool`` -> ``QCheckBox``, checked to ``spec.default``.
+    * ``spec.widget_hint == "file"`` -> ``FilePathWidget``.
     * otherwise -> ``QLineEdit`` seeded with ``str(spec.default)``.
 
     Args:
@@ -147,6 +404,8 @@ def build_param_widget(param_name: str, spec: ParamSpec) -> QWidget:
     Returns:
         The constructed widget (not yet registered or laid out).
     """
+    if spec.type is list:
+        return TableParamWidget(param_name, spec)
     if spec.choices:
         combo = QComboBox()
         for label in spec.choices:
@@ -168,6 +427,8 @@ def build_param_widget(param_name: str, spec: ParamSpec) -> QWidget:
         field = QLineEdit(str(spec.default))
         field.setPlaceholderText("YYYY-MM-DDTHH:MM:SS+00:00 (UTC)")
         return field
+    if spec.widget_hint == "file" and spec.type is str:
+        return FilePathWidget(param_name, str(spec.default))
     if spec.widget_hint == "array":
         default_str = ""
         if spec.default:
@@ -221,6 +482,7 @@ def build_form_layout(
     params: Mapping[str, ParamSpec],
     label_overrides: Mapping[str, str] | None = None,
     wrap: bool = False,
+    existing: Mapping[str, QWidget] | None = None,
 ) -> tuple[QFormLayout, dict[str, QWidget]]:
     """Build a ``QFormLayout`` of input rows for a name -> ``ParamSpec`` mapping.
 
@@ -251,6 +513,12 @@ def build_form_layout(
         wrap: When True, sets ``WrapLongRows`` so a row too wide for its column
             drops its field beneath the label (lowering the column's minimum
             width). Default False keeps every row inline.
+        existing: Widgets to put back into the form instead of building new
+            ones, by parameter name — a re-render keeps the fields whose
+            declaration did not change, so a structural selector that sits in
+            the group it re-derives (a sweep's mode) survives its own signal
+            and typed values are never lost to a rebuild. They must already
+            be out of their previous layout.
 
     Returns:
         ``(form, widgets)``: the populated ``QFormLayout`` (not yet attached to a
@@ -273,7 +541,7 @@ def build_form_layout(
         unit = spec.unit
         display_name = overrides.get(param_name, param_name)
         label_text = f"{display_name} ({unit}):" if unit else f"{display_name}:"
-        field = build_param_widget(param_name, spec)
+        field = (existing or {}).get(param_name) or build_param_widget(param_name, spec)
         field.setObjectName(f"param_{param_name}_input")
         tooltip = build_param_tooltip(spec)
         field.setToolTip(tooltip)
@@ -325,6 +593,8 @@ def collect_value(widget: QWidget, spec: ParamSpec) -> Any:
         ValueError: If a text field's contents cannot be parsed as ``spec.type``.
         TypeError: If ``spec.type`` rejects the text (e.g. wrong argument type).
     """
+    if spec.type is list:
+        return widget.get_rows()
     if spec.choices:
         # A combobox can only hold labels this module added, so the lookup is safe.
         return spec.choices[widget.currentText()]
@@ -334,6 +604,66 @@ def collect_value(widget: QWidget, spec: ParamSpec) -> Any:
         return spec.type(widget.get_raw())
     raw = widget.text().strip()
     return spec.type(raw)
+
+
+def format_value(value: Any) -> str:
+    """Render one typed parameter value as the text its widget would show.
+
+    The one place a value becomes display text, so a reflected value and a
+    typed one look the same: a list renders comma-separated (the loop-values
+    form), a bool as ``"True"``/``"False"``, a number as Python prints it
+    (``1.5``, not ``1.5000``), and ``None`` as an empty field.
+
+    Args:
+        value: A JSON-safe parameter value.
+
+    Returns:
+        The text.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(format_value(item) for item in value)
+    return str(value)
+
+
+def set_widget_value(widget: QWidget, spec: ParamSpec, value: Any) -> None:
+    """Put one TYPED value into a parameter widget.
+
+    Inverse of ``collect_value`` — ``collect_value(w, spec)`` after
+    ``set_widget_value(w, spec, v)`` returns ``v`` (up to the coercion the
+    spec's type applies) — and the **reflection standard**'s primitive: the
+    value comes from the contract (a run manifest's ``params``, a verdict's
+    ``args``), not from what somebody typed, so it is matched by VALUE rather
+    than by display text. A combobox is set to the label whose mapped value
+    equals *value* (a bool never matches an int or vice versa, mirroring
+    ``ParamSpec``'s own rule); a value no choice maps to leaves the combobox
+    where it was, exactly as ``set_widget_raw`` leaves a stale label alone.
+
+    Args:
+        widget: A widget created by ``build_param_widget``.
+        spec: The parameter's ``ParamSpec``.
+        value: The value to show, JSON-safe.
+    """
+    if spec.type is list:
+        if isinstance(widget, TableParamWidget) and isinstance(value, (list, tuple)):
+            widget.set_rows([row for row in value if isinstance(row, Mapping)])
+        return
+    if spec.choices:
+        if not isinstance(widget, QComboBox):
+            return
+        for label, mapped in spec.choices.items():
+            if isinstance(mapped, bool) != isinstance(value, bool):
+                continue
+            if mapped == value:
+                widget.setCurrentText(str(label))
+                return
+        return
+    if spec.type is bool:
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        return
+    set_widget_raw(widget, format_value(value))
 
 
 def get_widget_raw(widget: QWidget) -> str:
@@ -353,9 +683,11 @@ def get_widget_raw(widget: QWidget) -> str:
         return widget.currentText()
     if isinstance(widget, QCheckBox):
         return str(widget.isChecked())
-    if isinstance(widget, LoopValuesWidget):
+    if isinstance(widget, (LoopValuesWidget, TableParamWidget)):
         return widget.get_raw()
-    return widget.text() if isinstance(widget, QLineEdit) else ""
+    if isinstance(widget, (QLineEdit, FilePathWidget)):
+        return widget.text()
+    return ""
 
 
 def set_widget_raw(widget: QWidget, raw: str) -> None:
@@ -374,7 +706,7 @@ def set_widget_raw(widget: QWidget, raw: str) -> None:
             widget.setCurrentText(raw)
     elif isinstance(widget, QCheckBox):
         widget.setChecked(raw == "True")
-    elif isinstance(widget, LoopValuesWidget):
+    elif isinstance(widget, (LoopValuesWidget, TableParamWidget)):
         widget.set_raw(raw)
-    elif isinstance(widget, QLineEdit):
+    elif isinstance(widget, (QLineEdit, FilePathWidget)):
         widget.setText(raw)

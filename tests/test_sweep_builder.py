@@ -171,19 +171,21 @@ def field_axis():
 
 def test_sweep_axis_param_specs_keys(field_axis):
     specs = sweep_axis_param_specs(field_axis)
-    # field_segments is intentionally absent: it holds a list of segment dicts,
-    # which ParamSpec (a scalar float/int/str/bool declaration) cannot represent.
-    # The SweepAxisWidget still owns/emits the {key}_segments runtime value, and
-    # build_axis_sweep reads it with a [] fallback, so nothing rendered or run
-    # changes — see sweep_axis_param_specs' docstring.
+    # Every value build_axis_sweep reads is declared, the segments as a table
+    # (ParamSpec type=list) of {start, end, step} rows.
     assert set(specs) == {
         "field_mode",
         "field_start",
         "field_end",
         "field_steps",
+        "field_segments",
         "field_csv_path",
         "field_hysteresis",
     }
+    assert specs["field_segments"].type is list
+    assert list(specs["field_segments"].columns) == ["start", "end", "step"]
+    assert specs["field_mode"].structural
+    assert set(specs["field_mode"].choices.values()) == {"linear", "segments", "csv"}
 
 
 def test_sweep_axis_param_specs_are_paramspecs(field_axis):

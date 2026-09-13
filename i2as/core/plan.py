@@ -79,7 +79,13 @@ def params_digest(params: Mapping[str, Any] | None) -> str:
 
 
 # Scalar Python types accepted for GUI-facing parameters and their HDF5 dtypes.
-_PARAM_TYPES: tuple[type, ...] = (float, int, str, bool)
+#: The scalar kinds a parameter may declare, plus ``list``: a TABLE of rows,
+#: each row a dict shaped by the spec's ``columns`` (scalar specs themselves).
+#: ``list`` is what lets a form declare a piecewise sweep's breakpoints as
+#: data — one row per segment — instead of leaving the one non-scalar value
+#: a run takes to a hand-written widget every surface has to special-case.
+_PARAM_TYPES: tuple[type, ...] = (float, int, str, bool, list)
+_SCALAR_PARAM_TYPES: tuple[type, ...] = (float, int, str, bool)
 _ALLOWED_DTYPES: frozenset[str] = frozenset({"float", "int"})
 
 
@@ -350,8 +356,13 @@ class ParamSpec:
             equal one of them. Mutually exclusive with ``min``/``max``.
             Defensively copied.
         structural: If True, changing this value re-derives the whole form.
-        widget_hint: Optional non-empty display hint (e.g. "slider"); never a
-            concrete Qt widget class name.
+        widget_hint: Optional non-empty display hint (e.g. "slider", or
+            "file" for a path); never a concrete Qt widget class name.
+        columns: For ``type=list`` only, and required then: the table's
+            columns as ``{column name: scalar ParamSpec}``, in display order.
+            Each row of the value is a dict with exactly these keys, each
+            value acceptable to its column's spec; a column's ``default`` is
+            what a new row is seeded with. Defensively copied.
     """
 
     type: type
@@ -363,27 +374,34 @@ class ParamSpec:
     choices: dict[str, Any] | None = None
     structural: bool = False
     widget_hint: str | None = None
+    columns: dict[str, ParamSpec] | None = None
 
     def __post_init__(self) -> None:
-        """Validate the declaration and defensively copy ``choices``.
+        """Validate the declaration and defensively copy ``choices``/``columns``.
 
         Raises:
-            TypeError: If ``type`` is not one of the allowed scalar types, or a
-                string/flag field has the wrong type.
+            TypeError: If ``type`` is not one of the allowed kinds, or a
+                string/flag field has the wrong type, or a ``columns`` entry
+                is not a scalar ``ParamSpec``.
             ValueError: If ``default`` does not match ``type``; if bounds are
                 given for a non-numeric type, are inconsistent, or coexist with
                 ``choices``; if ``choices`` is empty, contains a wrong-typed
-                value, or excludes ``default``; or if ``widget_hint`` is empty.
+                value, or excludes ``default``; if ``widget_hint`` is empty;
+                or if ``columns`` is missing for a list, given for a scalar,
+                or empty.
         """
         if self.type not in _PARAM_TYPES:
             raise TypeError(
-                f"ParamSpec.type must be one of (float, int, str, bool), "
+                f"ParamSpec.type must be one of (float, int, str, bool, list), "
                 f"got {self.type!r}"
             )
 
-        if not self._matches_type(self.default):
+        self._validate_columns()
+
+        if not self.accepts(self.default):
             raise ValueError(
                 f"ParamSpec.default {self.default!r} is not a {self.type.__name__}"
+                + (" of rows shaped by its columns" if self.type is list else "")
             )
 
         for label, val in (("unit", self.unit), ("description", self.description)):
@@ -403,18 +421,21 @@ class ParamSpec:
             if not self.widget_hint:
                 raise ValueError("ParamSpec.widget_hint must be a non-empty str")
 
-        if self.choices is not None:
+        if self.type is list:
+            pass  # a table declares its constraints per column
+        elif self.choices is not None:
             self._validate_choices()
         else:
             self._validate_bounds()
 
-    def _matches_type(self, value: Any) -> bool:
+    def accepts(self, value: Any) -> bool:
         """Return True if ``value`` is a legal instance of ``self.type``.
 
         Applies the numeric nuance: an ``int`` is accepted where ``float`` is
         declared, but a ``bool`` never satisfies ``int`` or ``float`` (it must
         be checked before the ``int`` acceptance because ``bool`` subclasses
-        ``int``).
+        ``int``). A ``list`` value must be a list of dicts with exactly the
+        declared ``columns`` as keys, each cell acceptable to its column.
 
         Args:
             value: The candidate value.
@@ -422,6 +443,15 @@ class ParamSpec:
         Returns:
             True if ``value`` is acceptable for ``self.type``.
         """
+        if self.type is list:
+            if not isinstance(value, list) or not self.columns:
+                return False
+            return all(
+                isinstance(row, dict)
+                and set(row) == set(self.columns)
+                and all(spec.accepts(row[name]) for name, spec in self.columns.items())
+                for row in value
+            )
         if self.type is bool:
             return isinstance(value, bool)
         if isinstance(value, bool):
@@ -429,6 +459,47 @@ class ParamSpec:
         if self.type is float:
             return isinstance(value, (int, float))
         return isinstance(value, self.type)
+
+    # The pre-``columns`` name, kept for any caller that used it.
+    _matches_type = accepts
+
+    def _validate_columns(self) -> None:
+        """Validate ``columns`` against ``type`` and copy them defensively.
+
+        Raises:
+            TypeError: If ``columns`` is not a dict of scalar ``ParamSpec``.
+            ValueError: If a list declares no columns, a scalar declares some,
+                or ``columns`` is empty / has an empty name, or a list also
+                declares bounds or choices.
+        """
+        if self.type is not list:
+            if self.columns is not None:
+                raise ValueError(
+                    f"ParamSpec.columns is only valid for type=list, not "
+                    f"{self.type.__name__}"
+                )
+            return
+        if self.columns is None:
+            raise ValueError("ParamSpec(type=list) must declare its columns")
+        if self.columns is None:
+            raise ValueError("ParamSpec(type=list) must declare its columns")
+        if not isinstance(self.columns, dict):
+            raise TypeError(
+                f"ParamSpec.columns must be a dict of ParamSpec, got {self.columns!r}"
+            )
+        if not self.columns:
+            raise ValueError("ParamSpec(type=list) must declare at least one column")
+        for name, spec in self.columns.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("ParamSpec.columns keys must be non-empty strings")
+            if not isinstance(spec, ParamSpec) or spec.type not in _SCALAR_PARAM_TYPES:
+                raise TypeError(
+                    f"ParamSpec.columns[{name!r}] must be a scalar ParamSpec, "
+                    f"got {spec!r}"
+                )
+        if self.min is not None or self.max is not None or self.choices is not None:
+            raise ValueError("ParamSpec(type=list) takes no min, max or choices")
+        object.__setattr__(self, "columns", dict(self.columns))
 
     def _validate_bounds(self) -> None:
         """Validate ``min``/``max`` when no ``choices`` are declared.
@@ -825,6 +896,88 @@ def resolve_form(
     return [ParamGroup(key=key, title=titles[key], params=merged[key]) for key in ordered]
 
 
+def param_spec_from_json(spec: Mapping[str, Any]) -> ParamSpec:
+    """Rebuild one ``ParamSpec`` from its wire rendering.
+
+    The inverse of ``core.procedure_catalog._param_json`` (and of the
+    Station's rendering of a control parameter): ``kind`` names the type,
+    and a ``list`` kind carries its ``columns`` as the same rendering,
+    nested once.
+
+    Args:
+        spec: ``{name, kind, unit, description, default, min, max, choices,
+            structural, widget_hint, columns}``; every key but ``name`` and
+            ``kind`` optional.
+
+    Returns:
+        The spec.
+
+    Raises:
+        ValueError: If ``kind`` names no known type, or the declaration is
+            invalid (``ParamSpec``'s own rules).
+    """
+    by_name = {one.__name__: one for one in _PARAM_TYPES}
+    kind = str(spec.get("kind", ""))
+    if kind not in by_name:
+        raise ValueError(
+            f"parameter {spec.get('name')!r} declares kind {kind!r}, "
+            f"which is not one of {sorted(by_name)}"
+        )
+    columns = spec.get("columns")
+    return ParamSpec(
+        type=by_name[kind],
+        default=spec.get("default"),
+        unit=str(spec.get("unit", "")),
+        description=str(spec.get("description", "")),
+        min=spec.get("min"),
+        max=spec.get("max"),
+        choices=dict(spec["choices"]) if spec.get("choices") else None,
+        structural=bool(spec.get("structural", False)),
+        widget_hint=str(spec.get("widget_hint") or "") or None,
+        columns=(
+            {str(col["name"]): param_spec_from_json(col) for col in columns}
+            if columns
+            else None
+        ),
+    )
+
+
+def param_spec_to_json(name: str, spec: ParamSpec) -> dict[str, Any]:
+    """Render one ``ParamSpec`` for a declaration snapshot.
+
+    The one rendering every surface uses for a declared parameter — the
+    procedure catalog's form blocks and the Station's control parameters
+    both call it — so ``param_spec_from_json()`` is its exact inverse and a
+    new field is added here and nowhere else.
+
+    Args:
+        name: The parameter's name.
+        spec: Its declaration.
+
+    Returns:
+        ``{name, kind, unit, description, default, min, max, choices,
+        structural, widget_hint, columns}``, JSON-safe; ``columns`` is a
+        list of the same rendering for a ``list`` kind and ``None`` otherwise.
+    """
+    return {
+        "name": name,
+        "kind": spec.type.__name__,
+        "unit": spec.unit,
+        "description": spec.description,
+        "default": spec.default,
+        "min": spec.min,
+        "max": spec.max,
+        "choices": dict(spec.choices) if spec.choices else None,
+        "structural": spec.structural,
+        "widget_hint": spec.widget_hint or "",
+        "columns": (
+            [param_spec_to_json(col, col_spec) for col, col_spec in spec.columns.items()]
+            if spec.columns
+            else None
+        ),
+    }
+
+
 def blocks_from_json(
     blocks: Sequence[Mapping[str, Any]],
 ) -> tuple[ConditionalGroup, ...]:
@@ -850,28 +1003,11 @@ def blocks_from_json(
         ValueError: If a parameter declares a ``kind`` that is not a scalar
             type name — a rendering this vocabulary did not produce.
     """
-    by_name = {one.__name__: one for one in _PARAM_TYPES}
     rebuilt: list[ConditionalGroup] = []
     for block in blocks:
         params: dict[str, ParamSpec] = {}
         for spec in block.get("params") or ():
-            kind = str(spec.get("kind", ""))
-            if kind not in by_name:
-                raise ValueError(
-                    f"parameter {spec.get('name')!r} declares kind {kind!r}, "
-                    f"which is not one of {sorted(by_name)}"
-                )
-            params[str(spec["name"])] = ParamSpec(
-                type=by_name[kind],
-                default=spec.get("default"),
-                unit=str(spec.get("unit", "")),
-                description=str(spec.get("description", "")),
-                min=spec.get("min"),
-                max=spec.get("max"),
-                choices=dict(spec["choices"]) if spec.get("choices") else None,
-                structural=bool(spec.get("structural", False)),
-                widget_hint=str(spec.get("widget_hint") or "") or None,
-            )
+            params[str(spec["name"])] = param_spec_from_json(spec)
         rebuilt.append(
             ConditionalGroup(
                 key=str(block["key"]),

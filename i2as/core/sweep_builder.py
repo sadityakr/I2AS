@@ -6,7 +6,7 @@ import csv
 from dataclasses import dataclass
 from typing import Any
 
-from i2as.core.plan import ParamSpec
+from i2as.core.plan import ConditionalGroup, ParamSpec, When
 
 
 @dataclass
@@ -179,38 +179,44 @@ class SweepAxis:
     default_steps: int = 101
 
 
+#: The three shapes a sweep axis's points can take, as the ``{key}_mode``
+#: choices: the label a form shows, and the value a run carries.
+SWEEP_MODES: dict[str, str] = {"Linear": "linear", "Segments": "segments", "CSV": "csv"}
+
+
 def sweep_axis_param_specs(axis: SweepAxis) -> dict[str, ParamSpec]:
-    """Build the hidden ``ParamSpec`` declarations for a ``SweepAxis``.
+    """Return the seven hidden ``ParamSpec``s a declared ``SweepAxis`` adds.
 
-    These are merged into a Procedure's ``cls.parameters`` (alongside
-    ``sweep_parameters``/``system_parameters``/``measurement_parameters``) so
-    ``BaseProcedure.__init__`` fills in defaults exactly like any other
-    declared parameter. The GUI renders them via a single ``SweepAxisWidget``
-    instead of the usual flat text fields — see ``gui/sweep_axis_widget.py`` —
-    so none of these are ever built into a flat form widget.
+    Every value ``build_axis_sweep()`` reads is declared here, as data, so
+    every surface — the GUI form, the agent's ``describe_procedure``, the
+    validator — sees the same sweep the same way and none has to
+    special-case it:
 
-    ``{key}_segments`` is deliberately absent: it holds a *list* of segment
-    dicts, which ``ParamSpec`` (a scalar float/int/str/bool declaration) cannot
-    represent. The ``SweepAxisWidget`` still owns and emits the ``{key}_segments``
-    runtime value via its ``param_keys()`` / ``get_params()`` (its 2-column
-    breakpoint table), and ``build_axis_sweep()`` reads it defensively with a
-    ``[]`` fallback, so dropping it from the declared specs changes no rendered
-    or runtime behavior — it only means a linear-mode run constructed purely
-    from defaults no longer carries an unused empty ``{key}_segments`` entry.
+    * ``{key}_mode`` — structural, one of ``SWEEP_MODES``; which of the three
+      blocks below is part of the form (see ``sweep_axis_form_blocks()``).
+    * ``{key}_start`` / ``{key}_end`` / ``{key}_steps`` — the linear sweep.
+    * ``{key}_segments`` — the piecewise sweep as a TABLE (``type=list``):
+      one ``{start, end, step}`` row per contiguous segment, exactly the
+      shape ``build_piecewise_sweep()`` consumes.
+    * ``{key}_csv_path`` — the file of values, ``widget_hint="file"``.
+    * ``{key}_hysteresis`` — sweep back to the start after the end.
 
     Args:
         axis: The Procedure's declared sweep axis.
 
     Returns:
-        Dict of ``{param_name: ParamSpec}`` for the six scalar hidden axis
-        parameters (mode, start, end, steps, csv_path, hysteresis).
+        Dict of ``{param_name: ParamSpec}`` for the seven axis parameters.
     """
     k = axis.key
     lower_desc = axis.description[0].lower() + axis.description[1:]
+    span = abs(axis.default_end - axis.default_start)
+    default_step = span / max(axis.default_steps - 1, 1) if span else 1.0
     return {
         f"{k}_mode": ParamSpec(
             type=str,
             default="linear",
+            choices=dict(SWEEP_MODES),
+            structural=True,
             description=(
                 f"How the {lower_desc} points are generated: linear "
                 f"(start/end/steps), segments (a breakpoint table), or csv "
@@ -235,9 +241,41 @@ def sweep_axis_param_specs(axis: SweepAxis) -> dict[str, ParamSpec]:
             min=2,
             description=f"Number of {lower_desc} steps",
         ),
+        f"{k}_segments": ParamSpec(
+            type=list,
+            default=[],
+            columns={
+                "start": ParamSpec(
+                    type=float,
+                    default=axis.default_start,
+                    unit=axis.unit,
+                    description=f"Where this segment's {lower_desc} starts",
+                ),
+                "end": ParamSpec(
+                    type=float,
+                    default=axis.default_end,
+                    unit=axis.unit,
+                    description=(
+                        f"Where this segment's {lower_desc} ends; the next "
+                        f"segment starts here"
+                    ),
+                ),
+                "step": ParamSpec(
+                    type=float,
+                    default=default_step,
+                    unit=axis.unit,
+                    description="Spacing between points within this segment",
+                ),
+            },
+            description=(
+                f"The {lower_desc} sweep as contiguous segments, each with "
+                f"its own step, in sweep order"
+            ),
+        ),
         f"{k}_csv_path": ParamSpec(
             type=str,
             default="",
+            widget_hint="file",
             description=f"Path to the CSV of {lower_desc} values, in csv mode",
         ),
         f"{k}_hysteresis": ParamSpec(
@@ -249,6 +287,57 @@ def sweep_axis_param_specs(axis: SweepAxis) -> dict[str, ParamSpec]:
             ),
         ),
     }
+
+
+def sweep_axis_form_blocks(
+    axis: SweepAxis, *, key: str = "sweep", title: str = "Sweep"
+) -> tuple[ConditionalGroup, ...]:
+    """Declare a sweep axis's parameters as guarded blocks of one group.
+
+    The form half of the axis, in the **conditional-parameter standard**'s
+    own terms: the mode selector unconditionally, then ONE of the three
+    value blocks guarded on the mode it belongs to, then hysteresis. Every
+    block shares *key*, so they merge into the one Sweep group beside a
+    procedure's own ``sweep_parameters``, and a client that can resolve a
+    form can render — and reflect — a sweep of any shape with no widget of
+    its own.
+
+    Args:
+        axis: The Procedure's declared sweep axis.
+        key: The rendered group's key. ``"sweep"`` puts the axis in the
+            Sweep column.
+        title: The rendered group's heading.
+
+    Returns:
+        The blocks, in render order.
+    """
+    k = axis.key
+    specs = sweep_axis_param_specs(axis)
+    mode = f"{k}_mode"
+    return (
+        ConditionalGroup(key=key, title=title, params={mode: specs[mode]}),
+        ConditionalGroup(
+            key=key,
+            title=title,
+            params={name: specs[name] for name in (f"{k}_start", f"{k}_end", f"{k}_steps")},
+            when=When({mode: ("linear",)}),
+        ),
+        ConditionalGroup(
+            key=key,
+            title=title,
+            params={f"{k}_segments": specs[f"{k}_segments"]},
+            when=When({mode: ("segments",)}),
+        ),
+        ConditionalGroup(
+            key=key,
+            title=title,
+            params={f"{k}_csv_path": specs[f"{k}_csv_path"]},
+            when=When({mode: ("csv",)}),
+        ),
+        ConditionalGroup(
+            key=key, title=title, params={f"{k}_hysteresis": specs[f"{k}_hysteresis"]}
+        ),
+    )
 
 
 def build_axis_sweep(axis: SweepAxis, params: dict[str, Any]) -> list[float]:
@@ -279,12 +368,24 @@ def build_axis_sweep(axis: SweepAxis, params: dict[str, Any]) -> list[float]:
     mode = params.get(f"{k}_mode", "linear")
 
     if mode == "csv":
-        base = load_custom_sweep_csv(params[f"{k}_csv_path"])
+        path = str(params.get(f"{k}_csv_path") or "").strip()
+        if not path:
+            raise ValueError(
+                f"{k}: csv sweep mode selected but {k}_csv_path names no file"
+            )
+        try:
+            base = load_custom_sweep_csv(path)
+        except OSError as exc:
+            raise ValueError(f"{k}: cannot read the sweep CSV {path!r}: {exc}") from exc
     elif mode == "segments":
         segments = [
             seg if isinstance(seg, SweepSegment) else SweepSegment(**seg)
             for seg in params.get(f"{k}_segments", [])
         ]
+        if not segments:
+            raise ValueError(
+                f"{k}: segments sweep mode selected but {k}_segments holds no segment"
+            )
         params[f"{k}_segments"] = [
             {"start": s.start, "end": s.end, "step": s.step} for s in segments
         ]

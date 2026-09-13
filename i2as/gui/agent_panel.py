@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
 
 from i2as.core.events import ActorKind, StateChange, Verdict, VerdictCode
 from i2as.session.agent_feed import (
+    RECORD_COMMAND,
     RECORD_EVENT,
     RECORD_TOOL,
     RECORD_VERDICT,
@@ -85,6 +86,19 @@ OUTCOME_TAKEOVER = "takeover"
 #: What the panel says before any non-operator actor has acted.
 EMPTY_TEXT = "No agent has acted in this experiment."
 
+#: How many ``name=value`` pairs a row shows inline before counting the rest.
+#: The whole set is always in the row's tooltip.
+ARGS_INLINE_LIMIT = 4
+
+#: The command whose rows read as ``<vi>.<method>(...)`` (see
+#: ``AgentAction.described()``).
+VI_ACTION_COMMAND = "submit_vi_action"
+
+#: Argument names whose mapping value is shown one level flattened (a run's
+#: ``params`` become ``params.field_start=…``), because the mapping is the
+#: substance of the action and the name alone says nothing.
+FLATTENED_ARGS = frozenset({"params"})
+
 #: The run-owner line's two shapes (GLOSSARY.md's **Run owner**): who owns
 #: the run in flight, so a reader of this panel can tell at a glance whether
 #: an agent acting here is acting on its own run or somebody else's.
@@ -117,6 +131,13 @@ class AgentAction:
             only, read off the verdict's ``detail.takeover``; ``""`` on every
             ordinary row. When it is set, ``reason`` is the reason the actor
             gave for taking the run over.
+        args: The arguments the action was asked with, as ``(name, value)``
+            pairs in the order the command carried them — off the verdict's
+            ``args`` (the **reflection standard**: the answer echoes the
+            question) or a feed record's ``args``. Empty for a state change
+            and for a command that carried none. This is what makes the row
+            answer "what did the agent set?" rather than only "what did it
+            call?": ``run_procedure`` alone tells the operator nothing.
     """
 
     ts: float
@@ -129,6 +150,7 @@ class AgentAction:
     run_id: str = ""
     kind: str = "verdict"
     takeover_owner: str = ""
+    args: tuple[tuple[str, Any], ...] = ()
 
     @property
     def refused(self) -> bool:
@@ -148,19 +170,90 @@ class AgentAction:
             return OUTCOME_EVENT
         return OUTCOME_OK
 
+    def described(self) -> str:
+        """Return ``what`` with its arguments, the way the row shows them.
+
+        ``<what>(<args>)`` in general; an instrument action reads as the
+        capability it is — ``magnet_z.set_field(target_T=1.5)`` — which is
+        the same shape the agent called it by (its tool is
+        ``magnet_z__set_field``) and what the operator is looking for,
+        rather than the engine-side ``submit_vi_action`` with the target
+        buried in its arguments.
+
+        Returns:
+            The rendered action, arguments included where there are any.
+        """
+        args = dict(self.args)
+        vi_name = args.get("vi_name")
+        method_name = args.get("method_name")
+        if self.what == VI_ACTION_COMMAND and vi_name and method_name:
+            rest = AgentAction(
+                ts=self.ts,
+                actor_id=self.actor_id,
+                args=tuple(
+                    (name, value)
+                    for name, value in self.args
+                    if name not in ("vi_name", "method_name")
+                ),
+            ).args_summary()
+            return f"{vi_name}.{method_name}({rest})"
+        summary = self.args_summary()
+        return f"{self.what}({summary})" if summary else self.what
+
+    def args_summary(self, limit: int = ARGS_INLINE_LIMIT) -> str:
+        """Render the arguments as ``name=value`` pairs for the row's line.
+
+        Nested values (a ``run_procedure``'s ``params``) are flattened one
+        level, so the row shows the parameters the operator cares about
+        rather than the word ``params``; a mapping deeper than that renders
+        as its repr. The first *limit* pairs are shown and the rest counted,
+        because a twenty-parameter run on one line would flood the panel —
+        ``args_detail()`` carries all of them for the tooltip.
+
+        Args:
+            limit: How many pairs to show before ``"+N more"``.
+
+        Returns:
+            ``"a=1, b=2, +3 more"``, or ``""`` when there are no arguments.
+        """
+        pairs = list(self._flat_args())
+        if not pairs:
+            return ""
+        shown = ", ".join(f"{name}={value}" for name, value in pairs[:limit])
+        rest = len(pairs) - limit
+        return f"{shown}, +{rest} more" if rest > 0 else shown
+
+    def args_detail(self) -> str:
+        """Render every argument, one per line, for the row's tooltip.
+
+        Returns:
+            ``"name = value"`` lines, or ``""`` when there are none.
+        """
+        return "\n".join(f"{name} = {value}" for name, value in self._flat_args())
+
+    def _flat_args(self) -> list[tuple[str, Any]]:
+        """Return the arguments with one level of mapping flattened."""
+        flat: list[tuple[str, Any]] = []
+        for name, value in self.args:
+            if isinstance(value, Mapping) and name in FLATTENED_ARGS:
+                flat.extend((f"{name}.{key}", item) for key, item in value.items())
+            else:
+                flat.append((name, value))
+        return flat
+
     def text(self) -> str:
         """Return the one line this action is rendered as.
 
         Returns:
-            ``"HH:MM:SS  <actor> (<role>)  <what> → <code> — <reason>"``, with
-            the parts that do not apply left out rather than shown empty. A
-            **Takeover** ends instead with ``"took over <owner>'s run:
-            <reason>"``, which is the whole of what happened in the words the
-            contract carried.
+            ``"HH:MM:SS  <actor> (<role>)  <what>(<args>) → <code> — <reason>"``,
+            with the parts that do not apply left out rather than shown
+            empty. A **Takeover** ends instead with ``"took over <owner>'s
+            run: <reason>"``, which is the whole of what happened in the
+            words the contract carried.
         """
         stamp = datetime.fromtimestamp(self.ts).strftime("%H:%M:%S")
         who = f"{self.actor_id} ({self.actor_role})" if self.actor_role else self.actor_id
-        line = f"{stamp}  {who}  {self.what}"
+        line = f"{stamp}  {who}  {self.described()}"
         if self.code:
             line = f"{line} → {self.code}"
         if self.takeover_owner:
@@ -169,6 +262,21 @@ class AgentAction:
         if self.reason:
             line = f"{line} — {self.reason}"
         return line
+
+
+def _args_pairs(args: Any) -> tuple[tuple[str, Any], ...]:
+    """Freeze an arguments mapping into the row's ``(name, value)`` pairs.
+
+    Args:
+        args: A ``Verdict.args`` / feed ``args`` mapping, or anything else
+            (which reads as no arguments).
+
+    Returns:
+        The pairs in the mapping's order, values as carried.
+    """
+    if not isinstance(args, Mapping):
+        return ()
+    return tuple((str(name), value) for name, value in args.items())
 
 
 def _actor_fields(actor: Any) -> tuple[str, str, str]:
@@ -239,6 +347,7 @@ def action_from_verdict(verdict: Verdict) -> AgentAction | None:
         reason=took_because or verdict.reason,
         kind="verdict",
         takeover_owner=owner,
+        args=_args_pairs(verdict.args),
     )
 
 
@@ -266,15 +375,24 @@ def action_from_state_change(event: StateChange) -> AgentAction | None:
     )
 
 
-def action_from_feed_record(record: Mapping[str, Any]) -> AgentAction | None:
+def action_from_feed_record(
+    record: Mapping[str, Any],
+    command_args: Mapping[str, Mapping[str, Any]] | None = None,
+) -> AgentAction | None:
     """Build a row from one **Agent feed** line, or ``None`` when it is not one.
 
-    The seed path. A ``command`` record is deliberately skipped: its verdict
-    record says the same thing plus the answer, and showing both would double
-    every action in the history.
+    The seed path. A ``command`` record is deliberately skipped as a ROW: its
+    verdict record says the same thing plus the answer, and showing both
+    would double every action in the history. Its arguments are not thrown
+    away, though: a verdict record carries them itself since feed schema 3,
+    and for an older file the caller passes the command records' arguments
+    by request id so the row can still say what was asked.
 
     Args:
         record: One record as ``read_feed()`` returns it.
+        command_args: ``{request_id: args}`` gathered from the file's
+            ``command`` records, consulted when the verdict record itself
+            carries no arguments.
 
     Returns:
         The row, or ``None`` for a record kind the panel does not show.
@@ -297,6 +415,9 @@ def action_from_feed_record(record: Mapping[str, Any]) -> AgentAction | None:
         code = str(verdict.get("code") or "")
         reason = str(verdict.get("reason") or "")
     owner, took_because = ("", "") if kind == RECORD_EVENT else _takeover_fields(detail)
+    args = record.get("args")
+    if not isinstance(args, Mapping) and command_args and kind == RECORD_VERDICT:
+        args = command_args.get(str(record.get("request_id") or ""))
     return AgentAction(
         ts=float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0,
         actor_id=actor_id,
@@ -307,6 +428,7 @@ def action_from_feed_record(record: Mapping[str, Any]) -> AgentAction | None:
         reason=took_because or reason,
         kind="state" if kind == RECORD_EVENT else "verdict",
         takeover_owner=owner,
+        args=() if kind == RECORD_EVENT else _args_pairs(args),
     )
 
 
@@ -534,9 +656,17 @@ class AgentPanel(QWidget):
             How many rows were seeded.
         """
         records = read_feed(path)
+        command_args: dict[str, Mapping[str, Any]] = {
+            str(record.get("request_id") or ""): record["args"]
+            for record in records
+            if record.get("record") == RECORD_COMMAND
+            and isinstance(record.get("args"), Mapping)
+        }
         seeded = [
             action
-            for action in (action_from_feed_record(record) for record in records)
+            for action in (
+                action_from_feed_record(record, command_args) for record in records
+            )
             if action is not None
         ]
         if not seeded:
@@ -675,7 +805,8 @@ class AgentPanel(QWidget):
         # tooltip, and the scroll area scrolls sideways for the rest.
         label.setWordWrap(False)
         label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        label.setToolTip(action.text())
+        detail = action.args_detail()
+        label.setToolTip(f"{action.text()}\n\n{detail}" if detail else action.text())
         layout.addWidget(label, stretch=1)
         return row
 

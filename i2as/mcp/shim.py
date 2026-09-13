@@ -27,6 +27,7 @@ import logging
 import os
 import selectors
 import sys
+import time
 from collections.abc import Mapping
 from typing import Any, BinaryIO
 
@@ -75,15 +76,50 @@ def serve(
     source = stdin if stdin is not None else sys.stdin.buffer
     sink = stdout if stdout is not None else sys.stdout.buffer
     buffer = bytearray()
-    selector = selectors.DefaultSelector()
-    selector.register(source.fileno(), selectors.EVENT_READ, "stdin")
     gateway_fd = adapter.client.fileno()
-    if gateway_fd is not None:
-        selector.register(gateway_fd, selectors.EVENT_READ, "gateway")
-    timeout = None if gateway_fd is not None else _POLL_INTERVAL_S
 
     logger.info("MCP adapter serving over stdio")
+
+    if os.name == "nt":
+        try:
+            os.set_blocking(source.fileno(), False)
+        except OSError:
+            logger.warning("MCP adapter could not make stdin non-blocking on Windows")
+
+    if os.name == "nt":
+        try:
+            while True:
+                try:
+                    chunk = os.read(source.fileno(), _CHUNK)
+                except BlockingIOError:
+                    chunk = None
+
+                if chunk is None:
+                    _flush_notifications(adapter, sink)
+                    time.sleep(_POLL_INTERVAL_S)
+                    continue
+
+                if chunk:
+                    buffer.extend(chunk)
+                    if not _consume(adapter, buffer, sink):
+                        return
+                else:
+                    logger.info("MCP adapter: the client closed stdin")
+                    return
+
+                _flush_notifications(adapter, sink)
+                time.sleep(_POLL_INTERVAL_S)
+        except OSError:
+            logger.exception("MCP adapter lost the stdin stream")
+            return
+
+    selector = selectors.DefaultSelector()
     try:
+        selector.register(source.fileno(), selectors.EVENT_READ, "stdin")
+        if gateway_fd is not None:
+            selector.register(gateway_fd, selectors.EVENT_READ, "gateway")
+        timeout = None if gateway_fd is not None else _POLL_INTERVAL_S
+
         while True:
             for key, _ in selector.select(timeout):
                 if key.data == "gateway":

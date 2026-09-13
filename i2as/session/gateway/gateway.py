@@ -61,6 +61,7 @@ from i2as.core.events import (
     AgentGate,
     Command,
     CommandName,
+    Readings,
     StationInfo,
     StatusSnapshot,
     Verdict,
@@ -235,6 +236,10 @@ class Gateway:
         self.actor = Actor(kind=ActorKind.AGENT, id=str(actor_id), role=self.role.value)
 
         self._status: StatusSnapshot | None = None
+        # The last per-tick Readings — the numbers the front panel shows —
+        # kept for read_readings so an agent reads the same values off the
+        # same event the GUI does, never by polling an instrument.
+        self._readings: Readings | None = None
         self._station_info: StationInfo = self._initial_station_info(
             engine, station_info
         )
@@ -260,6 +265,7 @@ class Gateway:
             tool_context or ToolContext(),
             status_source=self.status,
             station_source=self.station,
+            readings_source=self.readings,
             actor=self.actor,
         )
 
@@ -314,6 +320,8 @@ class Gateway:
                 self._status = event
             elif isinstance(event, StationInfo):
                 self._station_info = event
+            elif isinstance(event, Readings):
+                self._readings = event
         except Exception:  # noqa: BLE001 — mirroring must never disrupt the engine
             logger.exception("gateway mirror update failed (non-fatal)")
 
@@ -352,6 +360,16 @@ class Gateway:
             The engine's most recent ``StatusSnapshot``.
         """
         return self._status
+
+    def readings(self) -> Readings | None:
+        """Return the latest per-tick readings, or ``None`` before any.
+
+        Returns:
+            The engine's most recent ``Readings`` — ``{vi_name: {reading:
+            value}}`` for every polled instrument, the values the GUI's
+            cards and front panels display.
+        """
+        return self._readings
 
     def station(self) -> StationInfo:
         """Return the station's latest declaration snapshot.

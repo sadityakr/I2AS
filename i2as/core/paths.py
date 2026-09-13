@@ -157,7 +157,15 @@ def _read_measurement_root_setting(config_path: Path) -> str | None:
         missing, unreadable, or has no such key.
     """
     try:
-        text = config_path.read_text(encoding="utf-8")
+        # utf-8-sig rather than utf-8: PowerShell's Out-File -Encoding utf8 —
+        # the tool a Windows admin reaches for to create exactly this file —
+        # writes a UTF-8 BOM. Read as plain utf-8, that BOM character sticks
+        # to the front of "measurement_root" on the first line, the key
+        # silently fails to match, and this returns None as if the file said
+        # nothing at all. utf-8-sig strips a leading BOM when present and is
+        # identical to utf-8 otherwise, so this is a pure widening of what
+        # parses.
+        text = config_path.read_text(encoding="utf-8-sig")
     except OSError:
         return None
 

@@ -33,6 +33,7 @@ from i2as.core.config import read_instrument_metadata
 from i2as.gui import app_settings  # import the module (not the function) so tests can monkeypatch the factory
 from i2as.gui import form_autosave  # module import keeps save/load monkeypatchable
 from i2as.gui import window_geometry
+from i2as.gui.connections_dialog import ConnectionsDialog
 from i2as.gui.eln_settings_dialog import ElnSettingsDialog, persist_eln_settings
 from i2as.gui.experiment_info_panel import ExperimentInfoPanel
 from i2as.gui.agent_panel import AgentPanel
@@ -168,6 +169,7 @@ class MonitorWindow(QMainWindow):
         session_store: SessionStore | None = None,
         panels_config: dict[str, list[str]] | None = None,
         mirror: StatusMirror | None = None,
+        gateway_controller: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self._station = station
@@ -193,6 +195,10 @@ class MonitorWindow(QMainWindow):
         # neither publishes nor analyses anything itself.
         self._eln_publisher = eln_publisher
         self._analysis_runner = analysis_runner
+        # The Connections menu's collaborator — None in a unit test that
+        # builds this window without one, in which case the menu says so
+        # rather than showing controls that could not be applied.
+        self._gateway_controller = gateway_controller
         # The L6 Session tier above session_manager, used only by the User
         # menu's Resume Session… action (see _open_resume_session_dialog) —
         # session_manager's own ExperimentStore stays fixed for this run
@@ -379,6 +385,20 @@ class MonitorWindow(QMainWindow):
         open_action.setShortcut("Ctrl+P")
         open_action.triggered.connect(self._open_procedures)
         proc_menu.addAction(open_action)
+
+        # The Agent gateway's on/off switch and role ceiling, editable at
+        # runtime instead of only via monitor.yaml + restart — see
+        # i2as/session/gateway/controller.py's module docstring for what
+        # the menu can and cannot change (it can never exceed monitor.yaml's
+        # own gateway_max_role).
+        connections_menu = menu_bar.addMenu("Connections")
+        gateway_settings_action = QAction("Gateway Settings…", self)
+        gateway_settings_action.setToolTip(
+            "Turn the Agent gateway on or off, and choose which role it "
+            "hands out to a connecting agent"
+        )
+        gateway_settings_action.triggered.connect(self._open_connections_dialog)
+        connections_menu.addAction(gateway_settings_action)
 
     def _open_procedures(self) -> None:
         """Lazily create and show the ProcedureWindow."""
@@ -1062,6 +1082,23 @@ class MonitorWindow(QMainWindow):
 
         ElnSettingsDialog(settings, on_save=_save, parent=self).exec()
 
+    def _open_connections_dialog(self) -> None:
+        """Open the **Connections dialog** over the Gateway controller.
+
+        With no controller wired (a unit test's window, or a build that
+        predates the Agent gateway) there is nothing to switch on or off,
+        and the window says so rather than showing controls that could not
+        be applied — the same shape ``_open_eln_settings`` follows.
+        """
+        if self._gateway_controller is None:
+            QMessageBox.information(
+                self,
+                "Connections",
+                "This session has no Agent gateway wired in.",
+            )
+            return
+        ConnectionsDialog(self._gateway_controller, parent=self).exec()
+
     def _open_login_dialog(self) -> None:
         """Open LoginDialog and switch to the picked user, if any."""
         if self._session_manager is None:
@@ -1242,6 +1279,10 @@ class MonitorWindow(QMainWindow):
         self._agent_panel.agents_active_changed.connect(
             self._takeover_strip.set_agents_active
         )
+        # The run in flight and its parameters (the reflection standard):
+        # the strip re-reads the mirror the moment a run starts or ends
+        # rather than waiting for the next tick's snapshot.
+        self._mirror.run_manifest_updated.connect(self._on_run_manifest_updated)
         if self._session_manager is not None:
             self._session_manager.experiment_changed.connect(
                 self._on_session_experiment_changed
@@ -1398,18 +1439,34 @@ class MonitorWindow(QMainWindow):
         for panel in self._panels:
             panel.on_status_snapshot()
 
+    def _on_run_manifest_updated(self, _manifest: object) -> None:
+        """Re-render the header's run line when a run starts or ends.
+
+        Args:
+            _manifest: The mirror's payload; the strip reads the mirror.
+        """
+        self._takeover_strip.sync_from_mirror()
+
     def _on_verdict_for_agents(self, verdict: object) -> None:
         """Forward one verdict to the panels that render verdicts.
 
-        Two of them, for opposite halves of the same contract: the Agent
-        panel keeps the non-operator ones, and the experiment header keeps
-        the one answering its own Apply click.
+        Three kinds of receiver, for three readings of the same contract:
+        the Agent panel keeps the non-operator ones (who asked for what, and
+        the answer); the experiment header keeps the one answering its own
+        Apply click; and every instrument card reflects an ACCEPTED action
+        on its instrument into its own input fields (the **reflection
+        standard** — ``InstrumentPanel.on_verdict()``), so a setpoint an
+        agent asked for shows on the card exactly as one the operator typed.
 
         Args:
             verdict: Anything off the client's ``verdict`` stream.
         """
         self._agent_panel.on_verdict(verdict)
         self._session_info.on_verdict(verdict)
+        for panel in self._panels:
+            on_verdict = getattr(panel, "on_verdict", None)
+            if on_verdict is not None:
+                on_verdict(verdict)
 
     def _on_event_for_agents(self, event: object) -> None:
         """Forward one event to the Agent panel.

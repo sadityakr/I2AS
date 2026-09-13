@@ -1020,8 +1020,9 @@ def test_instrument_panel_status_not_restyled_when_unchanged(
 def test_procedure_param_inputs_exist(procedure_win):
     """Parameter form inputs are created for the selected procedure.
 
-    FieldSweep declares sweep_axis, so its hidden axis parameters (field_mode,
-    field_start, ...) are handled by the SweepAxisWidget, not a flat QLineEdit.
+    FieldSweep declares sweep_axis, so its axis parameters (field_mode,
+    field_start, ...) render in the Sweep column from their own ParamSpecs:
+    the mode as a structural drop-down, the linear range as text fields.
     Its measurement parameters are station-dependent (from the selected
     measurement VI), rendered under the "Measurement method" selector.
     """
@@ -1029,7 +1030,8 @@ def test_procedure_param_inputs_exist(procedure_win):
 
     _select_procedure(procedure_win, FieldSweep.name)
 
-    assert procedure_win._params_panel._axis_widget is not None
+    assert procedure_win.findChild(QComboBox, "param_field_mode_input") is not None
+    assert procedure_win.findChild(QLineEdit, "param_field_start_input") is not None
 
     # System params (temperature, init_wait, step_wait) render as flat inputs.
     for param_name in FieldSweep.system_parameters:
@@ -1047,10 +1049,7 @@ def test_procedure_param_label_and_tooltip(procedure_win):
     HDF5 output (see BaseProcedure), not prose. The prose description lives in
     a tooltip on both the input field and its form label.
 
-    Uses FieldSweep's ``temperature`` system_parameter rather than one of
-    its sweep_axis-generated fields (e.g. field_start): those are rendered by
-    SweepAxisWidget, not a flat QLineEdit + QFormLayout row, so they are not a
-    valid target for this label/tooltip check.
+    Uses FieldSweep's ``temperature`` system_parameter.
     """
     from i2as.procedures.field_sweep import FieldSweep
 
@@ -3494,8 +3493,8 @@ def test_an_out_of_bounds_run_is_refused_when_it_is_queued(
     monkeypatch.setattr(
         QMessageBox, "warning", lambda parent, title, text, *a, **k: shown.append(text)
     )
-    end_input = win.findChild(QLineEdit, "sweep_field_end_input")
-    assert end_input is not None, "the field sweep renders a sweep-axis widget"
+    end_input = win.findChild(QLineEdit, "param_field_end_input")
+    assert end_input is not None, "the field sweep renders its axis in the Sweep column"
     end_input.setText("50")
 
     win._on_add_to_queue()
@@ -3566,10 +3565,10 @@ def _catalog(tmp_path):
     return ConfigCatalog(_app_settings.shipped_config_dir(), tmp_path / "user")
 
 
-def test_monitor_menu_bar_is_user_and_procedures_only(monitor_win):
-    """The operator menu bar is exactly User + Procedures."""
+def test_monitor_menu_bar_is_user_procedures_and_connections_only(monitor_win):
+    """The operator menu bar is exactly User + Procedures + Connections."""
     titles = [a.text() for a in monitor_win.menuBar().actions()]
-    assert titles == ["User", "Procedures"]
+    assert titles == ["User", "Procedures", "Connections"]
 
 
 def test_instrument_info_lives_in_the_user_menu(monitor_win):

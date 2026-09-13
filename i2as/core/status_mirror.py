@@ -32,6 +32,7 @@ ones anywhere under ``gui/``; a conformance test keeps it that way.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Protocol
 
@@ -40,6 +41,8 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from i2as.core.events import (
     InstrumentInfo,
     LifecycleState,
+    RunFinished,
+    RunStarted,
     StateChange,
     StationInfo,
     StatusSnapshot,
@@ -77,10 +80,19 @@ class StatusMirror(QObject):
     """The last picture of the engine a client was given, as pure reads.
 
     Fed by ``on_event()`` (the ``StatusSnapshot`` / ``StateChange`` /
-    ``StationInfo`` members of the event stream) and ``on_operational_status()``
-    (the per-tick troubleshooting record, which travels on its own stream).
-    Everything else on the stream is ignored: a mirror answers reads, and a
-    ``Datapoint`` is not a read.
+    ``StationInfo`` / ``RunStarted`` / ``RunFinished`` members of the event
+    stream) and ``on_operational_status()`` (the per-tick troubleshooting
+    record, which travels on its own stream). Everything else on the stream
+    is ignored: a mirror answers reads, and a ``Datapoint`` is not a read.
+
+    The run in flight is part of the picture, not of the log: ``RunStarted``
+    installs its manifest — the run's effective parameters, class and owner
+    — and ``RunFinished`` clears it, so ``run_manifest()`` answers "what
+    exactly is running, and with what?" for a client built after the run
+    started (a procedure window opened mid-run) as readily as for one that
+    watched it start. This is the **reflection standard**'s read: the
+    status snapshot stays the minimal per-tick payload it is, and the one
+    message that carries the parameters is kept rather than re-requested.
 
     Signals:
         status_updated: A fresh ``StatusSnapshot`` landed (per tick and on
@@ -88,6 +100,9 @@ class StatusMirror(QObject):
         state_changed: A ``StateChange`` landed, carrying cause and actor.
         station_updated: A ``StationInfo`` landed — the station's declaration
             changed, i.e. an instrument connected or disconnected.
+        run_manifest_updated: The run in flight changed — a ``RunStarted``
+            landed (payload: its manifest dict) or a ``RunFinished`` did
+            (payload: ``None``).
         operational_status_updated: A fresh operational-status record landed.
 
     Args:
@@ -97,6 +112,7 @@ class StatusMirror(QObject):
     status_updated = pyqtSignal(object)  # events.StatusSnapshot
     state_changed = pyqtSignal(object)  # events.StateChange
     station_updated = pyqtSignal(object)  # events.StationInfo
+    run_manifest_updated = pyqtSignal(object)  # dict | None
     operational_status_updated = pyqtSignal(dict)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -104,6 +120,11 @@ class StatusMirror(QObject):
         self._snapshot = StatusSnapshot(state="IDLE")
         self._station = StationInfo()
         self._operational_status: dict[str, Any] = {}
+        # The manifest of the run in flight (``RunStarted.manifest``), or
+        # None. Not primed: a mirror built mid-run learns of the run from
+        # the snapshot (``run()``) and of its parameters only at the next
+        # RunStarted — the one read here that can honestly answer "unknown".
+        self._run_manifest: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Attachment
@@ -212,6 +233,12 @@ class StatusMirror(QObject):
             self.station_updated.emit(event)
         elif isinstance(event, StateChange):
             self.state_changed.emit(event)
+        elif isinstance(event, RunStarted):
+            self._run_manifest = copy.deepcopy(dict(event.manifest))
+            self.run_manifest_updated.emit(copy.deepcopy(self._run_manifest))
+        elif isinstance(event, RunFinished):
+            self._run_manifest = None
+            self.run_manifest_updated.emit(None)
 
     def on_operational_status(self, record: dict[str, Any]) -> None:
         """Absorb one per-tick operational-status record.
@@ -245,6 +272,25 @@ class StatusMirror(QObject):
             — optional keys omitted rather than guessed — or ``None``.
         """
         return dict(self._snapshot.run) if self._snapshot.run is not None else None
+
+    def run_manifest(self) -> dict[str, Any] | None:
+        """Return the manifest of the run in flight, or ``None``.
+
+        The **reflection standard**'s read (see the class docstring): the
+        ``RunStarted.manifest`` of the run that is running — ``procedure``,
+        ``procedure_class``, ``params`` (the run's effective parameters),
+        ``owner``, ``kind``, ``data_file``, ``started_utc`` — so a client can
+        show what is running with exactly the values it was started with,
+        whoever started it. Cleared by ``RunFinished``.
+
+        Returns:
+            A copy of the manifest, or ``None`` when nothing is running or
+            this mirror was built after the run started and has not seen its
+            ``RunStarted`` (``run()`` still names the run in that case).
+        """
+        if self._run_manifest is None:
+            return None
+        return copy.deepcopy(self._run_manifest)
 
     def run_owner(self) -> dict[str, Any] | None:
         """Return the **run owner** of the run in flight, or ``None``.

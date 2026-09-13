@@ -110,6 +110,17 @@ class InstrumentFrontPanel(QWidget):
         # cannot disagree with the one on the card.
         self._mirror.status_updated.connect(self._on_status_snapshot)
 
+    @property
+    def panel(self) -> InstrumentPanel:
+        """The embedded card, so the card on the grid can reflect into it.
+
+        A front panel shows EVERY control of its instrument, including the
+        ones the monitor card's allowlist hides, so an accepted action on a
+        hidden control still has a field to be reflected into here (the
+        reflection standard, ``InstrumentPanel.on_verdict()``).
+        """
+        return self._panel
+
     def _on_status_snapshot(self, _snapshot: object) -> None:
         """Forward a fresh snapshot to the embedded panel.
 

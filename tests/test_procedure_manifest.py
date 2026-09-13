@@ -224,7 +224,9 @@ class TestGatewayTools:
             {"procedure": "FieldSweep"}, context
         )
         keys = [group["key"] for group in described["groups"]]
-        assert "sweep_axis" in keys
+        assert keys[0] == "sweep"
+        assert "field_mode" in _params(described, "sweep")
+        assert "field_start" in _params(described, "sweep")
         assert "measurement:dc_measurement" in keys
 
     def test_a_structural_choice_opens_the_form_it_gates(self, context) -> None:
@@ -315,10 +317,10 @@ def test_wire_and_gui_resolve_the_same_form(station, declared) -> None:
         selections,
     )
 
-    from i2as.core.procedure import SWEEP_AXIS_GROUP_KEY
-
+    # Nothing is dropped on either side any more: the sweep axis is guarded
+    # blocks of the Sweep group, rendered from the declaration by both.
     assert [(g.key, list(g.params)) for g in gui] == [
-        (g.key, list(g.params)) for g in wire if g.key != SWEEP_AXIS_GROUP_KEY
+        (g.key, list(g.params)) for g in wire
     ]
 
 

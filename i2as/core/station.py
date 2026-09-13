@@ -54,6 +54,7 @@ from i2as.core.plan import (
     EnvelopeVariable,
     ParamSpec,
     Target,
+    param_spec_to_json,
 )
 from i2as.virtual_instruments.base import (
     BaseVirtualInstrument,
@@ -2389,6 +2390,7 @@ def _param_json(
             "min": spec.min,
             "max": spec.max,
             "choices": dict(spec.choices) if spec.choices else None,
+            "columns": param_spec_to_json(param_name, spec)["columns"],
         }
     info = signature_info or {}
     return {
@@ -2401,6 +2403,7 @@ def _param_json(
         "min": None,
         "max": None,
         "choices": None,
+        "columns": None,
     }
 
 

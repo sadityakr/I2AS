@@ -998,6 +998,15 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
         "status, ramps, faults, holds, attendance and the kill switch.",
     ),
     _read_tool(
+        "read_readings",
+        "The latest polled readings of every instrument — the numbers the "
+        "operator's instrument cards and front panels show — keyed by "
+        "instrument name and then by the reading names read_station_info "
+        "declares, with the tick they were taken on. Null before the first "
+        "polled tick (monitoring off, or a client fed by the request spool, "
+        "which carries no readings).",
+    ),
+    _read_tool(
         "read_station_info",
         "The station's declaration snapshot: every configured instrument, what "
         "it reads, what it can be asked to do, and within which bounds.",
@@ -1488,6 +1497,10 @@ class ToolContext:
             ``StatusSnapshot``; the ``Gateway`` supplies its own mirror.
         station_source: Zero-argument callable returning the latest
             ``StationInfo``; the ``Gateway`` supplies its own mirror.
+        readings_source: Zero-argument callable returning the latest
+            ``Readings`` event, or ``None`` before the first polled tick;
+            the ``Gateway`` supplies its own mirror. What ``read_readings``
+            answers from.
         draft_client: The **Draft client** ``draft_eln_entry`` asks
             (``complete(system, user, max_tokens)``), duck-typed so a test
             passes ``FakeDraftClient`` and no test reaches a network.
@@ -1522,6 +1535,7 @@ class ToolContext:
     status_log_path: Path | None = None
     status_source: Callable[[], Any] | None = None
     station_source: Callable[[], StationInfo] | None = None
+    readings_source: Callable[[], Any] | None = None
     draft_client: Any | None = None
     assistant_settings: AssistantSettings | None = None
     publisher: Any | None = None
@@ -1828,6 +1842,26 @@ def _tool_read_status(args: Mapping[str, Any], context: ToolContext) -> Any:
     """
     snapshot = context.status_source() if context.status_source else None
     return None if snapshot is None else snapshot.to_json()
+
+
+def _tool_read_readings(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``read_readings`` from the client's own mirror.
+
+    The read half of the **reflection standard** for an agent: the same
+    per-tick ``Readings`` event the GUI's cards render, so an agent and the
+    physicist read one number from one message, never a second poll of the
+    instrument.
+
+    Args:
+        args: Unused; the tool takes none.
+        context: The tool context, whose ``readings_source`` is the mirror.
+
+    Returns:
+        ``{"values": {vi_name: {reading: value}}, "seq", "ts"}`` — the
+        ``Readings`` event as JSON — or ``None`` before the first polled tick.
+    """
+    readings = context.readings_source() if context.readings_source else None
+    return None if readings is None else readings.to_json()
 
 
 def _tool_read_station_info(args: Mapping[str, Any], context: ToolContext) -> Any:
@@ -2902,6 +2936,7 @@ def feed_arguments(tool: ToolSpec, args: Mapping[str, Any]) -> dict[str, Any]:
 #: wraps ``run_procedure`` and is submitted like any other command.
 SESSION_TOOL_FUNCTIONS: dict[str, Callable[[Mapping[str, Any], ToolContext], Any]] = {
     "read_status": _tool_read_status,
+    "read_readings": _tool_read_readings,
     "read_station_info": _tool_read_station_info,
     "read_manifest": _tool_read_manifest,
     "list_procedures": _tool_list_procedures,

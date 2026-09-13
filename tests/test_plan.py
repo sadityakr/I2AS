@@ -226,7 +226,7 @@ def test_paramspec_default_wrong_type():
 
 def test_paramspec_bad_type():
     with pytest.raises(TypeError, match="ParamSpec.type"):
-        ParamSpec(type=list, default=[])
+        ParamSpec(type=dict, default={})
 
 
 def test_paramspec_bounds_ok():
@@ -932,3 +932,49 @@ def test_image_block_is_frozen():
     block = ImageBlock(4, 6, "counts")
     with pytest.raises(dataclasses.FrozenInstanceError):
         block.height_px = 8  # type: ignore[misc]
+
+
+# ── ParamSpec(type=list): a table of rows shaped by its columns ───────────────
+
+
+def _segment_columns():
+    return {
+        "start": ParamSpec(type=float, default=0.0),
+        "end": ParamSpec(type=float, default=1.0),
+        "step": ParamSpec(type=float, default=0.1),
+    }
+
+
+def test_paramspec_list_declares_columns_and_accepts_rows():
+    spec = ParamSpec(type=list, default=[], columns=_segment_columns())
+    assert spec.accepts([{"start": 0.0, "end": 1.0, "step": 0.5}])
+    assert spec.accepts([])
+    assert not spec.accepts([{"start": 0.0}])  # a missing column
+    assert not spec.accepts([{"start": "a", "end": 1.0, "step": 0.5}])  # wrong type
+    assert not spec.accepts({"start": 0.0})  # not a list
+    assert not spec.accepts([{"start": 0.0, "end": 1.0, "step": True}])  # bool is not float
+
+
+def test_paramspec_list_needs_columns_and_scalars_refuse_them():
+    with pytest.raises(ValueError):
+        ParamSpec(type=list, default=[])
+    with pytest.raises(ValueError):
+        ParamSpec(type=float, default=1.0, columns=_segment_columns())
+    with pytest.raises(TypeError):
+        ParamSpec(type=list, default=[], columns={"rows": ParamSpec(type=list, default=[], columns=_segment_columns())})
+    with pytest.raises(ValueError):
+        ParamSpec(type=list, default=[{"start": 0.0}], columns=_segment_columns())
+
+
+def test_paramspec_list_round_trips_through_json():
+    from i2as.core.plan import param_spec_from_json, param_spec_to_json
+
+    spec = ParamSpec(
+        type=list,
+        default=[{"start": 0.0, "end": 1.0, "step": 0.5}],
+        columns=_segment_columns(),
+        description="segments",
+    )
+    wire = param_spec_to_json("segments", spec)
+    assert wire["kind"] == "list" and [c["name"] for c in wire["columns"]] == ["start", "end", "step"]
+    assert param_spec_from_json(wire) == spec

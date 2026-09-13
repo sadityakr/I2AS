@@ -36,7 +36,13 @@ from i2as.session.agent_feed import AgentFeed
 from i2as.session.eln.publisher import ElnPublisher
 from i2as.session.gateway import authorize_spooled
 from i2as.session.eln.settings import load_eln_settings
-from i2as.session.gateway import GatewayServer, ToolContext
+from i2as.session.gateway import (
+    GatewayController,
+    GatewayServer,
+    Role,
+    ToolContext,
+    role_within_ceiling,
+)
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import GUEST_USER_ID, GUEST_USER_NAME, User
 from i2as.session.store import ExperimentStore, SessionStore, UserRoster
@@ -199,21 +205,67 @@ def _resolve_active_session(store: SessionStore) -> tuple[str, str]:
     return user_id, session.session_id
 
 
-def _open_experiment_feed(manager: ExperimentManager) -> AgentFeed | None:
-    """Return the **Agent feed** of whichever experiment is open right now.
+class ExperimentFeeds:
+    """The **Agent feed** of whichever experiment is open, one per experiment.
 
     Resolved on demand rather than once at startup, so a client that
     connects after the physicist opened a new experiment leaves its trail in
     that experiment's folder — the feed belongs to the experiment, not to
-    the process.
+    the process. And ONE per experiment, attached ONCE to the engine's
+    streams: the gateway records a command's arguments from its own
+    ``submit()``, but the answering verdicts and the state changes are
+    recorded off ``verdict_emitted`` / ``event_emitted`` by
+    ``AgentFeed.attach()`` — a feed built per connection and never attached
+    would leave a trail of questions with no answers, and a feed attached
+    per connection would record every answer once per connection.
+
+    Args:
+        manager: The session layer's experiment façade.
+        engine: What to attach each feed to — the client's
+            ``OrchestratorProxy``, whose ``verdict``/``event`` signals
+            deliver on this thread whichever thread the engine runs on.
+    """
+
+    def __init__(self, manager: ExperimentManager, engine: Any) -> None:
+        self._manager = manager
+        self._engine = engine
+        self._feeds: dict[str, AgentFeed] = {}
+
+    def current(self) -> AgentFeed | None:
+        """Return the open experiment's feed, attached, or ``None``.
+
+        Returns:
+            The feed for the open experiment, or ``None`` when none is open
+            (in which case a connection records nothing rather than
+            inventing a folder to record into).
+        """
+        experiment = self._manager.current_experiment()
+        if experiment is None:
+            return None
+        experiment_id = experiment.experiment_id
+        feed = self._feeds.get(experiment_id)
+        if feed is None:
+            feed = AgentFeed(
+                self._manager.store.agent_feed_path(experiment_id), experiment_id
+            )
+            feed.attach(self._engine)
+            self._feeds[experiment_id] = feed
+        return feed
+
+
+def _open_experiment_feed(manager: ExperimentManager) -> AgentFeed | None:
+    """Return an UNATTACHED **Agent feed** for the open experiment, or ``None``.
+
+    The path-resolving half of ``ExperimentFeeds.current()``, kept for a
+    caller that only needs to know where the open experiment's trail lives;
+    the application itself opens feeds through ``ExperimentFeeds`` so each
+    is attached to the engine's streams exactly once.
 
     Args:
         manager: The session layer's experiment façade.
 
     Returns:
-        The feed for the open experiment, or ``None`` when none is open (in
-        which case a connection records nothing rather than inventing a
-        folder to record into).
+        The feed for the open experiment, or ``None`` when none is open.
     """
     experiment = manager.current_experiment()
     if experiment is None:
@@ -520,22 +572,59 @@ def main(
     # second writer to the bus. Wired here because this is the one place that
     # owns both the proxy and the session layer; attached to `app` so its
     # ownership is explicit, like every other QObject built in main().
+    # The Connections menu (i2as/gui/monitor_window.py, i2as/gui/connections_dialog.py)
+    # is what lets an operator turn this on/off and pick the role at runtime,
+    # without an edit-and-restart — but monitor.yaml's gateway_max_role stays
+    # the one thing that menu cannot raise: it is the ceiling GatewayController
+    # enforces (see controller.py's module docstring), read once here and never
+    # re-read from the menu. gateway_server / gateway_max_role in QSettings (set
+    # only by that menu) override monitor.yaml's own defaults for whether the
+    # door starts open and which role — up to the ceiling — walks through it;
+    # absent that, monitor.yaml's own values seed the very first launch.
     gateway_config = read_gateway_config(used_path)
-    app.gateway_server = _build_gateway_server(
+    try:
+        gateway_ceiling = Role(gateway_config["gateway_max_role"])
+    except ValueError:
+        logger.error(
+            "Gateway server disabled: monitor.yaml declares the unknown "
+            "gateway_max_role %r",
+            gateway_config["gateway_max_role"],
+        )
+        gateway_ceiling = Role.OBSERVER
+        gateway_enabled = False
+    else:
+        gateway_enabled = gateway_config["gateway_server"]
+    persisted_enabled = app_settings.gateway_enabled()
+    if persisted_enabled is not None:
+        gateway_enabled = persisted_enabled
+    gateway_role = gateway_ceiling
+    persisted_role = app_settings.gateway_max_role()
+    if persisted_role:
+        try:
+            candidate_role = Role(persisted_role)
+        except ValueError:
+            candidate_role = gateway_ceiling
+        if role_within_ceiling(candidate_role, gateway_ceiling):
+            gateway_role = candidate_role
+
+    # One attached feed per experiment, shared by every connection (see
+    # ExperimentFeeds). Owned by the app so its lifetime is explicit.
+    app.experiment_feeds = ExperimentFeeds(session_manager, orchestrator)
+    app.gateway_controller = GatewayController(
         orchestrator,
-        gateway_config,
         station_info=station.station_info,
         tool_context=ToolContext(experiments=session_manager, run_catalog=run_catalog),
-        feed=lambda: _open_experiment_feed(session_manager),
+        feed=app.experiment_feeds.current,
+        ceiling=gateway_ceiling,
     )
-    if app.gateway_server is not None:
-        # Stopping on quit is what keeps the descriptor honest: a gateway.json
-        # left behind names a socket that is gone and a token that means
-        # nothing, and an adapter reading it reports "cannot connect" instead
-        # of "the app is not running". The socket itself is reclaimed either
-        # way — start() removes a stale one — so this exists for the
-        # descriptor's sake.
-        app.aboutToQuit.connect(app.gateway_server.stop)
+    if gateway_enabled:
+        app.gateway_controller.start(gateway_role)
+    # Stopping on quit is what keeps the descriptor honest: a gateway.json
+    # left behind names a socket that is gone and a token that means
+    # nothing, and an adapter reading it reports "cannot connect" instead
+    # of "the app is not running". stop() is a no-op while already off, so
+    # this is connected unconditionally rather than only when started.
+    app.aboutToQuit.connect(app.gateway_controller.stop)
 
     # Read once and shared with the publisher below: the drafting model,
     # key, token cap and price table live in the same user-level settings
@@ -590,6 +679,7 @@ def main(
         session_store=session_store,
         panels_config=read_panels_config(used_path),
         mirror=mirror,
+        gateway_controller=app.gateway_controller,
     )
     monitor.show()
 

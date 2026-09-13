@@ -22,6 +22,7 @@ from i2as.session.gateway.action_classes import (
     classify_command,
     classify_control,
 )
+from i2as.session.gateway.controller import GatewayController
 from i2as.session.gateway.gateway import EngineClient, Gateway
 from i2as.session.gateway.local_server import (
     MAX_FRAME_BYTES,
@@ -70,6 +71,7 @@ __all__ = [
     "Gateway",
     "EngineClient",
     "GatewayServer",
+    "GatewayController",
     "SCHEMA_VERSION",
     "MAX_FRAME_BYTES",
     "descriptor_path",

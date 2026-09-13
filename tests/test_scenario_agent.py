@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -79,6 +80,23 @@ PROBE_PARAMS = {**FAST_PARAMS, "field_steps": 51}
 PROBE_SPEC = {"n_points": 3, "averaging": 2, "max_wait_s": 0.0}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Build a minimal, isolated environment for the adapter subprocess.
+
+    ``PATH`` is scoped down so the child cannot casually shell out — but on
+    Windows, ``asyncio`` imports ``_overlapped`` at startup, which calls
+    ``WSAStartup`` and fails with ``WinError 10106`` unless ``SystemRoot`` is
+    present for it to find its service provider. POSIX has no such
+    requirement, so the restrictive ``PATH`` alone is enough there.
+    """
+    env = {"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"}
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env["SystemRoot"] = system_root
+        env["PATH"] = rf"{system_root}\system32;{system_root}"
+    return env
 
 
 def _fast_station(config_path: str = CONFIG_PATH):
@@ -950,7 +968,7 @@ class _AdapterProcess:
                 "WARNING",
             ],
             cwd=str(REPO_ROOT),
-            env={"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"},
+            env=_subprocess_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

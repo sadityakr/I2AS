@@ -3,7 +3,7 @@
 # (the sim-coupling standard, drivers/README.md): the "@imaging" suffix on
 # both addresses is what lets the simulated sample respond to the simulated
 # field. The stage joins no environment; nothing else responds to it.
-data_directory: "C:/CryoData"
+data_directory: "C:/Users/Supervisor/CryoData"
 
 real_drivers:
   ips_z:

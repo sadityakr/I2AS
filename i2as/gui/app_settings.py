@@ -21,6 +21,8 @@ _SESSIONS_SUBDIR = "sessions"
 _ACTIVE_CONFIG_NAME_KEY = "ActiveConfig/name"
 _ACTIVE_CONFIG_SOURCE_KEY = "ActiveConfig/source"
 _CURRENT_USER_KEY = "CurrentUser/user_id"
+_GATEWAY_ENABLED_KEY = "Gateway/enabled"
+_GATEWAY_MAX_ROLE_KEY = "Gateway/max_role"
 
 
 def get_settings() -> QSettings:
@@ -154,3 +156,56 @@ def set_current_user_id(user_id: str | None) -> None:
         settings.setValue(_CURRENT_USER_KEY, user_id)
     else:
         settings.remove(_CURRENT_USER_KEY)
+
+
+def gateway_enabled() -> bool | None:
+    """Return whether the Connections menu last left the Gateway server on.
+
+    Machine-level like the active config: this is what lets an operator
+    turn the Agent gateway on or off from the GUI and have that choice
+    survive a restart, independent of ``monitor.yaml``'s ``gateway_server``
+    flag, which only seeds the very first launch.
+
+    Returns:
+        ``True``/``False`` once the Connections dialog has been used to set
+        it; ``None`` when it never has, so the caller falls back to the
+        active config's own default.
+    """
+    settings = get_settings()
+    if not settings.contains(_GATEWAY_ENABLED_KEY):
+        return None
+    # type=bool is what makes this correct on every backend: the Windows
+    # registry store round-trips a bool as the strings "true"/"false", not
+    # "1"/"0", and QSettings.value()'s own coercion is what already knows
+    # that — reimplementing it here previously broke on exactly this case.
+    return bool(settings.value(_GATEWAY_ENABLED_KEY, False, type=bool))
+
+
+def set_gateway_enabled(enabled: bool) -> None:
+    """Persist whether the Gateway server should listen on next launch.
+
+    Args:
+        enabled: The Connections dialog's on/off toggle.
+    """
+    get_settings().setValue(_GATEWAY_ENABLED_KEY, bool(enabled))
+
+
+def gateway_max_role() -> str | None:
+    """Return the Gateway role ceiling the Connections dialog last set.
+
+    Returns:
+        The ``Role`` value string (e.g. ``"session"``), or ``None`` when the
+        Connections dialog has never set one — the caller falls back to the
+        active config's ``gateway_max_role``.
+    """
+    value = get_settings().value(_GATEWAY_MAX_ROLE_KEY)
+    return str(value) if value else None
+
+
+def set_gateway_max_role(role: str) -> None:
+    """Persist the Gateway role ceiling for next launch.
+
+    Args:
+        role: A ``Role`` value string, as chosen in the Connections dialog.
+    """
+    get_settings().setValue(_GATEWAY_MAX_ROLE_KEY, str(role))

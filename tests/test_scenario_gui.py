@@ -876,7 +876,10 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
     # distinguishable by tool name at this layer.
     rows = panel.row_texts()
     assert not any("validate_run" in row for row in rows)
-    assert sum("run_procedure → OK" in row for row in rows) == 2
+    # Each row now says what the run was asked with (the reflection
+    # standard): ``run_procedure(procedure=FieldSweep, …) → OK``.
+    assert sum("run_procedure(" in row and "→ OK" in row for row in rows) == 2
+    assert all("procedure=FieldSweep" in row for row in rows if "run_procedure(" in row)
     assert all("runner-7" in row for row in rows)
     assert not any(action.refused for action in panel.actions() if action.actor_id == "runner-7")
 

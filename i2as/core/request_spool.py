@@ -361,6 +361,7 @@ class RequestSpool:
                 command=request.command.name,
                 code=VerdictCode.BLOCKED_ROLE,
                 actor=request.command.actor,
+                args=dict(request.command.args),
                 reason=(
                     "The request spool has no permission model installed, so "
                     "no spooled request can be authorised; every request is "
@@ -386,6 +387,7 @@ class RequestSpool:
                 command=request.command.name,
                 code=VerdictCode.FAILED,
                 actor=request.command.actor,
+                args=dict(request.command.args),
                 reason=f"The request spool's permission check failed: {exc}",
                 detail={"rule": "spool_authorizer_error"},
                 seq=seq,
@@ -642,6 +644,7 @@ class RequestSpool:
                     command=command.name,
                     code=VerdictCode.BLOCKED_ROLE,
                     actor=command.actor,
+                    args=dict(command.args),
                     reason=(
                         f"A spooled request may not claim actor kind "
                         f"{command.actor.kind.value!r}: the operator's authority "

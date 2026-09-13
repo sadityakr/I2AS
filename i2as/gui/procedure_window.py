@@ -1,4 +1,22 @@
-"""ProcedureWindow — procedure builder, queue, and live-data monitor (shell)."""
+"""ProcedureWindow — procedure builder, queue, and live-data monitor (shell).
+
+The window is one client of the control contract like any other, and since
+the **reflection standard** it is symmetric with the agent's and the CLI's:
+
+* **Acting.** Run Now submits the same JSON ``run_procedure`` command an
+  agent submits over MCP — a class name plus the form's values — through the
+  one door, ``submit()``, and is answered by the same ``Verdict``. The form's
+  values are validated here first (a headless build, exactly as the queue
+  validates an entry), so a refusal still arrives as a dialog rather than an
+  hour later; the engine builds the one run that executes.
+* **Reflecting.** Every ``RunStarted`` — the operator's own, a queued run
+  the tick pulled, an agent's — puts the run's effective parameters into the
+  form (``ProcedureParamsPanel.reflect_run()``), resets the live plot, and
+  writes a status line naming who started it. A window opened mid-run does
+  the same from the mirror's ``run_manifest()``. The human watching this
+  window therefore sees exactly the configuration that is running, whoever
+  set it, which is what attendance and the kill switch presuppose.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +43,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from i2as.core import events as ev
 from i2as.core.orchestrator_proxy import OrchestratorProxy
 from i2as.core.procedure import BaseProcedure
 from i2as.core.run_builder import PROCEDURE_BUILD_ERRORS, build_procedure
@@ -154,6 +173,11 @@ class ProcedureWindow(QMainWindow):
 
         # Active procedure reference (set on run)
         self._active_procedure: BaseProcedure | None = None
+        # The request id of this window's own last Run Now, so its verdict
+        # — the one answer the engine owes it — can be told apart from
+        # every other verdict on the stream and a refusal shown in the
+        # banner.
+        self._pending_run_request: str | None = None
         # Live plot: full datapoint history (each entry is the enriched dict from measurement_ready)
         self._datapoints: list[dict] = []
 
@@ -170,6 +194,14 @@ class ProcedureWindow(QMainWindow):
 
         if initial_session is not None:
             self._restore_session(initial_session)
+
+        # A window opened mid-run shows the run, not a stale draft (the
+        # reflection standard): the mirror kept the manifest the engine
+        # emitted when the run started. After the session restore, so the
+        # run in flight wins over what the form last held.
+        manifest = self._mirror.run_manifest()
+        if manifest is not None:
+            self._params_panel.reflect_run(manifest)
 
         # The window-liveness standard (gui/widget_lifecycle.py): this window
         # owns the reference that keeps it alive, so no garbage-collection
@@ -433,6 +465,16 @@ class ProcedureWindow(QMainWindow):
         # becomes something to analyse. Connected to a WINDOW slot (the
         # destruction-order rule, gui/README.md) rather than to the panel.
         self._orchestrator.run_finished.connect(self._on_run_finished)
+        # The run in flight, whoever started it (the reflection standard):
+        # the mirror re-emits every RunStarted's manifest, and this window
+        # puts it into the form. A window slot, like every other stream here.
+        self._mirror.run_manifest_updated.connect(self._on_run_manifest_updated)
+        # This window's own Run Now is answered on the verdict stream like
+        # every other command; a refusal is shown here, in the banner.
+        verdict_stream = getattr(self._orchestrator, "verdict_emitted", None)
+        if verdict_stream is None:
+            verdict_stream = self._orchestrator.verdict
+        verdict_stream.connect(self._on_verdict)
 
         self._params_panel.add_to_queue_requested.connect(self._on_add_to_queue)
         self._params_panel.run_now_requested.connect(self._on_run_now)
@@ -449,6 +491,7 @@ class ProcedureWindow(QMainWindow):
             manifest: The run manifest the Orchestrator emitted.
         """
         self._analysis_panel.on_run_finished(manifest)
+        self._params_panel.note_run_finished(manifest)
 
     def reload_analysis_panel(self) -> None:
         """Re-read the **eLab tab** (the settings behind it just changed).
@@ -498,6 +541,67 @@ class ProcedureWindow(QMainWindow):
                 serves every read they make.
         """
         self._refresh_pause_caption()
+
+    def _on_run_manifest_updated(self, manifest: object) -> None:
+        """Reflect the run that just started into the form and the plot.
+
+        The **reflection standard**'s slot: the payload is the
+        ``RunStarted`` manifest the mirror absorbed (or ``None`` for a
+        ``RunFinished``, which ``_on_run_finished`` already handles). The
+        form takes the run's effective parameters and says whose run it is
+        showing; the live plot starts over, because the points about to
+        arrive belong to this run whoever started it; and the Status log
+        gets one line naming the actor, so a run an agent started reads in
+        the same log the operator's own does.
+
+        Args:
+            manifest: A manifest dict, or ``None``.
+        """
+        if not isinstance(manifest, dict):
+            return
+        self._datapoints.clear()
+        self._plot1.clear()
+        self._plot2.clear()
+        self._progress_bar.setValue(0)
+        self._params_panel.reflect_run(manifest)
+        owner = manifest.get("owner")
+        who = ""
+        if isinstance(owner, dict):
+            who = f"{owner.get('kind', '')} {owner.get('id', '')!r}".strip()
+        name = manifest.get("procedure") or manifest.get("procedure_class") or "run"
+        # The first few parameters that say something; the form above holds
+        # all of them, so this line is a pointer, not the record.
+        told = [
+            (key, value)
+            for key, value in (manifest.get("params") or {}).items()
+            if value not in ("", None, [], {})
+        ]
+        summary = ", ".join(f"{key}={value}" for key, value in told[:6])
+        if len(told) > 6:
+            summary = f"{summary}, …"
+        self._on_status_message(
+            f"Run started{f' by {who}' if who else ''}: {name}"
+            + (f" ({summary})" if summary else "")
+        )
+
+    def _on_verdict(self, verdict: object) -> None:
+        """Show the engine's answer to this window's own Run Now, if refused.
+
+        Args:
+            verdict: Anything off the verdict stream; only the one answering
+                ``_pending_run_request`` is this window's to report.
+        """
+        if not isinstance(verdict, ev.Verdict):
+            return
+        if verdict.request_id != self._pending_run_request:
+            return
+        self._pending_run_request = None
+        if verdict.ok:
+            return
+        self._banner.show_message(
+            f"Run refused ({verdict.code.value}): {verdict.reason}",
+            BANNER_SEVERITY_ERROR,
+        )
 
     def _refresh_pause_caption(self) -> None:
         """Caption the Pause button "Pausing…" while a pause is deferred.
@@ -615,13 +719,48 @@ class ProcedureWindow(QMainWindow):
         )
 
     def _on_run_now(self) -> None:
-        """Build and immediately run the current procedure via the Orchestrator."""
-        proc = self._build_procedure_instance()
+        """Start the current form's run now, through the one door.
+
+        The form's values are validated first by building the run headlessly
+        — the same check the queue applies to an entry, so a parameter the
+        procedure refuses is reported in a dialog now rather than as a
+        verdict later — and the run is then SUBMITTED as the JSON
+        ``run_procedure`` command every other client sends (the reflection
+        standard's symmetry): a class name plus the values, stamped with the
+        operator actor, answered by one ``Verdict`` and followed by the
+        ``RunStarted`` that puts these same values back into the form. The
+        engine builds the run that executes; the instance built here is
+        discarded once it has proven the values sound.
+        """
+        collected = self._collect_params()
+        if collected is None:
+            return
+        proc = self._build_procedure_instance(collected)
         if proc is None:
             return
+        cls = self._params_panel.current_class()
+        if cls is None:
+            return
+        param_values, sample_info, data_dir, file_prefix = collected
         self._active_procedure = proc
         self._reset_plot(proc)
-        self._orchestrator.run_procedure(proc)
+        command = ev.Command(
+            name=ev.CommandName.RUN_PROCEDURE,
+            actor=ev.OPERATOR,
+            args={
+                "procedure": cls.__name__,
+                "params": param_values,
+                "sample_info": sample_info,
+                "data_directory": data_dir,
+                "file_prefix": file_prefix,
+                "experiment_info": self._experiment_info() or None,
+            },
+        )
+        # Remembered BEFORE the submit: with the engine on this thread the
+        # verdict is emitted inside submit() itself, and a slot that only
+        # learned the id afterwards would let its own answer go by.
+        self._pending_run_request = command.request_id
+        self._orchestrator.submit(command)
 
     def _on_pause_clicked(self) -> None:
         """Pause the running procedure."""

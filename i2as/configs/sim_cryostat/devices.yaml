@@ -1,5 +1,5 @@
 # Default data directory (outside I2AS folder)
-data_directory: "C:/CryoData"
+data_directory: "C:/Users/Supervisor/CryoData"
 
 real_drivers:
   ips_z:

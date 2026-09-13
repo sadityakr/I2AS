@@ -1,3 +1,4 @@
 monitor:
   tick_interval_ms: 3000
   max_vi_errors: 3
+  gateway_max_role: session

@@ -479,11 +479,30 @@ class Verdict(_ContractMessage):
     ``core.conditions.Verdict``, which is the enforcement decision computed
     from a set of system conditions.
 
+    **The answer echoes the question.** A verdict names the ``command`` and
+    the ``actor`` it answers, and — since the **reflection standard** — the
+    ``args`` that command carried. A command is otherwise the one message in
+    this contract with an audience of one: only the client that built it
+    ever held its arguments, so a second client watching the same stream
+    could see that an agent was obeyed but not what it had asked for. With
+    the arguments on the verdict, every surface reads "who asked for what,
+    and what the engine said" off the one message every client already
+    receives, exactly once per command — which is what lets the physicist's
+    window render an agent's action as if the physicist had typed it, and
+    an agent read the physicist's. The verdict is the right carrier rather
+    than the status snapshot (which ticks constantly and stays minimal) or
+    a second event (which would arrive before the engine had judged the
+    request): a client reflects what was *accepted*, and a refusal carries
+    its arguments too, so the refusal can be read in full.
+
     Attributes:
         request_id: The ``Command.request_id`` this answers.
         command: Which command was asked for.
         code: The machine-readable outcome (see ``VerdictCode``).
         actor: The actor of the command being answered.
+        args: The answered command's arguments, JSON-safe, as submitted —
+            the ``Command.args`` this verdict answers (see the reflection
+            note above). Empty for a command that carried none.
         reason: Human-readable explanation, suitable for a banner. Never
             parsed by a client.
         detail: Optional structured explanation of the code — for
@@ -498,6 +517,7 @@ class Verdict(_ContractMessage):
     command: CommandName
     code: VerdictCode
     actor: Actor = OPERATOR
+    args: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     detail: dict[str, Any] | None = None
     result: Any = None
@@ -515,6 +535,7 @@ class Verdict(_ContractMessage):
         object.__setattr__(self, "command", CommandName(self.command))
         object.__setattr__(self, "code", VerdictCode(self.code))
         object.__setattr__(self, "actor", _as_actor(self.actor))
+        object.__setattr__(self, "args", _checked_mapping(self.args))
         if self.detail is not None:
             object.__setattr__(self, "detail", _checked_mapping(self.detail))
         object.__setattr__(self, "result", _jsonable(self.result))
@@ -1294,10 +1315,21 @@ class Datapoint(_ContractMessage):
 class RunStarted(_ContractMessage):
     """A run reached successful setup and is now producing data.
 
+    The manifest is the **reflection standard**'s source for a run: it
+    carries ``procedure`` (the display name), ``procedure_class`` (the
+    catalog key ``run_procedure`` takes), ``params`` (the run's EFFECTIVE
+    parameters — declared defaults merged with what was asked, exactly what
+    the data file records), ``owner`` (the **run owner**'s ``Actor.ref()``),
+    ``kind``, ``data_file`` and ``started_utc``. A client that holds this
+    one event can put the procedure form into the state the run was
+    started with, whoever started it and by whichever door.
+
     Attributes:
         run_id: Identifier of the run that started.
-        manifest: The run manifest, JSON-safe.
-        actor: Who started it.
+        manifest: The run manifest, JSON-safe (see above).
+        actor: Who started it — the actor of the command in flight, which
+            for a run pulled off the queue by the tick is the ``system``
+            actor; the run's OWNER is ``manifest["owner"]``.
         request_id: The command that started it, or ``""``.
         seq: Monotonic sequence number.
         ts: Unix time of the start.

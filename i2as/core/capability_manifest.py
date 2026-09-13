@@ -284,6 +284,7 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "min",
                 "max",
                 "choices",
+                "columns",
             ],
             "additionalProperties": False,
             "properties": {
@@ -299,7 +300,10 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 },
                 "kind": {
                     "type": "string",
-                    "description": "Scalar type name: float, int, str or bool.",
+                    "description": (
+                        "Type name: float, int, str or bool, or list for a "
+                        "table of rows shaped by 'columns'."
+                    ),
                 },
                 "unit": {"type": "string"},
                 "description": {"type": "string"},
@@ -309,6 +313,13 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "choices": {
                     "type": ["object", "null"],
                     "description": "Label -> value for an enumerated parameter.",
+                },
+                "columns": {
+                    "type": ["array", "null"],
+                    "description": (
+                        "For kind 'list': one parameter declaration per "
+                        "column of the table, in display order."
+                    ),
                 },
             },
         },

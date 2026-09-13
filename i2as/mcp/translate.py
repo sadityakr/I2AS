@@ -59,6 +59,7 @@ __all__ = [
     "INSTRUCTIONS",
     "CAPABILITIES",
     "STATUS_URI",
+    "READINGS_URI",
     "STATION_URI",
     "MANIFEST_URI",
     "RESOURCES",
@@ -114,13 +115,14 @@ INSTRUCTIONS = (
     "connection's role, the human's attendance and the kill switch before "
     "anything reaches an instrument. A refusal comes back as a normal "
     "result whose 'code' names the rule that refused; read it rather than "
-    "retrying. Read i2as://status and i2as://station before acting, "
+    "retrying. Read i2as://status, i2as://readings and i2as://station before acting, "
     "and validate or probe a run before starting one."
 )
 
-#: The three resources: the live snapshot, the station's declaration, and
-#: the capability manifest.
+#: The four resources: the live snapshot, the live readings, the station's
+#: declaration, and the capability manifest.
 STATUS_URI = "i2as://status"
+READINGS_URI = "i2as://readings"
 STATION_URI = "i2as://station"
 MANIFEST_URI = "i2as://manifest"
 
@@ -130,6 +132,7 @@ MANIFEST_URI = "i2as://manifest"
 #: same trail in the **Agent feed** apply to a resource read as to any call.
 RESOURCE_TOOLS: dict[str, str] = {
     STATUS_URI: "read_status",
+    READINGS_URI: "read_readings",
     STATION_URI: "read_station_info",
     MANIFEST_URI: "read_manifest",
 }
@@ -141,6 +144,16 @@ RESOURCES: tuple[dict[str, Any], ...] = (
         "description": (
             "The engine's latest status snapshot: state, active run, "
             "attendance and the kill switch's setting."
+        ),
+        "mimeType": "application/json",
+    },
+    {
+        "uri": READINGS_URI,
+        "name": "readings",
+        "description": (
+            "The latest polled reading of every instrument, the numbers the "
+            "operator's instrument cards show, keyed by instrument and "
+            "reading name."
         ),
         "mimeType": "application/json",
     },

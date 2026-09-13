@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 from i2as.core.events import ProcedureFormBlock, ProcedureInfo
 from i2as.core.exceptions import I2ASConfigError
-from i2as.core.plan import ConditionalGroup, ParamSpec, validate_form
+from i2as.core.plan import ConditionalGroup, ParamSpec, validate_form, param_spec_to_json
 from i2as.core.procedure import BaseProcedure
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, never imported at runtime
@@ -206,7 +206,15 @@ def _procedure_info(
         roles={name: role.description for name, role in cls.role_parameters.items()},
         data_keys={
             "sweep": list(cls.sweep_data_keys),
-            "measurement": list(cls.measurement_data_keys),
+            # cls.measurement_data_keys is a static class attribute that a
+            # SweepMeasureProcedure subclass never actually populates (it
+            # only ever sets the INSTANCE attribute, in __init__, from the
+            # station's selected measurement VI) — reading it directly here
+            # always returned []. live_plot_measurement_keys() is the same
+            # classmethod the GUI's axis selectors already call for this
+            # exact reason: it resolves the columns without needing an
+            # instance, from the station's default measurement VI.
+            "measurement": cls.live_plot_measurement_keys(station),
             "default_x": cls.default_x_key,
         },
         form=tuple(_form_block(block) for block in blocks),
@@ -235,12 +243,11 @@ def _form_block(block: ConditionalGroup) -> ProcedureFormBlock:
 def _param_json(name: str, spec: ParamSpec) -> dict[str, Any]:
     """Render one procedure parameter for the declaration snapshot.
 
-    The procedure-side counterpart of the ``@control`` parameter rendering in
-    ``core.station``, and deliberately not the same shape: a procedure
-    parameter is always declared (there is no signature to fall back on, so
-    no ``declared`` flag), and it carries two fields a control parameter has
-    no use for — ``structural``, which says whether changing it changes which
-    blocks apply, and ``widget_hint``.
+    Delegates to ``core.plan.param_spec_to_json()``, the one rendering of a
+    ``ParamSpec`` every surface shares (the Station renders a control
+    parameter with it too), so the form an agent reads and the form the GUI
+    renders are rebuilt from the same fields — ``structural``,
+    ``widget_hint`` and, for a table, ``columns`` included.
 
     Args:
         name: The parameter's name.
@@ -249,15 +256,4 @@ def _param_json(name: str, spec: ParamSpec) -> dict[str, Any]:
     Returns:
         A JSON-safe dict of the declaration.
     """
-    return {
-        "name": name,
-        "kind": spec.type.__name__,
-        "unit": spec.unit,
-        "description": spec.description,
-        "default": spec.default,
-        "min": spec.min,
-        "max": spec.max,
-        "choices": dict(spec.choices) if spec.choices else None,
-        "structural": spec.structural,
-        "widget_hint": spec.widget_hint or "",
-    }
+    return param_spec_to_json(name, spec)

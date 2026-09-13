@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -79,6 +80,23 @@ TOKEN = "test-token-not-a-secret"
 SAMPLE_INFO = {"sample_name": "S", "sample_id": "S-1", "comments": ""}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Build a minimal, isolated environment for the adapter subprocess.
+
+    ``PATH`` is scoped down so the child cannot casually shell out — but on
+    Windows, ``asyncio`` imports ``_overlapped`` at startup, which calls
+    ``WSAStartup`` and fails with ``WinError 10106`` unless ``SystemRoot`` is
+    present for it to find its service provider. POSIX has no such
+    requirement, so the restrictive ``PATH`` alone is enough there.
+    """
+    env = {"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"}
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        env["SystemRoot"] = system_root
+        env["PATH"] = rf"{system_root}\system32;{system_root}"
+    return env
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -513,7 +531,7 @@ class AdapterProcess:
                 "WARNING",
             ],
             cwd=str(REPO_ROOT),
-            env={"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"},
+            env=_subprocess_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -778,7 +796,7 @@ def test_the_adapter_refuses_to_start_without_a_running_app(tmp_path):
     completed = subprocess.run(  # noqa: S603 — our own interpreter
         [sys.executable, "-m", "i2as.mcp", "--descriptor", str(tmp_path / "gone.json")],
         cwd=str(REPO_ROOT),
-        env={"PYTHONPATH": str(REPO_ROOT), "PATH": "/usr/bin:/bin"},
+        env=_subprocess_env(),
         capture_output=True,
         timeout=60,
     )

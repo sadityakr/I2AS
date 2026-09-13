@@ -19,10 +19,12 @@ from PyQt6.QtWidgets import (
 )
 
 from i2as.core.events import (
+    CommandName,
     ControlInfo,
     GroupInfo,
     InstrumentInfo,
     LifecycleState,
+    Verdict,
 )
 from i2as.core.orchestrator_proxy import OrchestratorProxy
 from i2as.core.plan import ParamSpec
@@ -31,6 +33,7 @@ from i2as.gui.param_form import (
     build_param_tooltip,
     build_param_widget,
     collect_value,
+    set_widget_value,
 )
 from i2as.core.status_mirror import StatusMirror
 from i2as.gui.theme import BTN_CLASS_DANGER, BTN_CLASS_SECONDARY, TEXT_PRIMARY
@@ -594,6 +597,80 @@ class InstrumentPanel(QGroupBox):
         partially destroyed child tree.
         """
         self._sync_lifecycle()
+
+    def on_verdict(self, verdict: object) -> None:
+        """Reflect an ACCEPTED action on this instrument into its input fields.
+
+        The **reflection standard** for a card: the engine's one answer to
+        a ``submit_vi_action`` echoes the command's arguments, so a setpoint
+        an agent (or the CLI, or a spooled request) asked for and the engine
+        carried out is written into the same field the operator would have
+        typed it into — the card then reads as if the human had set it. Only
+        an ``OK`` verdict is reflected: a refused or failed request changed
+        nothing on the hardware and must not look on the card as if it had
+        (the **Agent panel** shows the refusal, with its arguments). The
+        operator's own accepted action is reflected too, which is a no-op on
+        a field that already holds the value — the point is that the card
+        does not know or care who asked.
+
+        Called by the window that owns this card for every verdict on the
+        stream (the destruction-order rule: the window is the receiver).
+
+        Args:
+            verdict: Anything off the verdict stream; anything that is not
+                an accepted ``submit_vi_action`` on this VI is ignored.
+        """
+        if not isinstance(verdict, Verdict) or not verdict.ok:
+            return
+        if verdict.command is not CommandName.SUBMIT_VI_ACTION:
+            return
+        args = dict(verdict.args)
+        if args.pop("vi_name", None) != self._vi_name:
+            return
+        method_name = str(args.pop("method_name", "") or "")
+        self.reflect_action(method_name, args)
+        front = self._front_panel
+        if front is not None:
+            embedded = getattr(front, "panel", None)
+            if embedded is not None and embedded is not self:
+                embedded.reflect_action(method_name, args)
+
+    def reflect_action(self, method_name: str, params: dict[str, Any]) -> None:
+        """Write one control's accepted parameter values into its fields.
+
+        Inverse of ``_submit_control()``'s collection, keyed by the same
+        declaration the widgets were built from. A parameter the command did
+        not carry keeps its field (the method used its own default); a
+        parameter with no field on this card (a control the ``panels:``
+        allowlist hides) is ignored — the front panel shows every control
+        and reflects it there.
+
+        Args:
+            method_name: The ``@control`` the values belong to.
+            params: ``{param_name: value}`` as the command carried them.
+        """
+        inputs = self._control_inputs.get(method_name)
+        if not inputs:
+            return
+        declarations = self._control_params.get(method_name, {})
+        for param_name, value in params.items():
+            field = inputs.get(param_name)
+            if field is None:
+                continue
+            spec = _spec_from_json(declarations.get(param_name, {}))
+            field.blockSignals(True)
+            try:
+                if spec is not None:
+                    set_widget_value(field, spec, value)
+                elif isinstance(field, QLineEdit):
+                    field.setText("" if value is None else str(value))
+            finally:
+                field.blockSignals(False)
+
+    @property
+    def panel(self) -> InstrumentPanel:
+        """This card itself — the embedded card of a front panel answers here."""
+        return self
 
     def _sync_lifecycle(self) -> None:
         """Render the Initiate/Standby toggle from the mirror's lifecycle state.

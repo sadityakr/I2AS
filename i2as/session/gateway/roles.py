@@ -193,6 +193,7 @@ def _refusal(
         command=command.name,
         code=VerdictCode.BLOCKED_ROLE,
         actor=actor,
+        args=dict(command.args),
         reason=reason,
         detail=dict(detail),
         seq=seq,

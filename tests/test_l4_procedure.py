@@ -155,10 +155,10 @@ def test_base_procedure_sweep_axis_merges_hidden_params():
     assert "voltage_mode" in AxisProc.parameters
     assert "voltage_start" in AxisProc.parameters
     assert "voltage_csv_path" in AxisProc.parameters
-    # voltage_segments is not a merged param: a list of segment dicts can't be a
-    # scalar ParamSpec, so the SweepAxisWidget owns it directly (see
-    # sweep_axis_param_specs). Everything merged is a typed ParamSpec.
-    assert "voltage_segments" not in AxisProc.parameters
+    # voltage_segments is a merged param too: a table (ParamSpec type=list)
+    # of {start, end, step} rows, so every axis value is declared as data.
+    assert AxisProc.parameters["voltage_segments"].type is list
+    assert set(AxisProc.parameters["voltage_segments"].columns) == {"start", "end", "step"}
     assert all(isinstance(spec, ParamSpec) for spec in AxisProc.parameters.values())
 
 

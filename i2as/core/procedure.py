@@ -28,7 +28,12 @@ from i2as.core.plan import (
     resolve_form,
 )
 from i2as.core.station import Station
-from i2as.core.sweep_builder import SweepAxis, build_axis_sweep, sweep_axis_param_specs
+from i2as.core.sweep_builder import (
+    SweepAxis,
+    build_axis_sweep,
+    sweep_axis_form_blocks,
+    sweep_axis_param_specs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +95,6 @@ class RoleParam:
 #: GUI drops it from ``get_param_groups()`` because it renders those parameters
 #: through ``SweepAxisWidget``; every other client keeps it, because the sweep
 #: range is exactly what a caller must supply to run the procedure.
-SWEEP_AXIS_GROUP_KEY = "sweep_axis"
 
 
 class BaseProcedure:
@@ -110,8 +114,11 @@ class BaseProcedure:
             hidden parameters (``{key}_mode``, ``{key}_start``, etc. — see
             ``sweep_builder.sweep_axis_param_specs()``) are merged into
             ``parameters`` automatically, ``_build_sweep_array()`` needs no
-            override, and the GUI renders a mode-selector widget (linear /
-            segments / CSV, with hysteresis) instead of flat text fields.
+            override, and the form declares the axis as guarded blocks of
+            the Sweep group (``sweep_builder.sweep_axis_form_blocks()``): a
+            mode selector, then the linear / segments (a table) / CSV block
+            the mode picks, then hysteresis — rendered by every client from
+            the declaration alone.
             Most sweep procedures should use this instead of hand-writing
             ``sweep_parameters`` + ``_build_sweep_array()``.
         sweep_parameters: Parameters that define *what* to sweep over, for
@@ -242,10 +249,12 @@ class BaseProcedure:
         rather than leaving it to surface under the one selection that
         triggers it.
 
-        The default implementation declares the static Instruments / Sweep /
+        The default implementation declares the static Sweep / Instruments /
         System / Measurement groups unconditionally, skipping any that hold no
-        parameters, preceded by the ``sweep_axis`` group when the class
-        declares an axis.
+        parameters. A class that declares a ``sweep_axis`` opens the Sweep
+        group with the axis's guarded blocks (see
+        ``sweep_builder.sweep_axis_form_blocks()``), so its own
+        ``sweep_parameters`` follow the axis in the same column.
 
         Args:
             station: The active Station — the source of every station-dependent
@@ -257,25 +266,21 @@ class BaseProcedure:
             The form declaration, in render order.
         """
         blocks: list[ConditionalGroup] = []
-        if cls.sweep_axis:
-            blocks.append(
-                ConditionalGroup(
-                    key=SWEEP_AXIS_GROUP_KEY,
-                    title=cls.sweep_axis.description or "Sweep axis",
-                    params=sweep_axis_param_specs(cls.sweep_axis),
-                )
-            )
+        # Sweep first: what is swept, then with which instruments, then the
+        # system state and the measurement — the order the GUI has always
+        # drawn its columns in, now the declaration's own order so every
+        # surface reads the form the same way.
         candidates = (
-            ("instruments", "Instruments", cls._role_param_specs(station)),
             ("sweep", "Sweep", cls.sweep_parameters),
+            ("instruments", "Instruments", cls._role_param_specs(station)),
             ("system", "System", cls.system_parameters),
             ("measurement", "Measurement", cls.measurement_parameters),
         )
-        blocks.extend(
-            ConditionalGroup(key=key, title=title, params=dict(params))
-            for key, title, params in candidates
-            if params
-        )
+        for key, title, params in candidates:
+            if key == "sweep" and cls.sweep_axis:
+                blocks.extend(sweep_axis_form_blocks(cls.sweep_axis, key=key, title=title))
+            if params:
+                blocks.append(ConditionalGroup(key=key, title=title, params=dict(params)))
         return tuple(blocks)
 
     @classmethod
@@ -284,16 +289,12 @@ class BaseProcedure:
     ) -> list[ParamGroup]:
         """Return the parameter groups the GUI renders for these selections.
 
-        The GUI's view of :meth:`declaration_form`, and now derived from it
-        rather than a second description of the same form: this resolves the
-        declaration against *selections* and drops the ``sweep_axis`` group,
-        whose parameters the GUI renders through the separate
-        ``SweepAxisWidget`` (linear / segments / CSV) instead of as plain
-        fields. That exclusion is the ONE difference between what the GUI
-        renders and what the declaration holds, which is why it lives here as
-        a single filter rather than as a form the sweep parameters are missing
-        from — an agent reading the declaration needs the sweep range, and
-        omitting it was how ``field_start`` came to be undiscoverable.
+        The GUI's view of :meth:`declaration_form`, derived from it rather
+        than a second description of the same form: the declaration resolved
+        against *selections*, nothing added and nothing dropped. The sweep
+        axis is part of it like any other parameter (its blocks are guarded
+        on ``{key}_mode``), so what the GUI renders IS what the declaration
+        holds and what an agent reads through ``describe_procedure``.
 
         Args:
             station: The active Station.
@@ -305,11 +306,7 @@ class BaseProcedure:
         Returns:
             The active parameter groups, in declared order.
         """
-        return [
-            group
-            for group in resolve_form(cls.declaration_form(station), selections)
-            if group.key != SWEEP_AXIS_GROUP_KEY
-        ]
+        return resolve_form(cls.declaration_form(station), selections)
 
     @classmethod
     def _role_param_specs(cls, station: Station) -> dict[str, ParamSpec]:

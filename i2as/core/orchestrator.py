@@ -18,7 +18,7 @@ import functools
 import inspect
 import json
 import logging
-from dataclasses import replace
+from dataclasses import field, replace
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -98,6 +98,11 @@ class _PendingCommand:
             command rather than on the engine because the verdict that
             carries it is emitted AFTER the method has returned, by which
             time the acting context that decided it is gone.
+        args: The command's arguments, as submitted, so the verdict can
+            echo them (``Verdict.args`` — the **reflection standard**).
+            Held here for the same reason ``takeover`` is: a deferred
+            verdict is emitted by a later tick, when the command itself is
+            long gone.
     """
 
     request_id: str
@@ -106,6 +111,7 @@ class _PendingCommand:
     resolved: bool = False
     deferred: bool = False
     takeover: dict[str, Any] | None = None
+    args: dict[str, Any] = field(default_factory=dict)
 
 
 #: The run-scoped commands an agent may take only on a run it OWNS — the
@@ -800,7 +806,10 @@ class Orchestrator(QObject):
             verdict and every event this command causes carry back.
         """
         pending = _PendingCommand(
-            request_id=command.request_id, command=command.name, actor=command.actor
+            request_id=command.request_id,
+            command=command.name,
+            actor=command.actor,
+            args=dict(command.args),
         )
         previous, self._pending = self._pending, pending
         try:
@@ -2638,11 +2647,20 @@ class Orchestrator(QObject):
                 params = get_params()
             except Exception:  # noqa: BLE001 — manifest must never abort a run
                 logger.exception("run manifest: get_params() failed")
+        # ``procedure_class`` and ``owner`` are what the **reflection
+        # standard** needs from this manifest (see ``events.RunStarted``):
+        # the catalog key a client selects the form by — the display name
+        # is not unique by contract — and whose run it is, which the
+        # snapshot also carries but a client holding only this event should
+        # not have to wait a tick for.
+        owner = self._run_owner
         self._active_run_manifest = {
             "run_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{self._run_counter:03d}_{slug}",
             "procedure": name,
+            "procedure_class": type(procedure).__name__,
             "kind": getattr(procedure, "run_kind", "run"),
             "params": params,
+            "owner": owner.ref() if isinstance(owner, ev.Actor) else None,
             "data_file": str(getattr(procedure, "data_filepath", None) or ""),
             "started_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -2891,6 +2909,7 @@ class Orchestrator(QObject):
                 command=pending.command,
                 code=code,
                 actor=pending.actor,
+                args=pending.args,
                 reason=reason,
                 detail=detail,
                 result=_json_safe(result) if result is not None else None,
@@ -2903,6 +2922,7 @@ class Orchestrator(QObject):
                 command=pending.command,
                 code=ev.VerdictCode.FAILED,
                 actor=pending.actor,
+                args=pending.args,
                 reason=reason or "the verdict payload could not be built",
                 seq=self._next_seq(),
             )

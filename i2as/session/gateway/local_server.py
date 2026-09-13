@@ -275,6 +275,24 @@ class GatewayServer(QLocalServer):
         """The descriptor file this server writes while it is listening."""
         return self._descriptor
 
+    def connections(self) -> list[dict[str, str]]:
+        """Return one ``{"actor_id", "role"}`` per connection past its ``hello``.
+
+        Read-only: a connection accepted but not yet past ``hello`` (no
+        ``Gateway`` built yet) has no identity to report and is omitted
+        rather than shown half-formed. This is what a "Connections" GUI
+        panel lists — the server keeps no other roster.
+
+        Returns:
+            One entry per live, identified connection, in no particular
+            order.
+        """
+        return [
+            {"actor_id": connection.gateway.actor.id, "role": connection.gateway.role.value}
+            for connection in self._connections.values()
+            if connection.gateway is not None
+        ]
+
     def start(self) -> bool:
         """Listen, and publish the descriptor a client finds the app by.
 

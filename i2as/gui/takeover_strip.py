@@ -18,11 +18,15 @@ have to go and find:
   recently, rendered from the **Agent panel**'s own ledger — the panel already
   sees every agent action, so counting them twice would be counting them
   differently.
-* **"run owned by N"**, the **Run owner** of the run in flight, reflected
-  from the same mirror: whose run it is decides who may end it (GLOSSARY.md's
-  *Run owner*), so the fact belongs beside the controls that decide how far
-  agents may go at all. A read, never a control — ownership is a fact about
-  the run, and there is nothing here to set.
+* **"run owned by N · &lt;procedure&gt;"**, the **Run owner** of the run in
+  flight and what it is running, reflected from the same mirror: whose run
+  it is decides who may end it (GLOSSARY.md's *Run owner*), so the fact
+  belongs beside the controls that decide how far agents may go at all; and
+  WHAT is running — the procedure and, in the tooltip, every parameter it
+  was started with (the **reflection standard**, ``StatusMirror.run_manifest()``)
+  — is the always-on answer to "what did the agent just set?", in the window
+  the human is already watching, without opening the procedure window. A
+  read, never a control — a run is a fact, and there is nothing here to set.
 
 Nothing here is ever disabled by the gate. A kill switch that could lock the
 human out of their own instrument would be a hazard rather than a safeguard,
@@ -78,6 +82,12 @@ GATE_CHOICES: tuple[tuple[AgentGate, str, str], ...] = (
 #: there is none: an empty label rather than "no run", because the state bar
 #: beside it already says the station is idle.
 RUN_OWNER_TEXT = "run owned by {owner}"
+#: The same line once the mirror also holds the run's manifest: what the
+#: owner is running. The parameters go in the tooltip (``RUN_PARAMS_TOOLTIP``),
+#: one per line, because the header has room for a name and not for twenty
+#: values — and the tooltip is where a reader looks for the rest of a line.
+RUN_TEXT = "run owned by {owner} · {procedure}"
+RUN_PARAMS_TOOLTIP = "{procedure} — started by {owner}\n{params}"
 
 #: Why the run owner is worth a line in the header at all. Also the whole of
 #: what the line says when the header is too narrow to show its text.
@@ -211,10 +221,26 @@ class TakeoverStrip(QWidget):
         owner = self._mirror.run_owner()
         actor_id = str(owner.get("id") or "") if owner else ""
         text = RUN_OWNER_TEXT.format(owner=actor_id) if actor_id else ""
+        tooltip = f"{text}. {OWNER_TOOLTIP}" if text else OWNER_TOOLTIP
+        manifest = self._mirror.run_manifest()
+        if actor_id and manifest:
+            procedure = str(
+                manifest.get("procedure") or manifest.get("procedure_class") or ""
+            )
+            if procedure:
+                text = RUN_TEXT.format(owner=actor_id, procedure=procedure)
+                params = manifest.get("params") or {}
+                listing = "\n".join(
+                    f"  {key} = {value}" for key, value in params.items()
+                ) or "  (no parameters)"
+                tooltip = (
+                    RUN_PARAMS_TOOLTIP.format(
+                        procedure=procedure, owner=actor_id, params=listing
+                    )
+                    + f"\n\n{OWNER_TOOLTIP}"
+                )
         self._run_owner_label.setText(text)
-        self._run_owner_label.setToolTip(
-            f"{text}. {OWNER_TOOLTIP}" if text else OWNER_TOOLTIP
-        )
+        self._run_owner_label.setToolTip(tooltip)
 
     def set_agents_active(self, count: int) -> None:
         """Show how many agents are currently acting.

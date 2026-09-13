@@ -557,6 +557,19 @@ def _declared_param_findings(
         if name not in params:
             continue
         value = params[name]
+        if getattr(spec, "type", None) is list:
+            accepts = getattr(spec, "accepts", None)
+            if callable(accepts) and not accepts(value):
+                columns = ", ".join(getattr(spec, "columns", None) or ())
+                findings.append(
+                    RunFinding(
+                        FINDING_PARAM_BOUNDS,
+                        f"{name} must be a list of rows with the columns "
+                        f"[{columns}], got {value!r}",
+                        name,
+                    )
+                )
+            continue
         choices = getattr(spec, "choices", None)
         if choices:
             if value not in choices.values():

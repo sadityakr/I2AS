@@ -29,6 +29,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+
 __all__ = [
     "DESCRIPTOR_FILENAME",
     "DEFAULT_TIMEOUT_S",
@@ -234,9 +238,12 @@ class _PipeTransport:
 
     A local socket is a named pipe there, not a file in the filesystem, so
     it is opened rather than connected to and cannot be polled by a
-    selector. The consequence is one the adapter handles rather than hides:
-    ``fileno()`` returns ``None``, so notifications are delivered on the
-    next request instead of the moment they arrive.
+    selector. ``fileno()`` returns ``None`` for that reason — but a
+    non-blocking read is still possible: ``PeekNamedPipe`` reports how many
+    bytes are waiting without consuming them, so ``recv(blocking=False)``
+    can check that and only then read, rather than reading nothing at all.
+    That is what keeps a push notification from waiting behind the next
+    request that happens to be sent.
     """
 
     def __init__(self, name: str, timeout: float) -> None:
@@ -277,24 +284,40 @@ class _PipeTransport:
             raise GatewayError(f"gateway write failed: {error}") from error
 
     def recv(self, *, blocking: bool) -> bytes:
-        """Read one chunk, blocking.
+        """Read one chunk.
 
         Args:
-            blocking: A non-blocking read is not available on a pipe, so a
-                ``False`` here reads nothing rather than blocking anyway.
+            blocking: When ``False``, ``PeekNamedPipe`` is consulted first
+                so nothing is read (and nothing blocks) when the pipe is
+                empty; when ``True``, this reads one byte and waits for it.
 
         Returns:
-            The bytes read, or ``b""``.
+            The bytes read, or ``b""`` when nothing was waiting and
+            *blocking* is ``False``.
 
         Raises:
             GatewayError: If the read fails.
         """
-        if not blocking:
+        if not blocking and self._peek_available() <= 0:
             return b""
         try:
             return self._handle.read(1)
         except OSError as error:
             raise GatewayError(f"gateway read failed: {error}") from error
+
+    def _peek_available(self) -> int:
+        """Return how many bytes are waiting on the pipe, without reading them.
+
+        Returns:
+            The byte count ``PeekNamedPipe`` reports; ``0`` if the call
+            itself fails, which a following blocking read would surface.
+        """
+        handle = msvcrt.get_osfhandle(self._handle.fileno())
+        bytes_available = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.PeekNamedPipe(
+            ctypes.c_void_p(handle), None, 0, None, ctypes.byref(bytes_available), None
+        )
+        return bytes_available.value if ok else 0
 
     def close(self) -> None:
         """Close the pipe, ignoring one that is already gone."""
