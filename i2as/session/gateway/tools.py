@@ -122,7 +122,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from i2as.analysis.report import REPORT_FILENAME, AnalysisReport
+from i2as.analysis.report import (
+    MAX_REPORT_BYTES,
+    REPORT_FILENAME,
+    AnalysisReport,
+    output_file,
+)
 from i2as.core import data_reader
 from i2as.core.capability_manifest import build_manifest, validate_manifest
 from i2as.core.events import CommandName, StationInfo
@@ -141,6 +146,7 @@ from i2as.session.gateway.action_classes import (
     ActionClass,
     classify_control,
 )
+from i2as.session.store import is_plain_name
 
 logger = logging.getLogger(__name__)
 
@@ -1839,6 +1845,12 @@ class ToolContext:
             ToolError: If none was given and no experiment is open.
         """
         if requested:
+            if not is_plain_name(requested):
+                raise ToolError(
+                    f"{requested!r} is not an experiment id; list_runs and "
+                    f"read_experiment name the experiments there are",
+                    {"rule": "unknown_experiment", "experiment_id": requested},
+                )
             return requested
         record = self.require_experiments(tool_name).current_experiment()
         identity = getattr(record, "experiment_id", "") if record is not None else ""
@@ -3144,6 +3156,7 @@ def _tool_read_analysis_report(args: Mapping[str, Any], context: ToolContext) ->
     if not path.is_file():
         return {"status": "none", "run_id": run.run_id}
     try:
+        _check_report_size(path)
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise ToolError(
@@ -3250,6 +3263,20 @@ def _tool_run_analysis_script(args: Mapping[str, Any], context: ToolContext) -> 
     }
 
 
+def _check_report_size(path: Path) -> None:
+    """Refuse a report file larger than the report standard ever writes.
+
+    Args:
+        path: The report file.
+
+    Raises:
+        ValueError: If it is larger than ``MAX_REPORT_BYTES``.
+    """
+    size = path.stat().st_size
+    if size > MAX_REPORT_BYTES:
+        raise ValueError(f"{size} bytes, over the {MAX_REPORT_BYTES}-byte report limit")
+
+
 def _read_script_report(path: Path, run_id: str, script_id: str) -> AnalysisReport | None:
     """Read one script's report file, or ``None`` when there is none yet.
 
@@ -3267,6 +3294,7 @@ def _read_script_report(path: Path, run_id: str, script_id: str) -> AnalysisRepo
     if not path.is_file():
         return None
     try:
+        _check_report_size(path)
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise ToolError(
@@ -3315,7 +3343,13 @@ def _tool_read_analysis_script_result(args: Mapping[str, Any], context: ToolCont
             "script_dir": str(folder),
             "stdout": stdout[-MAX_SCRIPT_OUTPUT_CHARS:],
             "stdout_truncated": len(stdout) > MAX_SCRIPT_OUTPUT_CHARS,
-            "figure_paths": [str(folder / figure.file) for figure in report.figures if figure.file],
+            # Only files that pass the report standard's own check: a figure
+            # name comes from untrusted analysis code, never a path to follow.
+            "figure_paths": [
+                str(path)
+                for path in (output_file(folder, figure.file) for figure in report.figures)
+                if path is not None
+            ],
         }
     )
     return answer

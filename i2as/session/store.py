@@ -33,6 +33,30 @@ _DATA_DIRNAME = "data"
 _ANALYSIS_DIRNAME = "analysis"
 
 
+def is_plain_name(name: object) -> bool:
+    """Whether a store key names exactly one folder directly under its root.
+
+    Every experiment id (and session and run id) reaches the filesystem as a
+    path segment, and some of them arrive from outside the application — an
+    agent's tool call, a spool file. A key that could climb out of its root
+    (``..``, a separator, a drive letter, an absolute path) or hide itself
+    (a leading dot) is refused, so no caller can make the store read or
+    write anywhere but the folder it names.
+
+    Args:
+        name: The candidate key.
+
+    Returns:
+        ``True`` for a non-empty single path segment that does not start with
+        a dot and holds no separator, drive colon or control character.
+    """
+    if not isinstance(name, str) or not name or name.startswith("."):
+        return False
+    if any(ch in name for ch in ("/", "\\", ":")) or any(ord(ch) < 32 for ch in name):
+        return False
+    return Path(name).name == name
+
+
 def _utc_now_iso() -> str:
     """Return the current UTC time as an ISO 8601 string.
 
@@ -113,6 +137,26 @@ class ExperimentStore:
         """The store's root directory."""
         return self._root
 
+    def experiment_dir(self, experiment_id: str) -> Path:
+        """Return one experiment's folder, refusing a key that is not a plain name.
+
+        Every per-experiment path goes through here, so an experiment id that
+        arrived from an agent can never name a folder outside this store.
+
+        Args:
+            experiment_id: The store key.
+
+        Returns:
+            ``<root>/<experiment_id>`` (may not exist yet).
+
+        Raises:
+            ValueError: If *experiment_id* is not a plain folder name
+                (``is_plain_name``).
+        """
+        if not is_plain_name(experiment_id):
+            raise ValueError(f"{experiment_id!r} is not an experiment id of this store")
+        return self._root / experiment_id
+
     def make_experiment_id(self, title: str, created_utc: str) -> str:
         """Derive a unique experiment id from the title and creation date.
 
@@ -161,7 +205,10 @@ class ExperimentStore:
             future-format record check ``record.schema_version`` themselves
             (see ``ExperimentManager.switch_experiment``/``_save_current``).
         """
-        data = _read_json(self._root / experiment_id / _EXPERIMENT_FILENAME)
+        if not is_plain_name(experiment_id):
+            logger.warning("Refusing to load experiment %r: not a plain id", experiment_id)
+            return None
+        data = _read_json(self.experiment_dir(experiment_id) / _EXPERIMENT_FILENAME)
         if data is None:
             return None
         record = ExperimentRecord.from_dict(data)
@@ -185,7 +232,7 @@ class ExperimentStore:
             The path, which may not exist yet — nothing here creates it; the
             data manager ``mkdir -p``s it lazily when a run actually saves.
         """
-        return self._root / experiment_id / _DATA_DIRNAME
+        return self.experiment_dir(experiment_id) / _DATA_DIRNAME
 
     def gui_state_path(self, experiment_id: str) -> Path:
         """Return the experiment's GUI-state file path.
@@ -196,7 +243,7 @@ class ExperimentStore:
         Returns:
             ``<root>/<experiment_id>/gui_state.json`` (may not exist yet).
         """
-        return self._root / experiment_id / _GUI_STATE_FILENAME
+        return self.experiment_dir(experiment_id) / _GUI_STATE_FILENAME
 
     def outbox_path(self, experiment_id: str) -> Path:
         """Return the experiment's ELN publish-journal file path.
@@ -212,7 +259,7 @@ class ExperimentStore:
             ``<root>/<experiment_id>/outbox.jsonl`` (may not exist yet —
             nothing is written until a run is actually queued).
         """
-        return self._root / experiment_id / _OUTBOX_FILENAME
+        return self.experiment_dir(experiment_id) / _OUTBOX_FILENAME
 
     def agent_feed_path(self, experiment_id: str) -> Path:
         """Return the experiment's **Agent feed** file path.
@@ -229,7 +276,7 @@ class ExperimentStore:
             ``<root>/<experiment_id>/agent_actions.jsonl`` (may not exist yet
             — nothing is written until a non-operator actor acts).
         """
-        return self._root / experiment_id / _AGENT_FEED_FILENAME
+        return self.experiment_dir(experiment_id) / _AGENT_FEED_FILENAME
 
     def analysis_dir(self, experiment_id: str) -> Path:
         """Return the experiment's analysis folder.
@@ -247,7 +294,7 @@ class ExperimentStore:
             ``<root>/<experiment_id>/analysis`` (may not exist yet — nothing
             here creates it; the analysis runner does, when it writes a spec).
         """
-        return self._root / experiment_id / _ANALYSIS_DIRNAME
+        return self.experiment_dir(experiment_id) / _ANALYSIS_DIRNAME
 
     def recipes_dir(self, experiment_id: str) -> Path:
         """Return the experiment's own **Analysis recipe** folder.
@@ -318,7 +365,7 @@ class ExperimentStore:
             ``<root>/<experiment_id>``, else the absolute path string
             unchanged.
         """
-        session_folder = (self._root / experiment_id).resolve()
+        session_folder = self.experiment_dir(experiment_id).resolve()
         resolved = Path(path).resolve()
         if resolved.is_relative_to(session_folder):
             return resolved.relative_to(session_folder).as_posix()
@@ -343,8 +390,9 @@ class ExperimentStore:
             The best-effort real path to the data file.
         """
         candidate = Path(stored)
+        folder = self.experiment_dir(experiment_id)
         if not candidate.is_absolute():
-            return self._root / experiment_id / candidate
+            return folder / candidate
         if candidate.exists():
             return candidate
         match = next(self.data_dir(experiment_id).rglob(candidate.name), None)
@@ -362,7 +410,7 @@ class ExperimentStore:
         """
         if not record.experiment_id:
             raise ValueError("ExperimentRecord.experiment_id must be set before save()")
-        path = self._root / record.experiment_id / _EXPERIMENT_FILENAME
+        path = self.experiment_dir(record.experiment_id) / _EXPERIMENT_FILENAME
         _write_json_atomic(path, record.to_dict())
 
     def get_active(self) -> str | None:

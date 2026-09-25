@@ -205,6 +205,40 @@ def _resolve_active_session(store: SessionStore) -> tuple[str, str]:
     return user_id, session.session_id
 
 
+def gateway_tool_context(
+    session_manager: Any,
+    run_catalog: Mapping[str, type],
+    publisher: Any | None,
+    analysis_runner: Any | None,
+) -> ToolContext:
+    """Build the ``ToolContext`` every gateway connection answers session tools from.
+
+    One construction, so the socket server, the HTTP endpoint and the
+    embedded analyst all hand an agent the same collaborators: the
+    experiment layer, the run catalog, the ELN publisher
+    (``stage_analysis_result``, ``publish_eln_entry``, the per-procedure
+    recipe preference) and the analysis runner (``run_analysis``,
+    ``run_analysis_script``). A collaborator left out here is a tool every
+    agent is refused, which is why this is a function a test can call.
+
+    Args:
+        session_manager: The session layer's experiment façade.
+        run_catalog: The procedures a run may name.
+        publisher: The ``ElnPublisher``, or ``None`` when there is none.
+        analysis_runner: The ``AnalysisRunner``, or ``None`` when the build
+            has no analysis stage.
+
+    Returns:
+        The context.
+    """
+    return ToolContext(
+        experiments=session_manager,
+        run_catalog=run_catalog,
+        publisher=publisher,
+        analysis_runner=analysis_runner,
+    )
+
+
 class ExperimentFeeds:
     """The **Agent feed** of whichever experiment is open, one per experiment.
 
@@ -607,39 +641,6 @@ def main(
         if role_within_ceiling(candidate_role, gateway_ceiling):
             gateway_role = candidate_role
 
-    # One attached feed per experiment, shared by every connection (see
-    # ExperimentFeeds). Owned by the app so its lifetime is explicit.
-    app.experiment_feeds = ExperimentFeeds(session_manager, orchestrator)
-    app.gateway_controller = GatewayController(
-        orchestrator,
-        station_info=station.station_info,
-        tool_context=ToolContext(experiments=session_manager, run_catalog=run_catalog),
-        feed=app.experiment_feeds.current,
-        ceiling=gateway_ceiling,
-        key_store=app_settings.access_keys_path(),
-    )
-    if gateway_enabled:
-        app.gateway_controller.start(gateway_role)
-        # Remote access — the HTTP MCP endpoint — is a client of the socket
-        # server just started, and is only ever on because the Connections
-        # dialog switched it on; a port already taken is logged, not fatal,
-        # because the station must come up whether or not a web client can
-        # reach it.
-        if app_settings.remote_access_enabled():
-            try:
-                app.gateway_controller.start_http(
-                    host=app_settings.remote_access_host(),
-                    port=app_settings.remote_access_port(),
-                    public_url=app_settings.remote_access_public_url(),
-                )
-            except (OSError, RuntimeError):
-                logger.exception("the HTTP MCP endpoint could not start")
-    # Stopping on quit is what keeps the descriptor honest: a gateway.json
-    # left behind names a socket that is gone and a token that means
-    # nothing, and an adapter reading it reports "cannot connect" instead
-    # of "the app is not running". stop() is a no-op while already off, so
-    # this is connected unconditionally rather than only when started.
-    app.aboutToQuit.connect(app.gateway_controller.stop)
 
     # Read once and shared with the publisher below: the drafting model,
     # key, token cap and price table live in the same user-level settings
@@ -682,6 +683,46 @@ def main(
         requested = getattr(app.eln_publisher, "analysis_requested", None)
         if requested is not None:
             requested.connect(app.analysis_runner.start)
+
+    # The gateway is built AFTER the publisher and the analysis runner, so
+    # every agent connection is handed the same collaborators the GUI
+    # uses: an MCP client and the embedded analyst see one tool surface
+    # that can actually analyse, stage and publish.
+    # One attached feed per experiment, shared by every connection (see
+    # ExperimentFeeds). Owned by the app so its lifetime is explicit.
+    app.experiment_feeds = ExperimentFeeds(session_manager, orchestrator)
+    app.gateway_controller = GatewayController(
+        orchestrator,
+        station_info=station.station_info,
+        tool_context=gateway_tool_context(
+            session_manager, run_catalog, app.eln_publisher, app.analysis_runner
+        ),
+        feed=app.experiment_feeds.current,
+        ceiling=gateway_ceiling,
+        key_store=app_settings.access_keys_path(),
+    )
+    if gateway_enabled:
+        app.gateway_controller.start(gateway_role)
+        # Remote access — the HTTP MCP endpoint — is a client of the socket
+        # server just started, and is only ever on because the Connections
+        # dialog switched it on; a port already taken is logged, not fatal,
+        # because the station must come up whether or not a web client can
+        # reach it.
+        if app_settings.remote_access_enabled():
+            try:
+                app.gateway_controller.start_http(
+                    host=app_settings.remote_access_host(),
+                    port=app_settings.remote_access_port(),
+                    public_url=app_settings.remote_access_public_url(),
+                )
+            except (OSError, RuntimeError):
+                logger.exception("the HTTP MCP endpoint could not start")
+    # Stopping on quit is what keeps the descriptor honest: a gateway.json
+    # left behind names a socket that is gone and a token that means
+    # nothing, and an adapter reading it reports "cannot connect" instead
+    # of "the app is not running". stop() is a no-op while already off, so
+    # this is connected unconditionally rather than only when started.
+    app.aboutToQuit.connect(app.gateway_controller.stop)
 
     monitor = MonitorWindow(
         station,

@@ -1682,6 +1682,7 @@ def _script_result(folder: Path, **report) -> None:
     ).to_dict()
     (folder / "report.json").write_text(json.dumps(payload), encoding="utf-8")
     (folder / "stdout.txt").write_text("points: 6\n", encoding="utf-8")
+    (folder / "fit.png").write_bytes(b"\x89PNG")
 
 
 def _run_a_script(gateway, **extra):
@@ -1914,3 +1915,42 @@ def test_saving_a_script_keeps_it_as_an_ordinary_recipe(analysis_gateway):
         {"run_id": RUN_ID, "script_id": "nothing_here", "name": "other"},
     )
     assert missing["detail"]["rule"] == "unknown_script"
+
+
+def test_an_experiment_id_that_is_a_path_is_refused(analysis_gateway):
+    """An agent cannot read another folder by naming it as an experiment."""
+    gateway = analysis_gateway.build(Role.OBSERVER)
+
+    for bad in ("../../other_user/session/exp", "/etc", "..", ".hidden", "a/b"):
+        answer = gateway.call_tool("list_runs", {"experiment_id": bad})
+        assert answer["ok"] is False, bad
+        assert answer["detail"]["rule"] == "unknown_experiment", bad
+
+
+def test_a_script_result_lists_only_figures_inside_its_folder(analysis_gateway, tmp_path):
+    """A figure name claiming another file is never handed back as a path."""
+    import json as _json
+
+    from i2as.analysis.report import AnalysisReport, FigureRef
+
+    folder = analysis_gateway.report_dir / "scripts" / "probe_1"
+    folder.mkdir(parents=True)
+    secret = tmp_path / "gateway.json"
+    secret.write_text("{}", encoding="utf-8")
+    (folder / "ok.png").write_bytes(b"\x89PNG")
+    report = AnalysisReport(
+        run_id=RUN_ID,
+        figures=(
+            FigureRef(file="ok.png"),
+            FigureRef(file=str(secret)),
+            FigureRef(file="../../gateway.json"),
+            FigureRef(file="missing.png"),
+        ),
+    )
+    (folder / "report.json").write_text(_json.dumps(report.to_dict()), encoding="utf-8")
+
+    result = analysis_gateway.build().call_tool(
+        "read_analysis_script_result", {"run_id": RUN_ID, "script_id": "probe_1"}
+    )["result"]
+
+    assert result["figure_paths"] == [str((folder / "ok.png").resolve())]

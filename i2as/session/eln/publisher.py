@@ -57,7 +57,7 @@ from typing import Any
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from i2as.analysis.report import AnalysisReport
+from i2as.analysis.report import AnalysisReport, output_file
 from i2as.session.eln.adapter import ElnAdapter
 from i2as.session.eln.drafting import (
     SOURCE_ANALYSIS,
@@ -481,11 +481,7 @@ class ElnPublisher(QObject):
                 findings=experiment.findings,
             ),
             tags=list(rendered.tags),
-            attachments=[
-                {"path": str(directory / figure.file), "comment": figure.caption or figure.file}
-                for figure in rendered.figures
-                if figure.file
-            ],
+            attachments=self._figure_attachments(rendered, directory),
             attach_data_file=rendered.attach_data_file,
             source=SOURCE_ANALYSIS,
             metadata={"recipe": rendered.recipe, "recipe_digest": rendered.recipe_digest},
@@ -498,6 +494,34 @@ class ElnPublisher(QObject):
                 rendered.recipe or "unnamed",
             )
         return parked
+
+    @staticmethod
+    def _figure_attachments(report: AnalysisReport, directory: Path) -> list[dict[str, str]]:
+        """Return the attachments a report's figures become, refusing any unsafe claim.
+
+        A figure name comes from the analysis worker, which runs code this
+        application does not trust; only a plain PNG inside the report's own
+        folder (``report.output_file``) is attached. A refused name is logged
+        and left out — it never becomes a path to another file.
+
+        Args:
+            report: The analysis report.
+            directory: The folder the report was written to.
+
+        Returns:
+            ``[{"path", "comment"}]`` for every figure that passed.
+        """
+        attachments: list[dict[str, str]] = []
+        for figure in report.figures:
+            path = output_file(directory, figure.file)
+            if path is None:
+                if figure.file:
+                    logger.warning(
+                        "Not attaching figure %r: not a PNG inside %s", figure.file, directory
+                    )
+                continue
+            attachments.append({"path": str(path), "comment": figure.caption or figure.file})
+        return attachments
 
     def _entry_facts(
         self, run_id: str

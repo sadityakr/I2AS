@@ -59,6 +59,7 @@ from i2as.analysis.report import (
     SPEC_FILENAME,
     AnalysisReport,
     AnalysisSpec,
+    read_report_file,
 )
 from i2as.session.analysis_sandbox import (
     AnalysisSandbox,
@@ -568,12 +569,10 @@ class AnalysisRunner(QObject):
             (the caller synthesizes a failure from the worker's stderr).
         """
         path = request.output_dir / REPORT_FILENAME
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            logger.warning("No usable analysis report at %s: %s", path, exc)
-            return None
-        return AnalysisReport.from_dict(payload)
+        report = read_report_file(path)
+        if report is None:
+            logger.warning("No usable analysis report at %s", path)
+        return report
 
     def _failed_report(self, request: _Request, error: str) -> AnalysisReport:
         """Build the report an ending that produced none is reported as.

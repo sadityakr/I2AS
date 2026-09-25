@@ -24,7 +24,9 @@ journal and to hand to a model.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 #: Terminal status of a report whose recipe ran to completion.
@@ -42,6 +44,17 @@ REPORT_FILENAME = "report.json"
 
 #: Name of the spec file the runner writes beside the report.
 SPEC_FILENAME = "spec.json"
+
+#: The largest ``report.json`` the application will read back. A report is
+#: capped when it is written (the caps below), so a file past this size was
+#: not written by the report standard and is refused rather than parsed.
+MAX_REPORT_BYTES = 2_000_000
+
+#: The largest figure file the application will show or attach.
+MAX_FIGURE_BYTES = 20_000_000
+
+#: The suffixes a figure file may have.
+FIGURE_SUFFIXES: tuple[str, ...] = (".png",)
 
 #: Name of the folder, inside one run's analysis folder, that holds the
 #: **analysis scripts** run over that run — one sub-folder per script, with
@@ -74,6 +87,69 @@ MAX_TEXT_CHARS = 2000
 
 #: The wildcard a recipe declares in ``procedures`` to serve every procedure.
 ANY_PROCEDURE = "*"
+
+
+def output_file(
+    directory: str | Path,
+    name: str,
+    *,
+    suffixes: tuple[str, ...] = FIGURE_SUFFIXES,
+    max_bytes: int = MAX_FIGURE_BYTES,
+) -> Path | None:
+    """Resolve one file a report names, trusting nothing about the name.
+
+    A report is written by the analysis worker, which runs analysis code the
+    application does not trust, so a ``FigureRef.file`` is only a CLAIM. It is
+    honoured only when it is a plain file name (no directory part, no
+    absolute path) with an allowed suffix, the file exists directly in the
+    report's own directory, and it is no larger than *max_bytes*. Everything
+    that reads a report's files — the publisher attaching them, a tool
+    listing them, the eLab preview showing them — goes through here, so a
+    script cannot name ``gateway.json`` or a settings file as its "figure".
+
+    Args:
+        directory: The report's own directory.
+        name: The file name the report claims.
+        suffixes: The allowed suffixes, lower case.
+        max_bytes: The largest file accepted.
+
+    Returns:
+        The file's path, or ``None`` when the claim is refused.
+    """
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        return None
+    if name.startswith(".") or Path(name).suffix.lower() not in suffixes:
+        return None
+    folder = Path(directory).resolve()
+    path = (folder / name).resolve()
+    if path.parent != folder or not path.is_file():
+        return None
+    try:
+        if path.stat().st_size > max_bytes:
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def read_report_file(path: str | Path) -> AnalysisReport | None:
+    """Read one ``report.json`` within ``MAX_REPORT_BYTES``, tolerantly.
+
+    Args:
+        path: The report file.
+
+    Returns:
+        The report; ``None`` when the file is absent, too large, unreadable
+        or not JSON.
+    """
+    file = Path(path)
+    try:
+        if not file.is_file() or file.stat().st_size > MAX_REPORT_BYTES:
+            return None
+        payload = json.loads(file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return AnalysisReport.from_dict(payload)
 
 
 def _text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
