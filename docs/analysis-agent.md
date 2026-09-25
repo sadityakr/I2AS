@@ -1,9 +1,48 @@
 # An analysis agent for I2AS
 
 Status: **milestone 1 implemented** (the analyst role, sandboxed scripts, the
-tool surface and the magnetoresistance recipe). The embedded agent host
-(milestone 2) is designed here, and the Analysis screen (milestone 3) is
-planned here; neither is built yet.
+tool surface and the magnetoresistance recipe), and **the uniform session
+layout implemented** (below). The embedded agent host (milestone 2), the
+Analysis screen (milestone 3) and analysis across a whole session are
+planned here; none of them is built yet. The plan below was reviewed
+against the code by an independent agent. Its corrections are folded in,
+and "Findings from the review" lists them.
+
+## The session layout: one tree an agent can walk
+
+Analysis across a session only works if every run of every experiment is
+where the agent expects it. So the operator makes one choice about location,
+the **session folder**, and everything below it is fixed:
+
+```
+<session folder>/                     chosen in User → Session Folder…
+  session.json                        name, owner, experiment index
+  key_results.jsonl                   (planned) session key results, app-written only
+  analysis/series/<analysis_id>/      (planned) analyses over many runs
+  NNN_<label>/                        one experiment; NNN = order started
+    experiment.json  agent_actions.jsonl  outbox.jsonl
+    analysis_journal.jsonl            (planned) every analysis step, app-written only
+    data/run-NNNN_<Procedure>[_<label>].h5
+    analysis/recipes/
+    analysis/run-NNNN/                report.json, figures, *.plot.json, scripts/<id>/
+```
+
+- **Sessions** are registered in `<measurement root>/sessions.json` (active
+  and recent). `SessionStore` creates a session in a new or empty folder,
+  and `session_id` is always the folder's own name.
+- **Experiments** are `NNN_<label>`: the next serial number, then the
+  operator's folder label or the slugged title (`ExperimentStore.make_experiment_id`).
+- **Runs** are placed by the engine, whoever started them. The session layer
+  installs the open experiment's `data/` folder (`Orchestrator.set_run_folder`),
+  and every run becomes `run-NNNN` with the file
+  `run-NNNN_<Procedure>[_<label>].h5` (`core/run_naming.py`). With no
+  experiment open, every run is refused (`rule: no_experiment`). Numbers are
+  never reused.
+- **App-owned records sit outside `analysis/`:** the journal and key
+  results. A sandboxed script's working directory is its own folder under
+  `analysis/`, and under the `venv` backend it runs as the same user, so
+  nothing a script can reach by a relative path is ever treated as a
+  trusted record.
 
 ## The problem
 
@@ -242,9 +281,17 @@ the GUI never keeps its own copy of the truth, the data layer comes first.
 ### Layer 1: a record of every analysis step (no GUI)
 
 1. **The analysis journal** (`session/analysis_journal.py`) is one
-   append-only `analysis/<run_id>/journal.jsonl` per run, with the same record
-   rules as the agent feed (`schema`, `ts`, `seq`, every key always present).
-   One line per step:
+   append-only `<experiment>/analysis_journal.jsonl` **per experiment**,
+   outside `analysis/`. Each step carries `run_ids` (one run, or many for a
+   series). It follows the same record rules as the agent feed (`schema`,
+   `ts`, `seq`, every key always present). It is written only in the
+   application process, on the GUI thread, through one instance per
+   experiment (like `ExperimentFeeds`). A journal-writing tool called from
+   `i2as-ctl`'s own process is refused rather than appending from a second
+   process. On load, a `script_started` with no finish is closed as
+   `abandoned`. It is separate from the agent feed because the feed records
+   agents only, and the journal must also show the operator's steps. One
+   line per step:
 
    | `step` | Written by | Points at |
    |---|---|---|
@@ -256,35 +303,48 @@ the GUI never keeps its own copy of the truth, the data layer comes first.
    | `approved` / `discarded` | `ExperimentManager` | the pending entry's source |
 
    Every step names its `actor` (kind, id, role). It is written by the code
-   that performs the step, never by the agent, so it cannot be skipped or
-   forged. A conformance test asserts that every `analysis`-class tool
-   writes a step.
+   that performs the step, never by the agent, so an agent cannot skip it.
+   Keeping it outside any folder a script works in is what stops a script
+   overwriting it (see "Findings"). A conformance test asserts that every
+   `analysis`-class tool writes a step.
 2. **Live listeners.** The journal calls back its listeners
-   (`add_listener(callback)`) after each append. The gateway server runs
-   inside the application process, so an MCP agent's steps reach the screen
-   live. A thin Qt adapter (`AnalysisActivity(QObject)`, signal
+   (`add_listener(callback)`) after each append. Stdio MCP and HTTP MCP
+   calls reach the in-app `GatewayServer` over its socket, and the tool code
+   runs on the GUI thread, so an MCP agent's steps reach the screen live.
+   `i2as-ctl` builds its own gateway in its own process and does not. A thin Qt adapter (`AnalysisActivity(QObject)`, signal
    `step_recorded(run_id, dict)`) is owned by the app next to
    `ExperimentFeeds`.
 3. **`annotate_analysis(run_id, text, script_id?)`** is a new
    `analysis`-class tool (recorded) that lets the agent explain why, e.g.
    "residuals are asymmetric, so I'm symmetrising for Hall pickup". The
    embedded analyst's commentary (milestone 2) goes to the same step kind.
+5. **Operator steps have an explicit actor.** The screen's Stage and Save
+   as recipe call one shared implementation of each step, which takes the
+   acting `Actor` explicitly (the operator's here, the connection's in the
+   gateway). `call_session_tool()` skips authorization and records nothing,
+   so it is not a door for the operator.
 4. **Plot data, not only pictures.** `ScriptReport.plot(name, series,
    x_label, y_label, caption)` and `AnalysisContext.plot(...)` write
    `<name>.plot.json` (a list of series: `x`, `y`, optional `yerr`, `label`,
    `style` of `points` / `line` / `band`, and `role` of `data` / `fit` /
    `residual`) and render the PNG from the same data. `FigureRef` gains an
-   optional `data_file`. The eLab entry still gets the PNG; the screen draws
+   optional `data_file`. The schema and its parser live in
+   `i2as.analysis.report`, and the application reads a plot file only
+   through `report.output_file()`: a plain `*.plot.json` inside the step's
+   folder, at most 5 MB and 200k finite points. The eLab entry still gets the PNG; the screen draws
    the data in pyqtgraph. A figure made only with matplotlib has no
    `data_file` and is shown as an image. `magnetoresistance` switches to
    `plot()`.
 
 ### Layer 2: the screen
 
-**The switch.** The Procedure window's central widget becomes a
-`QStackedWidget` with two pages: **Setup** (today's 2×2 grid, unchanged) and
-**Analysis**. A two-way `Setup | Analysis` toggle in the window header
-switches between them (Ctrl+1 / Ctrl+2), and the last page is remembered.
+**The switch.** Only the Procedure window's quadrant grid (`_main_splitter`)
+goes into a `QStackedWidget`, with two pages: **Setup** (today's 2×2 grid,
+unchanged) and **Analysis**. The banner, the progress bar and Pause and Abort
+stay visible on both pages. A `Setup | Analysis` tab bar above the stack
+(the same pattern as the Monitor window's `Monitor | Logs` switcher)
+switches between them. Ctrl+1 and Ctrl+2 are window-scoped shortcuts, and
+the last page is remembered.
 **It never switches on its own.** New steps from an agent add to a count
 badge on "Analysis", cleared when the page is shown. A finished run's first
 recipe or agent step raises a banner: "run-0012 analysed — View".
@@ -323,17 +383,84 @@ from this screen are out of scope for now; the eLab tab keeps its
 the timeline. The embedded analyst writes to the same journal, so it needs
 no screen of its own.
 
+### Analysis across a session (planned)
+
+The goal is to analyse many runs, across the experiments of one session,
+together (e.g. R0 or MR against temperature over a series of field sweeps),
+keep the key numbers, and look them up later when planning the next
+experiment.
+
+- **A multi-run analysis.** `AnalysisSpec.runs` becomes a list of
+  `(experiment_id, run_id, data_path, manifest)`; `run_id` stays for a single
+  run. The application resolves every input from validated ids through
+  `ExperimentStore.resolve_data_file`, inside the session folder, and
+  stages them as `input/<experiment>/<run>.h5` with caps on count and bytes,
+  using hard links rather than copies where it can. A `SeriesRecipe` gets
+  `analyse(runs, context)`, and a script gets `runs` beside `run`. The runner
+  is keyed by an `analysis_id` and writes to
+  `<session>/analysis/series/<analysis_id>/`, with a lower priority than the
+  automatic per-run analyses.
+- **Finding runs.** `list_session_runs(filter)` walks the session tree and
+  returns each run's experiment, procedure, time and setpoints (T, B from the
+  manifest). `define_run_set(name, members)` saves a named selection.
+- **Key results.** `<session>/key_results.jsonl` is append-only, and only
+  the application writes it. Each line holds `seq`, `ts`, `result_id`,
+  `quantity` (a key from a declared vocabulary, `QuantitySpec`, declared once
+  like `ParamSpec`), `value`, `unit`, `uncertainty`, `conditions` (T, B, …
+  each with `setpoint` or `measured` as its source), `provenance` (the runs,
+  `analysis_id`, recipe, and a digest computed by the application rather
+  than taken from the worker), `actor`, `note`, and `supersedes` (a
+  correction is a new line; no line is ever edited).
+  `record_key_result` only promotes a value from an existing ok report, so
+  the number and its provenance come from the application's copy, not from
+  the agent's arguments. `query_key_results(quantity, condition ranges,
+  runs, since)` and `read_key_result_trend` are `read`. All of them are the
+  same `ToolSpec`s for MCP and the embedded analyst.
+- **On the Analysis screen:** a scope selector, This run / Series / Session.
+  Session scope shows the key-results table and a pyqtgraph trend (quantity
+  against a chosen condition, with error bars), where a click opens the
+  source step.
+- **Hard questions still open:**
+  - the vocabulary of quantities (so "R0" means one thing across recipes);
+  - unit normalisation;
+  - setpoint vs measured conditions;
+  - marking a key result stale when its recipe's digest changes, rather
+    than rewriting it.
+
+### Findings from the review (incorporated above)
+
+- **Fixed (commit "Hand agents the analysis collaborators…"):**
+  - The gateway was built without the analysis runner and the publisher, so
+    every analysis tool over MCP was refused.
+  - An `experiment_id` was used as a path unchecked.
+  - Figure names from a script were followed as paths when publishing.
+- **Corrected in this plan:**
+  - "`ctl` is live": it is not.
+  - "The journal cannot be forged": only if it sits outside any folder a
+    script can reach.
+  - The operator's `call_session_tool` "door": it does not exist, so steps
+    take an explicit actor.
+  - The stack: the whole central widget would have hidden Pause and Abort.
+- **Still to do in milestone 3:** a size cap and name check on `*.plot.json`;
+  hashing script digests in the application.
+
 ### Order of work
 
-1. **Data layer:** `AnalysisJournal` and its listeners, `annotate_analysis`,
-   `plot()` and `FigureRef.data_file`, and journal writes in the tools, the
-   runner and the manager. Tested without a GUI.
-2. **Read-only screen:** the switch, badge and banner, `RunBrowser`,
-   `StepTimeline`, `StepDetail`, and `EntryStrip` shared with the eLab tab.
-   pytest-qt tests drive a journal and assert what is shown.
-3. **Operator actions:** Stage and Save as recipe through the shared tool
-   functions, and journal steps for approve and discard.
-4. **Milestone 2** plugs its console into the placeholder.
+1. **Data layer:** the per-experiment `AnalysisJournal` and its listeners,
+   `annotate_analysis`, `plot()` with validation, `FigureRef.data_file`,
+   journal writes in the tools, the runner and the manager (with explicit
+   actors), and digests computed by the application. Tested without a GUI.
+2. **Multi-run analysis:** `AnalysisSpec.runs`, staging, `SeriesRecipe`,
+   `runs` in scripts, the runner keyed by `analysis_id`, and
+   `list_session_runs` / `define_run_set`.
+3. **Key results:** the store, `QuantitySpec`, and `record_key_result` /
+   `query_key_results` / `read_key_result_trend`.
+4. **Read-only Analysis screen:** the switch, badge and banner, the three
+   scopes, `RunBrowser`, `StepTimeline`, `StepDetail`, and `EntryStrip`
+   shared with the eLab tab.
+5. **Operator actions:** Stage and Save as recipe, and approve and discard
+   recorded on the timeline.
+6. **Milestone 2** plugs its console into the placeholder.
 
 ## Milestone 4: the container sandbox and heavier models
 

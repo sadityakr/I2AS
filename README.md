@@ -85,6 +85,26 @@ Three mechanisms can only ever subtract from that table. Each door has a ceiling
 
 One action is outside the table. Emergency standby is permitted to every role, in every state, at every kill-switch setting. Whoever can see a problem must be able to make the station safe.
 
+### Where data lives: one session folder, one fixed tree
+
+The operator makes exactly one choice about where data goes: the **session folder** (User → Session Folder…, any folder on disk; the Monitor header shows the session's name). Everything below it has one shape, so a person, a script or an analysis agent finds any run of any experiment without being told where to look:
+
+```
+<session folder>/                      the only folder the operator chooses
+  session.json                         name, owner, experiment index
+  001_<experiment label>/              experiments, numbered in the order started
+    experiment.json  agent_actions.jsonl  outbox.jsonl
+    data/
+      run-0001_FieldSweep.h5           runs, numbered; the procedure; the
+      run-0002_FieldSweep_10K.h5       operator's optional label last
+    analysis/
+      recipes/                         this experiment's analysis recipes
+      run-0001/                        report.json, figures, scripts/<id>/
+  002_<experiment label>/
+```
+
+A run needs an open experiment, and the engine places every run, whoever started it, in that experiment's `data/` folder as `run-NNNN`. Numbers are never reused. The machine remembers the active and recent session folders in `<measurement root>/sessions.json`.
+
 ## Setting up your own station
 
 Most of I2AS is fixed machinery you never edit per rack. A new setup touches four things: a driver if yours is not shipped, a Virtual Instrument that declares what the instrument reads and does, one YAML file naming the rack's instruments and limits, and, when the shipped sweeps do not fit, a procedure describing the experiment. Everything the agent and the GUI see is rendered from those declarations.
