@@ -329,3 +329,103 @@ def test_start_refuses_what_it_cannot_analyse(runner_setup, tmp_path, qtbot):
     assert runner.start("run-0001") == ""
     assert runner.recipe_dirs() == []
     assert publisher.reports == [] and publisher.parked == []
+
+
+# ── Analysis scripts and the sandbox ──────────────────────────────────────
+
+_ENV_REPORT = (
+    "import os\n"
+    '(out / "env.json").write_text(json.dumps({"env": dict(os.environ), "cwd": os.getcwd()}))\n'
+    + _OK_REPORT
+)
+
+
+def test_a_script_is_announced_on_its_own_signal_and_never_parked(
+    runner_setup, tmp_path, qtbot
+):
+    """Exploring a run leaves the run's pending entry exactly as it was."""
+    manager, publisher, _settings, make_runner = runner_setup
+    runner = make_runner(_worker(tmp_path, _OK_REPORT))
+    experiment = manager.current_experiment()
+    folder = manager.store.script_dir(experiment.experiment_id, "run-0001", "probe_1")
+    folder.mkdir(parents=True)
+    script = folder / "probe_1.py"
+    script.write_text("report.summary('hi')\n", encoding="utf-8")
+    finished_recipes: list = []
+    runner.analysis_finished.connect(lambda *args: finished_recipes.append(args))
+
+    with qtbot.waitSignal(runner.script_finished, timeout=20000) as blocker:
+        output = runner.start_script("run-0001", "probe_1", script, options={"k": 1})
+        assert runner.is_running("run-0001", "probe_1")
+        assert not runner.is_running("run-0001"), "the run's recipe analysis is not running"
+
+    assert output == str(folder)
+    run_id, script_id, payload = blocker.args
+    assert (run_id, script_id) == ("run-0001", "probe_1")
+    assert payload["status"] == "ok"
+    assert publisher.reports == [] and publisher.parked == []
+    assert finished_recipes == []
+    spec = json.loads((folder / SPEC_FILENAME).read_text(encoding="utf-8"))
+    assert spec["script_path"] == str(script)
+    assert spec["recipe"] == ""
+    assert spec["options"] == {"k": 1}
+
+
+def test_the_venv_sandbox_scrubs_the_environment_and_stages_the_run(
+    runner_setup, tmp_path, qtbot, monkeypatch
+):
+    """A credential in this process never reaches analysis code, nor does the original file."""
+    from dataclasses import replace
+
+    from i2as.session.eln.settings import SandboxSettings
+
+    _manager, _publisher, settings_box, make_runner = runner_setup
+    monkeypatch.setenv("I2AS_ASSISTANT_APIKEY", "sk-secret")
+    monkeypatch.setenv("SOME_API_TOKEN", "t0ken")
+    worker = _worker(tmp_path, _ENV_REPORT)
+    settings_box[0] = replace(
+        settings_box[0],
+        analysis=replace(
+            settings_box[0].analysis,
+            sandbox=SandboxSettings(backend="venv", python=worker),
+        ),
+    )
+    # The runner's own interpreter is NOT what the venv backend starts.
+    runner = make_runner(sys.executable)
+
+    with qtbot.waitSignal(runner.analysis_finished, timeout=20000):
+        report_dir = runner.start("run-0001")
+
+    seen = json.loads((Path(report_dir) / "env.json").read_text(encoding="utf-8"))
+    assert "I2AS_ASSISTANT_APIKEY" not in seen["env"]
+    assert "SOME_API_TOKEN" not in seen["env"]
+    assert seen["env"]["MPLBACKEND"] == "Agg"
+    assert Path(seen["cwd"]).resolve() == Path(report_dir).resolve()
+    spec = json.loads((Path(report_dir) / SPEC_FILENAME).read_text(encoding="utf-8"))
+    staged = Path(spec["data_path"])
+    assert staged.parent == Path(report_dir) / "input"
+    assert staged.read_bytes() == b"\x89HDF\r\n\x1a\n"
+
+
+def test_a_sandbox_with_no_interpreter_is_a_failed_analysis_not_a_silent_one(
+    runner_setup, tmp_path, qtbot
+):
+    """A misconfigured sandbox still leaves an entry waiting, naming why."""
+    from dataclasses import replace
+
+    from i2as.session.eln.settings import SandboxSettings
+
+    _manager, publisher, settings_box, make_runner = runner_setup
+    settings_box[0] = replace(
+        settings_box[0],
+        analysis=replace(settings_box[0].analysis, sandbox=SandboxSettings(backend="venv")),
+    )
+    runner = make_runner(sys.executable)
+
+    with qtbot.waitSignal(runner.analysis_failed, timeout=5000) as blocker:
+        runner.start("run-0001")
+
+    assert blocker.args[0] == "run-0001"
+    assert "no interpreter is configured" in blocker.args[1]
+    assert publisher.parked and publisher.parked[0][0] == "run-0001"
+    assert not runner.is_running()

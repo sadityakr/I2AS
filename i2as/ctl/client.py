@@ -611,7 +611,8 @@ def open_client(
     Args:
         offline: A config directory to build a simulated station from, or
             ``None`` for live mode.
-        role: The declared **Role** (``observer`` / ``debug`` / ``session``).
+        role: The declared **Role** (``observer`` / ``analyst`` / ``debug`` /
+            ``session``).
         actor_id: The declared identity; defaults to
             :func:`default_actor_id`.
         timeout_s: How long a live request waits for its verdict.

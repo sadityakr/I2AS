@@ -699,3 +699,113 @@ def test_the_gateway_mirrors_ownership_from_the_status_snapshot(qtbot, engine, t
     assert verdicts[-1]["detail"]["rule"] == "run_owner"
 
     orch.abort_procedure()
+
+
+# ── The analyst role and the analysis class ───────────────────────────────
+
+ANALYST = ev.Actor(kind=ev.ActorKind.AGENT, id="analyst", role=Role.ANALYST.value)
+
+
+def test_the_analyst_column_grants_read_and_analysis_and_nothing_else():
+    """The whole design of the role, read straight off the table."""
+    from i2as.session.gateway import PERMISSION_MATRIX
+
+    granted = {
+        action_class
+        for action_class, row in PERMISSION_MATRIX.items()
+        if row[Role.ANALYST] is not Permission.REFUSED
+    }
+    assert granted == {ActionClass.READ, ActionClass.ANALYSIS}
+    # Analysis is not a rung on the way to control: only the analyst and the
+    # session roles hold it.
+    assert {
+        role
+        for role, cell in PERMISSION_MATRIX[ActionClass.ANALYSIS].items()
+        if cell is Permission.PERMITTED
+    } == {Role.ANALYST, Role.SESSION}
+
+
+def test_an_analyst_is_refused_every_station_command(station_info):
+    """Run control, recovery and the envelope are all refused by the matrix."""
+    for name in (
+        ev.CommandName.RUN_PROCEDURE,
+        ev.CommandName.PAUSE_PROCEDURE,
+        ev.CommandName.CONNECT_INSTRUMENT,
+        ev.CommandName.SET_ATTENDANCE,
+    ):
+        verdict = _authorize(_command(name, ANALYST), station_info, attended=False)
+        assert verdict is not None, name
+        assert verdict.detail["rule"] == "role_matrix", name
+    # Emergency standby stays outside the table.
+    assert _authorize(
+        _command(ev.CommandName.EMERGENCY_STANDBY, ANALYST, reason="x"), station_info
+    ) is None
+
+
+def test_the_ceiling_places_the_analyst_beside_debug_not_above_it():
+    """Within session, above observer, and neither within nor above debug."""
+    from i2as.session.gateway import ROLE_LADDER, role_within_ceiling
+
+    assert role_within_ceiling(Role.ANALYST, Role.SESSION)
+    assert role_within_ceiling(Role.OBSERVER, Role.ANALYST)
+    assert not role_within_ceiling(Role.ANALYST, Role.OBSERVER)
+    assert not role_within_ceiling(Role.ANALYST, Role.DEBUG)
+    assert not role_within_ceiling(Role.DEBUG, Role.ANALYST)
+    assert not role_within_ceiling(Role.SESSION, Role.ANALYST)
+    assert set(ROLE_LADDER) == set(Role)
+
+
+def test_the_spool_cap_judges_an_analyst_cell_by_cell(station_info):
+    """A file declaring 'analyst' passes a session cap and is refused under debug."""
+    from i2as.session.gateway import authorize_spooled
+
+    command = _command(ev.CommandName.RUN_PROCEDURE, ANALYST)
+    under_session = authorize_spooled(
+        command=command,
+        declared_role=Role.ANALYST.value,
+        max_role=Role.SESSION.value,
+        station_info=station_info,
+        attendance=False,
+        kill_switch=ev.AgentGate.ACTIVE,
+    )
+    # Past the cap — and then refused by the matrix, on the authority it lacks.
+    assert under_session is not None and under_session.detail["rule"] == "role_matrix"
+    under_debug = authorize_spooled(
+        command=command,
+        declared_role=Role.ANALYST.value,
+        max_role=Role.DEBUG.value,
+        station_info=station_info,
+        attendance=False,
+        kill_switch=ev.AgentGate.ACTIVE,
+    )
+    assert under_debug is not None and under_debug.detail["rule"] == "spool_role_cap"
+
+
+def test_no_instrument_action_may_carry_the_analysis_class(station_info):
+    """A snapshot claiming a @control is 'analysis' is refused, never granted."""
+    from dataclasses import replace
+
+    from i2as.core.decorators import VALID_ACTION_CLASSES
+    from i2as.session.gateway import classify_control
+
+    assert "analysis" not in VALID_ACTION_CLASSES
+    instrument = next(item for item in station_info.instruments if item.controls)
+    control = instrument.controls[0]
+    forged = replace(
+        station_info,
+        instruments=tuple(
+            replace(
+                item,
+                controls=tuple(
+                    replace(c, action_class="analysis") if c is control else c
+                    for c in item.controls
+                ),
+            )
+            if item is instrument
+            else item
+            for item in station_info.instruments
+        ),
+    )
+
+    with pytest.raises(UnclassifiedActionError, match="no instrument action may carry"):
+        classify_control(forged, instrument.name, control.name)

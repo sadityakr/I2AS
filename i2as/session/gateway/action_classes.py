@@ -48,12 +48,14 @@ logger = logging.getLogger(__name__)
 class ActionClass(str, Enum):
     """How much authority an action needs, independent of who is asking.
 
-    The four classes of the gateway's permission matrix (``roles.py``). A
+    The five classes of the gateway's permission matrix (``roles.py``). A
     ``str`` enum so the value is JSON-safe as it stands and travels in a
-    refusal's ``detail`` unchanged. The same four values are
+    refusal's ``detail`` unchanged. The four HARDWARE classes are
     ``core.decorators.VALID_ACTION_CLASSES``, which is what a VI declares
-    against; ``tests/test_conformance.py`` asserts the two agree, so the
-    declaration side and the permission side can never drift apart.
+    against; the fifth, ``ANALYSIS``, is in ``SESSION_ONLY_ACTION_CLASSES``
+    and no instrument may declare it. ``tests/test_conformance.py`` asserts
+    the split, so the declaration side and the permission side can never
+    drift apart.
 
     Members:
         READ: Observes the system and changes nothing.
@@ -65,12 +67,27 @@ class ActionClass(str, Enum):
         ENVELOPE: Changes the rules the other three are judged by — the
             session envelope, attendance, and the kill switch. Reserved to
             the human.
+        ANALYSIS: Puts analysis code on the measurement machine and runs it
+            over a FINISHED run in the analysis worker, or parks what it
+            produced for a human to approve. It touches no instrument, starts
+            no measurement and publishes nothing, which is why it is its own
+            class rather than ``run_control``: an agent may be trusted to
+            analyse without being trusted to measure.
     """
 
     READ = "read"
     RECOVERY = "recovery"
     RUN_CONTROL = "run_control"
     ENVELOPE = "envelope"
+    ANALYSIS = "analysis"
+
+
+#: The classes only a session tool can carry. A ``@control`` is hardware, and
+#: a hardware action classified ``analysis`` would hand an instrument to a
+#: role granted analysis alone — so ``core.decorators.VALID_ACTION_CLASSES``
+#: omits these, and ``classify_control()`` refuses one arriving on a snapshot
+#: anyway rather than trusting where the snapshot came from.
+SESSION_ONLY_ACTION_CLASSES: frozenset[ActionClass] = frozenset({ActionClass.ANALYSIS})
 
 
 @dataclass(frozen=True)
@@ -293,6 +310,12 @@ def classify_control(station_info: StationInfo, vi_name: str, method_name: str) 
             f"{declared.action_class!r}, which this gateway does not know, "
             f"so no role can be granted it"
         ) from exc
+    if action_class in SESSION_ONLY_ACTION_CLASSES:
+        raise UnclassifiedActionError(
+            f"{vi_name}.{method_name}() declares action class "
+            f"{action_class.value!r}, which no instrument action may carry, "
+            f"so no role can be granted it"
+        )
     return ClassifiedAction(
         action_class,
         f"Declared {action_class.value} by {vi_name}'s own @control.",

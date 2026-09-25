@@ -778,6 +778,9 @@ def test_the_two_eln_tools_declare_their_class_and_their_recording(tools):
         "publish_eln_entry",
         "write_analysis_recipe",
         "run_analysis",
+        "run_analysis_script",
+        "stage_analysis_result",
+        "save_analysis_script_as_recipe",
     }, "a tool an agent polls must not drown the accountability trail"
 
 
@@ -1094,20 +1097,25 @@ def fake_discovery(tmp_path, monkeypatch):
 
 
 class FakeAnalysisRunner:
-    """A stand-in for the **Analysis runner**, duck-typed on its three methods."""
+    """A stand-in for the **Analysis runner**, duck-typed on its four methods."""
 
     def __init__(self, report_dir):
         self._report_dir = report_dir
         self.calls: list[tuple] = []
-        self.running: set[str] = set()
+        self.script_calls: list[tuple] = []
+        self.running: set = set()
         self.refuse = False
 
     def start(self, run_id, recipe="", options=None):
         self.calls.append((run_id, recipe, dict(options or {})))
         return "" if self.refuse else str(self._report_dir(run_id))
 
-    def is_running(self, run_id=""):
-        return run_id in self.running
+    def start_script(self, run_id, script_id, script_path, options=None):
+        self.script_calls.append((run_id, script_id, script_path, dict(options or {})))
+        return "" if self.refuse else str(Path(script_path).parent)
+
+    def is_running(self, run_id="", script_id=""):
+        return (run_id, script_id) in self.running if script_id else run_id in self.running
 
     def recipe_dirs(self):
         return []
@@ -1163,6 +1171,12 @@ def analysis_gateway(qtbot, tmp_path, monkeypatch, fake_discovery):
         lambda exp, run_id: analysis_root / exp / run_id,
         raising=False,
     )
+    monkeypatch.setattr(
+        store,
+        "script_dir",
+        lambda exp, run_id, script_id: analysis_root / exp / run_id / "scripts" / script_id,
+        raising=False,
+    )
     runner = FakeAnalysisRunner(lambda run_id: analysis_root / experiment_id / run_id)
     feed_path = store.agent_feed_path(experiment_id)
     feed = AgentFeed(feed_path, experiment_id)
@@ -1208,10 +1222,21 @@ def _preference_publisher(**recipes):
     )
 
 
-def test_the_five_analysis_tools_are_rendered_with_their_class(tools):
-    """The surface offers them, and says which two put something on the machine."""
-    read_only = {"list_analysis_recipes", "read_analysis_recipe", "read_analysis_report"}
-    controls = {"write_analysis_recipe", "run_analysis"}
+def test_the_analysis_tools_are_rendered_with_their_class(tools):
+    """The surface offers them, and says which put code on the machine or park a result."""
+    read_only = {
+        "list_analysis_recipes",
+        "read_analysis_recipe",
+        "read_analysis_report",
+        "read_analysis_script_result",
+    }
+    controls = {
+        "write_analysis_recipe",
+        "run_analysis",
+        "run_analysis_script",
+        "stage_analysis_result",
+        "save_analysis_script_as_recipe",
+    }
 
     for name in read_only | controls:
         tool = tools[name]
@@ -1219,8 +1244,10 @@ def test_the_five_analysis_tools_are_rendered_with_their_class(tools):
         assert tool.input_schema["additionalProperties"] is False, name
         assert tool.command is None, name
     assert all(tools[name].action_class is ActionClass.READ for name in read_only)
+    # Analysis is its own class, not run_control: an agent may be trusted to
+    # analyse without being trusted to measure.
     assert all(
-        tools[name].action_class is ActionClass.RUN_CONTROL for name in controls
+        tools[name].action_class is ActionClass.ANALYSIS for name in controls
     )
     assert all(tools[name].recorded is True for name in controls)
     assert all(tools[name].recorded is False for name in read_only)
@@ -1513,8 +1540,8 @@ def test_the_analysis_reads_are_open_to_an_observer(analysis_gateway):
         assert answer["ok"] is True, (name, answer)
 
 
-def test_writing_and_running_belong_to_the_session_role_alone(analysis_gateway):
-    """Code on the measurement machine is run control, and the matrix says so."""
+def test_writing_and_running_are_refused_to_the_roles_without_analysis(analysis_gateway):
+    """Code on the measurement machine is the analysis class, and the matrix says so."""
     calls = (
         ("write_analysis_recipe", {"name": "drift", "source": RECIPE_SOURCE}),
         ("run_analysis", {"run_id": RUN_ID}),
@@ -1623,3 +1650,267 @@ def test_the_analysis_tools_refuse_by_name_without_the_analysis_package(
         "rule": "missing_collaborator",
         "collaborator": "analysis",
     }
+
+
+# ── Analysis scripts, and the analyst role ────────────────────────────────
+
+SCRIPT_SOURCE = 'report.value("n", run.n_points)\nprint("points:", run.n_points)\n'
+
+
+class FakeReportPublisher:
+    """A publisher stand-in recording what ``stage_analysis_result`` parks."""
+
+    def __init__(self, parks=True):
+        self.parked: list[tuple] = []
+        self._parks = parks
+
+    def export_report(self, run_id, report, report_dir):
+        self.parked.append((run_id, report, report_dir))
+        return self._parks
+
+
+def _script_result(folder: Path, **report) -> None:
+    """Write what the worker would leave in one script's folder."""
+    from i2as.analysis.report import AnalysisReport, FigureRef
+
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = AnalysisReport(
+        run_id=RUN_ID,
+        recipe="script:probe",
+        figures=(FigureRef(file="fit.png", caption="the fit"),),
+        **report,
+    ).to_dict()
+    (folder / "report.json").write_text(json.dumps(payload), encoding="utf-8")
+    (folder / "stdout.txt").write_text("points: 6\n", encoding="utf-8")
+
+
+def _run_a_script(gateway, **extra):
+    answer = gateway.call_tool(
+        "run_analysis_script", {"run_id": RUN_ID, "source": SCRIPT_SOURCE, **extra}
+    )
+    assert answer["ok"] is True, answer
+    return answer["result"]
+
+
+def test_an_analyst_may_analyse_but_never_touch_the_station(analysis_gateway):
+    """The point of the role: every analysis tool, and not one station action."""
+    analyst = analysis_gateway.build(Role.ANALYST)
+
+    assert analyst.call_tool(
+        "write_analysis_recipe", {"name": "drift", "source": RECIPE_SOURCE}
+    )["ok"] is True
+    assert analyst.call_tool("run_analysis", {"run_id": RUN_ID})["ok"] is True
+    _run_a_script(analyst)
+    assert analyst.call_tool("read_status")["ok"] is True
+
+    for name, args in (
+        ("run_procedure", {"procedure": "FieldSweep", "params": dict(FULL_PARAMS)}),
+        ("probe_run", {"procedure": "FieldSweep", "probe_spec": {"n_points": 2}}),
+        ("pause_procedure", {}),
+        ("start_monitoring", {}),
+    ):
+        answer = analyst.call_tool(name, args)
+        assert answer["code"] == "BLOCKED_ROLE", (name, answer)
+        assert answer["detail"]["rule"] == "role_matrix", (name, answer)
+    # Emergency standby stays outside the table for every role, this one included.
+    assert analyst.call_tool("emergency_standby", {"reason": "test"})["code"] != "BLOCKED_ROLE"
+
+
+def test_the_script_tools_are_refused_to_the_roles_without_analysis(analysis_gateway):
+    """Observer and debug read results; they neither run nor stage nor save scripts."""
+    for role in (Role.OBSERVER, Role.DEBUG):
+        gateway = analysis_gateway.build(role)
+        for name, args in (
+            ("run_analysis_script", {"run_id": RUN_ID, "source": SCRIPT_SOURCE}),
+            ("stage_analysis_result", {"run_id": RUN_ID, "script_id": "probe_1"}),
+            (
+                "save_analysis_script_as_recipe",
+                {"run_id": RUN_ID, "script_id": "probe_1", "name": "kept"},
+            ),
+        ):
+            answer = gateway.call_tool(name, args)
+            assert answer["code"] == "BLOCKED_ROLE", (role, name)
+        answer = gateway.call_tool(
+            "read_analysis_script_result", {"run_id": RUN_ID, "script_id": "probe_1"}
+        )
+        assert answer["ok"] is True, (role, answer)
+    assert analysis_gateway.runner.script_calls == []
+
+
+def test_running_a_script_writes_it_stamped_into_the_runs_folder_and_starts_it(
+    analysis_gateway,
+):
+    """The exploring step: a stamped file, a started worker, and nothing parked."""
+    from i2as.session.agent_feed import read_feed
+
+    result = _run_a_script(
+        analysis_gateway.build(Role.ANALYST), name="probe", options={"window": 3}
+    )
+
+    script_id = result["script_id"]
+    assert script_id.startswith("probe_")
+    folder = analysis_gateway.report_dir / "scripts" / script_id
+    path = folder / f"{script_id}.py"
+    assert result["script_path"] == str(path)
+    assert result["result_path"] == str(folder / "report.json")
+    written = path.read_text(encoding="utf-8")
+    assert written.startswith("# Written by agent 'runner-1' via run_analysis_script at ")
+    assert written.endswith(SCRIPT_SOURCE)
+    assert analysis_gateway.runner.script_calls == [
+        (RUN_ID, script_id, str(path), {"window": 3})
+    ]
+    assert analysis_gateway.runner.calls == [], "a script is not a recipe analysis"
+
+    records = [r for r in read_feed(analysis_gateway.feed_path) if r["record"] == "tool"]
+    assert [r["tool"] for r in records] == ["run_analysis_script"]
+    assert "source" not in records[0]["args"]
+    assert records[0]["args"]["source_digest"] == hashlib.sha256(
+        SCRIPT_SOURCE.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("args", "rule"),
+    [
+        ({"source": "def broken(:\n"}, "syntax_error"),
+        ({"source": SCRIPT_SOURCE, "name": "../escape"}, "invalid_name"),
+        ({"source": SCRIPT_SOURCE, "name": "x" * 41}, "invalid_name"),
+    ],
+)
+def test_a_script_that_cannot_be_run_is_refused_before_anything_is_written(
+    analysis_gateway, args, rule
+):
+    """Refused by name, and no file and no worker left behind."""
+    answer = analysis_gateway.build().call_tool(
+        "run_analysis_script", {"run_id": RUN_ID, **args}
+    )
+
+    assert answer["ok"] is False
+    assert answer["detail"]["rule"] == rule
+    assert not (analysis_gateway.report_dir / "scripts").exists()
+    assert analysis_gateway.runner.script_calls == []
+
+
+def test_a_script_the_runner_did_not_start_is_reported(analysis_gateway):
+    """A sandbox that could not stage, or no data file, is 'not_started'."""
+    analysis_gateway.runner.refuse = True
+
+    answer = analysis_gateway.build().call_tool(
+        "run_analysis_script", {"run_id": RUN_ID, "source": SCRIPT_SOURCE}
+    )
+
+    assert answer["detail"]["rule"] == "not_started"
+
+
+def test_reading_a_script_result_answers_running_none_or_the_report(analysis_gateway):
+    """Three answers: still running, nothing there, or the report with its output."""
+    gateway = analysis_gateway.build(Role.OBSERVER)
+    args = {"run_id": RUN_ID, "script_id": "probe_1"}
+
+    analysis_gateway.runner.running.add((RUN_ID, "probe_1"))
+    assert gateway.call_tool("read_analysis_script_result", args)["result"]["status"] == "running"
+    analysis_gateway.runner.running.clear()
+    assert gateway.call_tool("read_analysis_script_result", args)["result"]["status"] == "none"
+
+    folder = analysis_gateway.report_dir / "scripts" / "probe_1"
+    _script_result(folder, summary=("six points",))
+    result = gateway.call_tool("read_analysis_script_result", args)["result"]
+
+    assert result["status"] == "ok"
+    assert result["summary"] == ["six points"]
+    assert result["stdout"] == "points: 6\n"
+    assert result["stdout_truncated"] is False
+    assert result["figure_paths"] == [str(folder / "fit.png")]
+    assert result["script_dir"] == str(folder)
+
+
+def test_a_script_id_is_never_a_path(analysis_gateway):
+    """An id that could climb out of the run's folder is refused, not resolved."""
+    answer = analysis_gateway.build().call_tool(
+        "read_analysis_script_result", {"run_id": RUN_ID, "script_id": "../../x"}
+    )
+
+    assert answer["ok"] is False
+    assert answer["detail"]["rule"] == "unknown_script"
+
+
+def test_staging_parks_a_scripts_report_as_the_runs_pending_entry(analysis_gateway):
+    """The deciding step: the report goes to the publisher, for a human to approve."""
+    publisher = FakeReportPublisher()
+    gateway = analysis_gateway.build(Role.ANALYST, publisher=publisher)
+    folder = analysis_gateway.report_dir / "scripts" / "probe_1"
+    _script_result(folder, summary=("R0 = 100 ohm",))
+
+    answer = gateway.call_tool(
+        "stage_analysis_result", {"run_id": RUN_ID, "script_id": "probe_1"}
+    )
+
+    assert answer["ok"] is True, answer
+    assert answer["result"]["parked"] is True
+    [(run_id, report, report_dir)] = publisher.parked
+    assert run_id == RUN_ID
+    assert report.summary == ("R0 = 100 ohm",)
+    assert report_dir == str(folder)
+
+
+def test_staging_refuses_a_missing_or_failed_result(analysis_gateway):
+    """Only a finished, successful script result becomes an entry."""
+    from i2as.analysis.report import REPORT_FAILED
+
+    publisher = FakeReportPublisher()
+    gateway = analysis_gateway.build(publisher=publisher)
+    args = {"run_id": RUN_ID, "script_id": "probe_1"}
+
+    assert gateway.call_tool("stage_analysis_result", args)["detail"]["rule"] == "no_result"
+    _script_result(
+        analysis_gateway.report_dir / "scripts" / "probe_1",
+        status=REPORT_FAILED,
+        error="ValueError: bad",
+    )
+    assert gateway.call_tool("stage_analysis_result", args)["detail"]["rule"] == "failed_report"
+    assert publisher.parked == []
+
+    _script_result(analysis_gateway.report_dir / "scripts" / "probe_1")
+    refusing = analysis_gateway.build(publisher=FakeReportPublisher(parks=False))
+    assert refusing.call_tool("stage_analysis_result", args)["detail"]["rule"] == "not_parked"
+
+
+def test_saving_a_script_keeps_it_as_an_ordinary_recipe(analysis_gateway):
+    """The keeping step: a stamped ScriptRecipe carrying the script unchanged."""
+    gateway = analysis_gateway.build(Role.ANALYST)
+    result = _run_a_script(gateway, name="probe")
+
+    answer = gateway.call_tool(
+        "save_analysis_script_as_recipe",
+        {
+            "run_id": RUN_ID,
+            "script_id": result["script_id"],
+            "name": "point_count",
+            "procedures": ["FieldSweep"],
+            "description": "Counts the points",
+        },
+    )
+
+    assert answer["ok"] is True, answer
+    path = analysis_gateway.recipes_dir / "point_count.py"
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(
+        "# Written by agent 'runner-1' via save_analysis_script_as_recipe at "
+    )
+    namespace: dict = {}
+    exec(compile(text, str(path), "exec"), namespace)
+    recipe = namespace["PointCountRecipe"]
+    assert recipe.name == "point_count"
+    assert recipe.procedures == ("FieldSweep",)
+    assert recipe.SCRIPT.endswith(SCRIPT_SOURCE)
+
+    again = gateway.call_tool(
+        "save_analysis_script_as_recipe",
+        {"run_id": RUN_ID, "script_id": result["script_id"], "name": "point_count"},
+    )
+    assert again["detail"]["rule"] == "exists"
+    missing = gateway.call_tool(
+        "save_analysis_script_as_recipe",
+        {"run_id": RUN_ID, "script_id": "nothing_here", "name": "other"},
+    )
+    assert missing["detail"]["rule"] == "unknown_script"

@@ -43,6 +43,11 @@ REPORT_FILENAME = "report.json"
 #: Name of the spec file the runner writes beside the report.
 SPEC_FILENAME = "spec.json"
 
+#: Name of the folder, inside one run's analysis folder, that holds the
+#: **analysis scripts** run over that run — one sub-folder per script, with
+#: the script, its spec, its report, its figures and its captured output.
+SCRIPTS_DIRNAME = "scripts"
+
 #: Sub-directory of an experiment's analysis folder holding the experiment's
 #: own recipe scripts (``<experiment>/analysis/recipes/*.py``).
 RECIPES_DIRNAME = "recipes"
@@ -391,6 +396,11 @@ class AnalysisSpec:
             does not set it.
         attach_data_file: Default for the report's flag when the recipe does
             not set it.
+        script_path: Absolute path of an **analysis script** to run INSTEAD
+            of a recipe (``i2as.analysis.scripts``), or ``""`` for the recipe
+            path. A script is exploratory code an agent or a physicist runs
+            once over one run; ``recipe`` and ``recipe_dirs`` are ignored
+            when it is set.
     """
 
     run_id: str
@@ -404,6 +414,7 @@ class AnalysisSpec:
     options: dict[str, Any] = field(default_factory=dict)
     include_fact_tables: bool = False
     attach_data_file: bool = False
+    script_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-safe form."""
@@ -419,6 +430,7 @@ class AnalysisSpec:
             "options": dict(self.options),
             "include_fact_tables": self.include_fact_tables,
             "attach_data_file": self.attach_data_file,
+            "script_path": self.script_path,
         }
 
     @classmethod
@@ -438,4 +450,5 @@ class AnalysisSpec:
             options=_dict(payload.get("options")),
             include_fact_tables=_bool(payload.get("include_fact_tables"), False),
             attach_data_file=_bool(payload.get("attach_data_file"), False),
+            script_path=_text(payload.get("script_path", ""), 4096),
         )

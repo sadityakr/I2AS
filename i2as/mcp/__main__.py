@@ -74,8 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--role",
         default=os.environ.get("I2AS_MCP_ROLE", "observer"),
         help=(
-            "The role to declare at the handshake: observer (default), debug "
-            "or session. The app refuses anything above its own ceiling."
+            "The role to declare at the handshake: observer (default), "
+            "analyst, debug or session. The app refuses anything above its "
+            "own ceiling."
         ),
     )
     parser.add_argument(

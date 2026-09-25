@@ -40,6 +40,7 @@ from i2as.analysis.report import (
     AnalysisReport,
     AnalysisSpec,
 )
+from i2as.analysis.scripts import run_script
 from i2as.core.data_reader import open_run
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,9 @@ def run_spec(spec: AnalysisSpec) -> AnalysisReport:
     recipe name nothing answers to — each becomes a ``REPORT_FAILED`` report
     whose ``error`` says what happened.
 
+    A spec naming a ``script_path`` runs that **analysis script** instead
+    of a recipe (``scripts.run_script()``) and answers with the same report.
+
     Args:
         spec: The request: the run, its data file, its manifest, the
             experiment and setup facts, the recipe (or ``""`` to choose by
@@ -138,6 +142,8 @@ def run_spec(spec: AnalysisSpec) -> AnalysisReport:
         ``options``. The spec's ``include_fact_tables``/``attach_data_file``
         are applied as defaults wherever the recipe left them ``False``.
     """
+    if spec.script_path:
+        return run_script(spec)
     started_utc = _utc_now()
     clock = time.monotonic()
     info: RecipeInfo | None = None

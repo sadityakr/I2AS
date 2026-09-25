@@ -36,27 +36,43 @@ on.
   the experiment store, the run files, the operational log and the agent
   feed, they answer "may I run this, and how long will it take?" without
   dispatching anything, they draft and publish this experiment's notebook
-  entries, and they read, write and run the **analysis recipes** a finished
-  run is analysed with. Every one of them is ``ActionClass.READ`` except
-  ``probe_run``, which really is a ``run_procedure`` with a ``ProbeSpec`` and
-  is classified (and refused) as one; ``publish_eln_entry``, which puts a
-  permanent record of this experiment into the outside world on the
-  experiment's behalf; and ``write_analysis_recipe`` / ``run_analysis``, which
-  put code on the measurement machine and start the process that executes it.
-  All three are classified ``run_control``.
+  entries, and they read, write and run the **analysis recipes** and
+  **analysis scripts** a finished run is analysed with. Every one of them is
+  ``ActionClass.READ`` except ``probe_run``, which really is a
+  ``run_procedure`` with a ``ProbeSpec`` and is classified (and refused) as
+  one; ``publish_eln_entry``, which puts a permanent record of this
+  experiment into the outside world on the experiment's behalf and is
+  ``run_control``; and the five that put analysis code on the measurement
+  machine, run it, or park what it produced, which are ``analysis``.
 
-**Five tools reach the analysis stage**, and the trust boundary they sit on is
-written down in this folder's README. A recipe is code, trusted like a
-procedure: ``write_analysis_recipe`` compiles what it is given, stamps it with
-a header naming the actor and the UTC time, and writes it into the
-experiment's own ``analysis/recipes`` folder — it executes nothing. The
-analysis worker does that, in a separate process that holds the run's data
-file and reaches no instrument, and only when ``run_analysis`` (or a human's
-button) starts it. Both are ``run_control`` and both declare ``recorded``, so
-the **Agent feed** carries the call, the digest of the source written and the
-run analysed, and the eLab tab shows the recipe before anybody runs it. The
-other three — listing recipes, reading one, and reading a report — change
-nothing and are ``read``.
+**Nine tools reach the analysis stage**, and the trust boundary they sit on is
+written down in ``docs/analysis-agent.md``. Analysis code is trusted like a
+procedure, and it only ever runs in the analysis worker — a separate process,
+started in the configured **analysis sandbox**, that holds the run's data
+file and reaches no instrument:
+
+* ``write_analysis_recipe`` compiles a recipe, stamps it with a header naming
+  the actor and the UTC time, and writes it into the experiment's own
+  ``analysis/recipes`` folder — it executes nothing; ``run_analysis`` starts
+  the worker on a run with a recipe, and its report becomes the run's
+  pending entry.
+* ``run_analysis_script`` is the exploring step before that: it writes one
+  script into the run's own ``scripts/<script_id>`` folder and starts the
+  worker on it. Its report parks NOTHING;
+  ``read_analysis_script_result`` reads it, with what the script printed.
+* ``stage_analysis_result`` is the deciding step: it parks one script's
+  report as the run's pending entry — where a human approves it in the eLab
+  tab exactly as a recipe's — and ``save_analysis_script_as_recipe`` keeps a
+  script that proved its worth as an ordinary recipe
+  (``i2as.analysis.scripts.ScriptRecipe``).
+
+Those five are the ``analysis`` **Action class**: an ``analyst`` role is
+granted them and nothing that touches the station, so an agent can be
+trusted to analyse without being trusted to measure. Every one declares
+``recorded``, so the **Agent feed** carries the call, the digest of the code
+written and the run analysed. The other four — listing recipes, reading one,
+reading a report and reading a script's result — change nothing and are
+``read``.
 
 **Two tools reach the ELN track**, and they divide exactly where the money
 and the authority divide. ``draft_eln_entry`` renders one finished run's
@@ -162,7 +178,17 @@ MAX_RECIPE_BYTES = 200_000
 #: it in every line. The file itself is the record of the text.
 FEED_DIGESTED_ARGS: dict[str, tuple[str, ...]] = {
     "write_analysis_recipe": ("source",),
+    "run_analysis_script": ("source",),
 }
+
+#: The most of a script's captured output ``read_analysis_script_result``
+#: returns — the tail, since the last lines printed are the ones that say how
+#: it ended.
+MAX_SCRIPT_OUTPUT_CHARS = 8_000
+
+#: The longest ``name`` an analysis script may be given; it becomes the front
+#: of the script's id and of a folder name.
+MAX_SCRIPT_NAME_CHARS = 40
 
 #: The JSON Schema type each ``ParamSpec.type`` name and each scalar
 #: annotation renders as.
@@ -984,13 +1010,14 @@ _ANALYSIS_EXPERIMENT: dict[str, Any] = {
 
 #: The session tools, in the order a client meets them: the live picture, the
 #: stored runs, the "may I run this?" question, the two audit trails, the two
-#: that reach the notebook, a probe run, and the five that read, write and run
-#: the **Analysis recipe**s an experiment is analysed with. Every one is
-#: ``read`` except ``probe_run``, which dispatches a real (if cheap) run and is
-#: classified as the run control it is; ``publish_eln_entry``, which puts a
-#: permanent record into the outside world; and ``write_analysis_recipe`` /
-#: ``run_analysis``, which put code on the measurement machine and start the
-#: process that executes it.
+#: that reach the notebook, a probe run, the five that read, write and run the
+#: **Analysis recipe**s an experiment is analysed with, and the four that
+#: explore a run with **analysis scripts** and keep what they found. Every one
+#: is ``read`` except ``probe_run``, which dispatches a real (if cheap) run and
+#: is classified as the run control it is; ``publish_eln_entry``, which puts a
+#: permanent record into the outside world (``run_control``); and the five
+#: that put analysis code on the measurement machine, run it or park its
+#: result (``analysis``).
 SESSION_TOOLS: tuple[ToolSpec, ...] = (
     _read_tool(
         "read_status",
@@ -1273,7 +1300,8 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "is not a plain Python identifier (rule 'invalid_name'), a source "
             "that does not compile ('syntax_error', with the line), a source "
             "over 200 kB ('too_large'), and an existing file unless overwrite "
-            "is true ('exists')."
+            "is true ('exists'). To keep an analysis script you already ran, "
+            "save_analysis_script_as_recipe does this for you."
         ),
         input_schema={
             "type": "object",
@@ -1306,7 +1334,7 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "required": ["name", "source"],
             "additionalProperties": False,
         },
-        action_class=ActionClass.RUN_CONTROL,
+        action_class=ActionClass.ANALYSIS,
         session_function="write_analysis_recipe",
         recorded=True,
     ),
@@ -1352,7 +1380,7 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "required": ["run_id"],
             "additionalProperties": False,
         },
-        action_class=ActionClass.RUN_CONTROL,
+        action_class=ActionClass.ANALYSIS,
         session_function="run_analysis",
         recorded=True,
     ),
@@ -1372,6 +1400,165 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             **_ANALYSIS_EXPERIMENT,
         },
         ("run_id",),
+    ),
+    ToolSpec(
+        name="run_analysis_script",
+        description=(
+            "Explore one recorded run with an analysis SCRIPT: plain Python "
+            "run once, in the analysis worker — a separate process started in "
+            "the configured analysis sandbox, which holds the run's data file "
+            "and reaches no instrument. The script is executed with these "
+            "names bound: 'run' (the run: n_points, list_columns(), "
+            "read_slice(column), summary_stats(column), read_metadata(), "
+            "read_image(column, index)), 'context' (pyplot(), manifest, "
+            "options, output_dir), 'report' (summary(text), value(name, value, "
+            "unit, uncertainty, note), figure(name, fig, caption), "
+            "table(caption, columns, rows), tag(text), warn(text)), "
+            "'manifest', 'options' and 'np' (numpy); whatever it prints is "
+            "captured. The script is written into the run's own "
+            "scripts/<script_id> folder, stamped with who wrote it, and the "
+            "worker is STARTED — this returns before it finishes, so read the "
+            "answer with read_analysis_script_result. Nothing reaches the "
+            "notebook: stage_analysis_result does that, for a human to "
+            "approve. Refused for a name that is not a plain identifier "
+            "('invalid_name'), a source that does not compile "
+            "('syntax_error'), one over 200 kB ('too_large'), and when "
+            "nothing could be started ('not_started')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "The recorded run to analyse.",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "The script's whole text. Capped at 200 kB.",
+                },
+                "name": {
+                    "type": "string",
+                    "default": "script",
+                    "description": (
+                        "A short plain-identifier label for the script, e.g. "
+                        "'mr_fit'. The script id is this label plus a UTC "
+                        "timestamp."
+                    ),
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Options passed to the script as 'options', as scalars.",
+                    "additionalProperties": {
+                        "type": ["string", "number", "integer", "boolean", "null"]
+                    },
+                },
+                **_ANALYSIS_EXPERIMENT,
+            },
+            "required": ["run_id", "source"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.ANALYSIS,
+        session_function="run_analysis_script",
+        recorded=True,
+    ),
+    _read_tool(
+        "read_analysis_script_result",
+        "The result of one analysis script run with run_analysis_script: its "
+        "report (summary, derived values, figures, tables, warnings, and — "
+        "when it failed — the error with its traceback), the tail of what it "
+        "printed, the absolute paths of the figures it saved and the script's "
+        "folder. Answers {'status': 'running'} while the worker is still on "
+        "it and {'status': 'none'} when no such script has a result.",
+        {
+            "run_id": {"type": "string", "description": "The run the script analysed."},
+            "script_id": {
+                "type": "string",
+                "description": "The script id run_analysis_script returned.",
+            },
+            **_ANALYSIS_EXPERIMENT,
+        },
+        ("run_id", "script_id"),
+    ),
+    ToolSpec(
+        name="stage_analysis_result",
+        description=(
+            "Decide what goes to the notebook: park one analysis script's "
+            "report as the run's PENDING notebook entry — its prose, values, "
+            "tables, and its figures as attachments. It publishes nothing: a "
+            "human approves or discards it in the eLab tab, exactly as a "
+            "recipe's entry, and it replaces whatever entry was pending on "
+            "that run. The run must belong to the OPEN experiment. Refused "
+            "for a script with no result ('no_result'), a failed one "
+            "('failed_report'), and when nothing could be parked "
+            "('not_parked')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The run, in the open experiment."},
+                "script_id": {
+                    "type": "string",
+                    "description": "The script whose report to park.",
+                },
+            },
+            "required": ["run_id", "script_id"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.ANALYSIS,
+        session_function="stage_analysis_result",
+        recorded=True,
+    ),
+    ToolSpec(
+        name="save_analysis_script_as_recipe",
+        description=(
+            "Keep an analysis script that proved its worth: write it into "
+            "this experiment's analysis/recipes folder as an ordinary recipe "
+            "(a ScriptRecipe whose SCRIPT is the script's text, unchanged), "
+            "so it is listed by list_analysis_recipes, reviewed in the eLab "
+            "tab, and run by run_analysis — or automatically on every run of "
+            "the procedures it declares, when analysis is on. Stamped with "
+            "who saved it and when. Refused for a name that is not a plain "
+            "identifier ('invalid_name'), an existing recipe unless overwrite "
+            "is true ('exists'), and a script id with no script "
+            "('unknown_script')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The run the script analysed."},
+                "script_id": {"type": "string", "description": "The script to keep."},
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "The recipe's name: a plain Python identifier that "
+                        "does not start with '_'."
+                    ),
+                },
+                "procedures": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Procedure class names the recipe serves, e.g. "
+                        "['FieldSweep']; omit for every procedure."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One line saying what the recipe does.",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Replace an existing recipe of this name.",
+                },
+                **_ANALYSIS_EXPERIMENT,
+            },
+            "required": ["run_id", "script_id", "name"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.ANALYSIS,
+        session_function="save_analysis_script_as_recipe",
+        recorded=True,
     ),
 )
 
@@ -1514,13 +1701,15 @@ class ToolContext:
             (``export_draft(run_id, draft)``), duck-typed so this package
             imports neither it nor the Qt object that owns its drain timer.
             ``None`` means nothing can be published from here.
-        analysis_runner: The **Analysis runner** ``run_analysis`` starts and
-            ``read_analysis_report`` asks whether a run is still being
-            analysed — duck-typed on ``start(run_id, recipe=..., options=...)``,
-            ``is_running(run_id)`` and ``recipe_dirs()``, so this package
-            imports neither it nor the Qt object that owns its worker
-            process. ``None`` means nothing can be analysed from here, and
-            the two tools that need it are refused by name.
+        analysis_runner: The **Analysis runner** ``run_analysis`` and
+            ``run_analysis_script`` start and the read tools ask whether an
+            analysis is still in flight — duck-typed on
+            ``start(run_id, recipe=..., options=...)``,
+            ``start_script(run_id, script_id, script_path, options=...)``,
+            ``is_running(run_id, script_id="")`` and ``recipe_dirs()``, so
+            this package imports neither it nor the Qt object that owns its
+            worker process. ``None`` means nothing can be analysed from here,
+            and the tools that need it are refused by name.
         actor: The ``Actor`` of the connection calling the tool — the same one
             it stamps on every ``Command`` — set by the ``Gateway`` from its
             own identity, so a tool that leaves something behind on disk can
@@ -2743,18 +2932,49 @@ def _tool_write_analysis_recipe(args: Mapping[str, Any], context: ToolContext) -
     experiment_id = context.experiment_id(tool_name, str(args.get("experiment_id", "")))
     name = str(args["name"])
     source = str(args["source"])
+    _check_code(tool_name, "recipe", name, source)
+    return _write_recipe_file(
+        context, tool_name, experiment_id, name, source, bool(args.get("overwrite", False))
+    )
 
+
+def _check_identifier(kind: str, name: str) -> None:
+    """Refuse a name that cannot be a module, a file stem and a folder name.
+
+    Args:
+        kind: ``"recipe"`` or ``"script"``, for the message.
+        name: The name to check.
+
+    Raises:
+        ToolError: ``invalid_name``, when it is not a plain Python identifier
+            or starts with an underscore.
+    """
     if not name.isidentifier() or name.startswith("_"):
         raise ToolError(
-            f"{name!r} is not a usable recipe name: it must be a plain Python "
+            f"{name!r} is not a usable {kind} name: it must be a plain Python "
             f"identifier that does not start with an underscore",
             {"rule": "invalid_name", "name": name},
         )
+
+
+def _check_code(tool_name: str, kind: str, name: str, source: str) -> None:
+    """Refuse analysis code that is badly named, too large to review, or does not compile.
+
+    Args:
+        tool_name: The tool asking, for the compile filename.
+        kind: ``"recipe"`` or ``"script"``, for the messages.
+        name: The code's name.
+        source: Its text.
+
+    Raises:
+        ToolError: ``invalid_name``, ``too_large`` or ``syntax_error``.
+    """
+    _check_identifier(kind, name)
     size = len(source.encode("utf-8"))
     if size > MAX_RECIPE_BYTES:
         raise ToolError(
-            f"the recipe {name!r} is {size} bytes, over the "
-            f"{MAX_RECIPE_BYTES}-byte limit a reviewable recipe is held to",
+            f"the {kind} {name!r} is {size} bytes, over the "
+            f"{MAX_RECIPE_BYTES}-byte limit reviewable analysis code is held to",
             {"rule": "too_large", "name": name, "bytes": size,
              "limit": MAX_RECIPE_BYTES},
         )
@@ -2762,7 +2982,7 @@ def _tool_write_analysis_recipe(args: Mapping[str, Any], context: ToolContext) -
         compile(source, f"<{name}.py>", "exec")
     except SyntaxError as error:
         raise ToolError(
-            f"the recipe {name!r} does not compile: {error.msg} "
+            f"the {kind} {name!r} does not compile: {error.msg} "
             f"(line {error.lineno})",
             {
                 "rule": "syntax_error",
@@ -2772,24 +2992,63 @@ def _tool_write_analysis_recipe(args: Mapping[str, Any], context: ToolContext) -
             },
         ) from error
 
-    recipes_dir = _store_directory(context, tool_name, "recipes_dir", experiment_id)
-    path = recipes_dir / f"{name}.py"
-    if path.exists() and not bool(args.get("overwrite", False)):
-        raise ToolError(
-            f"the recipe {name!r} already exists at {path}; call it again with "
-            f"overwrite true to replace it",
-            {"rule": "exists", "name": name, "path": str(path)},
-        )
 
+def _stamp_header(context: ToolContext, tool_name: str) -> str:
+    """Return the comment header every analysis file written by a tool starts with.
+
+    Args:
+        context: The tool context, carrying the actor.
+        tool_name: The tool writing the file.
+
+    Returns:
+        Three comment lines naming who wrote it, via which tool, when, and
+        where it will run.
+    """
     stamped_at = datetime.now(timezone.utc).isoformat()
-    header = (
+    return (
         f"# Written by {_actor_stamp(context)} via {tool_name} at {stamped_at}\n"
         f"# The analysis worker executes this file in its own process; it is "
         f"visible\n"
         f"# in the eLab tab, and recorded in the agent feed, before anybody "
         f"runs it.\n\n"
     )
-    content = header + source
+
+
+def _write_recipe_file(
+    context: ToolContext,
+    tool_name: str,
+    experiment_id: str,
+    name: str,
+    source: str,
+    overwrite: bool,
+) -> dict[str, Any]:
+    """Write one stamped recipe into an experiment's ``analysis/recipes`` folder.
+
+    Args:
+        context: The tool context.
+        tool_name: The tool writing it.
+        experiment_id: The experiment whose folder it goes into.
+        name: The recipe's name, already checked.
+        source: Its text, already checked.
+        overwrite: Whether an existing file may be replaced.
+
+    Returns:
+        ``{"name", "path", "bytes", "digest"}`` — the digest is of the file as
+        written, header included, which is the digest a ``RecipeInfo`` for it
+        will carry.
+
+    Raises:
+        ToolError: ``exists`` or ``unwritable_recipe``.
+    """
+    recipes_dir = _store_directory(context, tool_name, "recipes_dir", experiment_id)
+    path = recipes_dir / f"{name}.py"
+    if path.exists() and not overwrite:
+        raise ToolError(
+            f"the recipe {name!r} already exists at {path}; call it again with "
+            f"overwrite true to replace it",
+            {"rule": "exists", "name": name, "path": str(path)},
+        )
+    content = _stamp_header(context, tool_name) + source
     try:
         recipes_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -2903,6 +3162,281 @@ def _tool_read_analysis_report(args: Mapping[str, Any], context: ToolContext) ->
     return report
 
 
+def _script_folder(
+    context: ToolContext, tool_name: str, experiment_id: str, run_id: str, script_id: str
+) -> Path:
+    """Return one analysis script's folder, refusing an id that is not a plain name.
+
+    Args:
+        context: The tool context.
+        tool_name: The tool asking.
+        experiment_id: The experiment.
+        run_id: The run the script analysed.
+        script_id: The script's id — never a path.
+
+    Returns:
+        The folder, as the store lays it out.
+
+    Raises:
+        ToolError: ``unknown_script`` for an id that could name a path.
+    """
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", script_id):
+        raise ToolError(
+            f"{script_id!r} is not a script id run_analysis_script returned",
+            {"rule": "unknown_script", "script_id": script_id},
+        )
+    return _store_directory(context, tool_name, "script_dir", experiment_id, run_id, script_id)
+
+
+def _tool_run_analysis_script(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``run_analysis_script``: write one script and start the worker on it.
+
+    Args:
+        args: The call's arguments — the run, the source, optionally a name,
+            options and the experiment.
+        context: The tool context.
+
+    Returns:
+        ``{"run_id", "script_id", "started", "script_path", "result_path"}``.
+
+    Raises:
+        ToolError: If the run is unknown, the script is refused, no runner was
+            wired in, or nothing was started.
+    """
+    tool_name = "run_analysis_script"
+    experiment_id, _record, run = _run_record(context, tool_name, args)
+    runner = context.require_analysis_runner(tool_name)
+    label = str(args.get("name") or "script")
+    source = str(args["source"])
+    _check_code(tool_name, "script", label, source)
+    if len(label) > MAX_SCRIPT_NAME_CHARS:
+        raise ToolError(
+            f"the script name {label!r} is longer than {MAX_SCRIPT_NAME_CHARS} characters",
+            {"rule": "invalid_name", "name": label},
+        )
+    script_id = f"{label}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
+    folder = _script_folder(context, tool_name, experiment_id, run.run_id, script_id)
+    path = folder / f"{script_id}.py"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path.write_text(_stamp_header(context, tool_name) + source, encoding="utf-8")
+    except OSError as error:
+        raise ToolError(
+            f"the script could not be written to {path}: {error}",
+            {"rule": "unwritable_script", "path": str(path)},
+        ) from error
+    started = str(
+        runner.start_script(
+            run.run_id, script_id, str(path), options=dict(args.get("options") or {})
+        )
+        or ""
+    )
+    if not started:
+        raise ToolError(
+            f"nothing was started for run {run.run_id!r}: no experiment is "
+            f"open, the run is not known to the runner, it wrote no data file, "
+            f"or the analysis sandbox could not stage it",
+            {"rule": "not_started", "run_id": run.run_id, "script_id": script_id},
+        )
+    logger.info(
+        "analysis script %s started on run %s by %s", script_id, run.run_id, _actor_stamp(context)
+    )
+    return {
+        "run_id": run.run_id,
+        "script_id": script_id,
+        "started": True,
+        "script_path": str(path),
+        "result_path": str(folder / REPORT_FILENAME),
+    }
+
+
+def _read_script_report(path: Path, run_id: str, script_id: str) -> AnalysisReport | None:
+    """Read one script's report file, or ``None`` when there is none yet.
+
+    Args:
+        path: The report file.
+        run_id: The run, for the message.
+        script_id: The script, for the message.
+
+    Returns:
+        The report, or ``None`` when the file does not exist.
+
+    Raises:
+        ToolError: ``unreadable_report`` when it exists but cannot be read.
+    """
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ToolError(
+            f"the result of script {script_id!r} on run {run_id!r} at {path} "
+            f"cannot be read: {error}",
+            {"rule": "unreadable_report", "run_id": run_id, "script_id": script_id},
+        ) from error
+    return AnalysisReport.from_dict(payload)
+
+
+def _tool_read_analysis_script_result(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``read_analysis_script_result``.
+
+    Args:
+        args: The call's arguments — the run, the script and optionally the
+            experiment.
+        context: The tool context.
+
+    Returns:
+        The report as its dict, plus ``stdout`` (the tail), ``figure_paths``
+        and ``script_dir``; or ``{"status": "running"}`` / ``{"status":
+        "none"}``.
+
+    Raises:
+        ToolError: If the run is unknown or the result cannot be read.
+    """
+    tool_name = "read_analysis_script_result"
+    experiment_id, _record, run = _run_record(context, tool_name, args)
+    script_id = str(args["script_id"])
+    folder = _script_folder(context, tool_name, experiment_id, run.run_id, script_id)
+    runner = context.analysis_runner
+    if runner is not None and runner.is_running(run.run_id, script_id):
+        return {"status": "running", "run_id": run.run_id, "script_id": script_id}
+    report = _read_script_report(folder / REPORT_FILENAME, run.run_id, script_id)
+    if report is None:
+        return {"status": "none", "run_id": run.run_id, "script_id": script_id}
+    stdout_path = folder / _analysis_scripts_module(tool_name).STDOUT_FILENAME
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8")
+    except OSError:
+        stdout = ""
+    answer = report.to_dict()
+    answer.update(
+        {
+            "script_id": script_id,
+            "script_dir": str(folder),
+            "stdout": stdout[-MAX_SCRIPT_OUTPUT_CHARS:],
+            "stdout_truncated": len(stdout) > MAX_SCRIPT_OUTPUT_CHARS,
+            "figure_paths": [str(folder / figure.file) for figure in report.figures if figure.file],
+        }
+    )
+    return answer
+
+
+def _tool_stage_analysis_result(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``stage_analysis_result``: park one script's report for approval.
+
+    Args:
+        args: The call's arguments — the run and the script.
+        context: The tool context.
+
+    Returns:
+        ``{"run_id", "script_id", "parked", "recipe"}``.
+
+    Raises:
+        ToolError: If there is no open experiment, no such run or script
+            result, the result failed, or the publisher parked nothing.
+    """
+    tool_name = "stage_analysis_result"
+    experiment_id = context.experiment_id(tool_name)
+    _experiment_id, _record, run = _run_record(
+        context, tool_name, {"run_id": args["run_id"], "experiment_id": experiment_id}
+    )
+    script_id = str(args["script_id"])
+    publisher = context.require_publisher(tool_name)
+    folder = _script_folder(context, tool_name, experiment_id, run.run_id, script_id)
+    report = _read_script_report(folder / REPORT_FILENAME, run.run_id, script_id)
+    if report is None:
+        raise ToolError(
+            f"script {script_id!r} on run {run.run_id!r} has no result to stage; "
+            f"read_analysis_script_result says whether it is still running",
+            {"rule": "no_result", "run_id": run.run_id, "script_id": script_id},
+        )
+    if not report.ok:
+        raise ToolError(
+            f"script {script_id!r} failed, and a failed result is not a "
+            f"notebook entry: {report.error.strip().splitlines()[0] if report.error.strip() else ''}",
+            {"rule": "failed_report", "run_id": run.run_id, "script_id": script_id},
+        )
+    if not publisher.export_report(run.run_id, report, str(folder)):
+        raise ToolError(
+            f"nothing was parked for run {run.run_id!r}: it is not a run of the "
+            f"open experiment",
+            {"rule": "not_parked", "run_id": run.run_id, "script_id": script_id},
+        )
+    logger.info(
+        "analysis script %s staged for run %s by %s", script_id, run.run_id, _actor_stamp(context)
+    )
+    return {
+        "run_id": run.run_id,
+        "script_id": script_id,
+        "parked": True,
+        "recipe": report.recipe,
+    }
+
+
+def _tool_save_analysis_script_as_recipe(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``save_analysis_script_as_recipe``: keep a script as a recipe.
+
+    Args:
+        args: The call's arguments — the run, the script, the recipe's name,
+            procedures and description, whether to overwrite, and optionally
+            the experiment.
+        context: The tool context.
+
+    Returns:
+        ``{"name", "path", "bytes", "digest", "script_id"}``.
+
+    Raises:
+        ToolError: If the name is refused, the script does not exist, or the
+            recipe exists and may not be replaced.
+    """
+    tool_name = "save_analysis_script_as_recipe"
+    experiment_id, _record, run = _run_record(context, tool_name, args)
+    script_id = str(args["script_id"])
+    name = str(args["name"])
+    _check_identifier("recipe", name)
+    folder = _script_folder(context, tool_name, experiment_id, run.run_id, script_id)
+    try:
+        source = (folder / f"{script_id}.py").read_text(encoding="utf-8")
+    except OSError as error:
+        raise ToolError(
+            f"run {run.run_id!r} has no analysis script {script_id!r}",
+            {"rule": "unknown_script", "run_id": run.run_id, "script_id": script_id},
+        ) from error
+    scripts = _analysis_scripts_module(tool_name)
+    procedures = [str(item) for item in (args.get("procedures") or []) if str(item)]
+    module = scripts.render_script_recipe(
+        name, source, procedures=procedures, description=str(args.get("description") or "")
+    )
+    written = _write_recipe_file(
+        context, tool_name, experiment_id, name, module, bool(args.get("overwrite", False))
+    )
+    written["script_id"] = script_id
+    return written
+
+
+def _analysis_scripts_module(tool_name: str) -> Any:
+    """Import ``i2as.analysis.scripts``, refusing by name when it is absent.
+
+    Args:
+        tool_name: The tool asking, for the message.
+
+    Returns:
+        The module.
+
+    Raises:
+        ToolError: If the analysis package cannot be imported.
+    """
+    try:
+        from i2as.analysis import scripts
+    except ImportError as error:
+        raise ToolError(
+            f"{tool_name} needs i2as.analysis, which this installation "
+            f"does not provide: {error}",
+            {"rule": "missing_collaborator", "collaborator": "analysis"},
+        ) from error
+    return scripts
+
+
 def feed_arguments(tool: ToolSpec, args: Mapping[str, Any]) -> dict[str, Any]:
     """Render one tool call's arguments for the **Agent feed**.
 
@@ -2957,6 +3491,10 @@ SESSION_TOOL_FUNCTIONS: dict[str, Callable[[Mapping[str, Any], ToolContext], Any
     "write_analysis_recipe": _tool_write_analysis_recipe,
     "run_analysis": _tool_run_analysis,
     "read_analysis_report": _tool_read_analysis_report,
+    "run_analysis_script": _tool_run_analysis_script,
+    "read_analysis_script_result": _tool_read_analysis_script_result,
+    "stage_analysis_result": _tool_stage_analysis_result,
+    "save_analysis_script_as_recipe": _tool_save_analysis_script_as_recipe,
 }
 
 

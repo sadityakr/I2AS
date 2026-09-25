@@ -25,6 +25,20 @@ silently left with nothing waiting for its human.
 
 Both hand-offs PARK; neither publishes. Approval stays exactly where it was,
 ``ExperimentManager.approve_eln_draft()``.
+
+**An analysis script parks nothing.** ``start_script()`` runs one
+exploratory **analysis script** (``i2as.analysis.scripts``) over one run, in
+the same worker and the same queue, but writes into the script's own folder
+and announces its answer on ``script_finished`` only. Whether its result
+becomes the run's pending entry is a separate, explicit decision
+(``stage_analysis_result``), so exploring a run never replaces what a human
+is about to approve.
+
+**Where the worker runs is the sandbox's decision** (``analysis_sandbox``):
+the settings' ``analysis.sandbox`` names a backend, which stages the spec's
+inputs when the analysis is started and plans the worker's program,
+environment and working directory when it is launched. A backend that
+cannot run the worker is a ``failed`` report naming why.
 """
 
 from __future__ import annotations
@@ -37,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QObject, QProcess, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
 from i2as.analysis.report import (
     REPORT_FAILED,
@@ -45,6 +59,12 @@ from i2as.analysis.report import (
     SPEC_FILENAME,
     AnalysisReport,
     AnalysisSpec,
+)
+from i2as.session.analysis_sandbox import (
+    AnalysisSandbox,
+    LaunchPlan,
+    SandboxError,
+    build_sandbox,
 )
 from i2as.session.eln.drafting import manifest_from_run
 from i2as.session.eln.settings import ElnSettings
@@ -68,12 +88,18 @@ class _Request:
             choice — carried so a synthesized failure can still say it.
         spec_path: The ``spec.json`` the worker is started with.
         output_dir: Where the worker writes its report and figures.
+        sandbox: The backend that staged this analysis's inputs and will
+            launch its worker.
+        script_id: The **analysis script** this request runs, or ``""`` for a
+            recipe analysis. A script's report is never parked.
     """
 
     run_id: str
     recipe: str
     spec_path: Path
     output_dir: Path
+    sandbox: AnalysisSandbox
+    script_id: str = ""
 
 
 class AnalysisRunner(QObject):
@@ -86,11 +112,16 @@ class AnalysisRunner(QObject):
         analysis_failed (str, str): The run id and the failure text, for every
             other ending — a raising recipe, a timeout, a missing report, a
             cancellation.
+        script_finished (str, str, dict): The run id, the script id and the
+            report as its JSON dict, for EVERY ending of an analysis script —
+            ok or failed. The three signals above are never emitted for a
+            script, so the eLab tab only ever hears about the run's recipe.
     """
 
     analysis_started = pyqtSignal(str)
     analysis_finished = pyqtSignal(str, dict)
     analysis_failed = pyqtSignal(str, str)
+    script_finished = pyqtSignal(str, str, dict)
 
     def __init__(
         self,
@@ -113,9 +144,10 @@ class AnalysisRunner(QObject):
             settings_source: Called for the current ``ElnSettings`` at the
                 moment each analysis starts, so a settings change reaches the
                 next run without re-wiring anything.
-            python: The interpreter the worker is started with. Defaults to
-                the running one, which is what makes the worker see the same
-                installed I2AS.
+            python: The interpreter the ``local`` sandbox starts the worker
+                with. Defaults to the running one, which is what makes the
+                worker see the same installed I2AS; the ``venv`` sandbox uses
+                its own configured interpreter instead.
             parent: Qt parent, if any.
         """
         super().__init__(parent)
@@ -135,19 +167,27 @@ class AnalysisRunner(QObject):
     # Read surface
     # ------------------------------------------------------------------
 
-    def is_running(self, run_id: str = "") -> bool:
+    def is_running(self, run_id: str = "", script_id: str = "") -> bool:
         """Whether an analysis is in flight.
 
         Args:
-            run_id: Ask about one run. ``""`` asks about any.
+            run_id: Ask about one run. ``""`` asks about any analysis at all.
+            script_id: With a ``run_id``, ask about one analysis script of it;
+                ``""`` asks about the run's RECIPE analysis, which is what
+                every caller that predates scripts means.
 
         Returns:
             ``True`` while a worker is running or a request is queued behind
             one — from the caller's side both mean "the answer is not here
             yet".
         """
-        in_flight = [request.run_id for request in self._pending()]
-        return bool(run_id in in_flight if run_id else in_flight)
+        pending = self._pending()
+        if not run_id:
+            return bool(pending)
+        return any(
+            request.run_id == run_id and request.script_id == script_id
+            for request in pending
+        )
 
     def recipe_dirs(self) -> list[str]:
         """Return the extra recipe directories discovery should search.
@@ -196,6 +236,71 @@ class AnalysisRunner(QObject):
             could not be started: no experiment open, no such run, or no data
             file to read (all logged, never raised).
         """
+        return self._enqueue(
+            run_id, manifest=manifest, data_path=data_path, recipe=recipe, options=options
+        )
+
+    def start_script(
+        self,
+        run_id: str,
+        script_id: str,
+        script_path: str | Path,
+        options: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Run one **analysis script** over one recorded run, later. Never raises.
+
+        The script's folder (``script_path``'s parent) is its output folder:
+        its spec, report, figures and captured output are written there, and
+        the answer arrives on ``script_finished``. Nothing is parked.
+
+        Args:
+            run_id: The run to analyse, in the open experiment.
+            script_id: The script's id — the key ``is_running()`` and
+                ``script_finished`` use.
+            script_path: The script file, already written into its folder.
+            options: Free-form options, passed through to the script.
+
+        Returns:
+            The script's output folder as a string, or ``""`` when nothing
+            could be started (logged, never raised).
+        """
+        path = Path(script_path)
+        return self._enqueue(
+            run_id,
+            options=options,
+            script_id=script_id,
+            script_path=path,
+            output_dir=path.parent,
+        )
+
+    def _enqueue(
+        self,
+        run_id: str,
+        *,
+        manifest: Mapping[str, Any] | None = None,
+        data_path: str = "",
+        recipe: str = "",
+        options: Mapping[str, Any] | None = None,
+        script_id: str = "",
+        script_path: Path | None = None,
+        output_dir: Path | None = None,
+    ) -> str:
+        """Build, stage and write one spec, then queue its worker.
+
+        Args:
+            run_id: The run to analyse.
+            manifest: Fresher run facts, merged over the record's.
+            data_path: The run's data file, or ``""`` to resolve it.
+            recipe: The recipe name, or ``""``.
+            options: Options passed through.
+            script_id: The script's id, or ``""`` for a recipe analysis.
+            script_path: The script file, for a script analysis.
+            output_dir: Where the worker writes; ``None`` for the run's
+                report directory.
+
+        Returns:
+            The output folder as a string, or ``""`` when nothing was queued.
+        """
         experiment = self._manager.current_experiment()
         if experiment is None:
             logger.warning("No experiment is open — run %r cannot be analysed", run_id)
@@ -211,8 +316,12 @@ class AnalysisRunner(QObject):
 
         settings = self._settings_source()
         facts = {**manifest_from_run(run), **dict(manifest or {})}
-        chosen = recipe or settings.analysis.recipes.get(str(facts.get("procedure", "")), "")
-        output_dir = self._manager.store.report_dir(experiment.experiment_id, run_id)
+        chosen = "" if script_path is not None else (
+            recipe or settings.analysis.recipes.get(str(facts.get("procedure", "")), "")
+        )
+        if output_dir is None:
+            output_dir = self._manager.store.report_dir(experiment.experiment_id, run_id)
+        sandbox = build_sandbox(settings.analysis.sandbox, default_python=self._python)
         spec = AnalysisSpec(
             run_id=run_id,
             data_path=resolved,
@@ -225,22 +334,31 @@ class AnalysisRunner(QObject):
             options=dict(options or {}),
             include_fact_tables=settings.analysis.include_fact_tables,
             attach_data_file=settings.analysis.attach_data_file,
+            script_path=str(script_path) if script_path is not None else "",
         )
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             # A stale report from an earlier analysis of this run must never be
             # mistaken for this one's answer.
             (output_dir / REPORT_FILENAME).unlink(missing_ok=True)
+            spec = sandbox.prepare(spec)
             spec_path = output_dir / SPEC_FILENAME
             spec_path.write_text(
                 json.dumps(spec.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
             )
-        except OSError as exc:
-            logger.error("Could not write the analysis spec for run %s: %s", run_id, exc)
+        except (OSError, SandboxError) as exc:
+            logger.error("Could not prepare the analysis of run %s: %s", run_id, exc)
             return ""
 
         self._queue.append(
-            _Request(run_id=run_id, recipe=chosen, spec_path=spec_path, output_dir=output_dir)
+            _Request(
+                run_id=run_id,
+                recipe=chosen,
+                spec_path=spec_path,
+                output_dir=output_dir,
+                sandbox=sandbox,
+                script_id=script_id,
+            )
         )
         self._start_next()
         return str(output_dir)
@@ -277,10 +395,28 @@ class AnalysisRunner(QObject):
         return ([self._active] if self._active is not None else []) + list(self._queue)
 
     def _start_next(self) -> None:
-        """Launch the next queued worker, unless one is already running."""
-        if self._active is not None or not self._queue:
-            return
-        request = self._queue.pop(0)
+        """Launch the next queued worker, unless one is already running.
+
+        A request whose sandbox cannot plan a launch is finished at once with
+        a failed report naming why, and the next one is tried.
+        """
+        while self._active is None and self._queue:
+            request = self._queue.pop(0)
+            try:
+                plan = request.sandbox.launch(request.spec_path)
+            except SandboxError as exc:
+                logger.error("Analysis of run %s cannot start: %s", request.run_id, exc)
+                self._finish(request, self._failed_report(request, str(exc)))
+                continue
+            self._launch(request, plan)
+
+    def _launch(self, request: _Request, plan: LaunchPlan) -> None:
+        """Start one worker as its sandbox planned it.
+
+        Args:
+            request: The analysis to start.
+            plan: The sandbox's ``LaunchPlan``.
+        """
         self._active = request
         self._failure = ""
         process = QProcess(self)
@@ -289,17 +425,24 @@ class AnalysisRunner(QObject):
         self._process = process
         timeout_s = max(float(self._settings_source().analysis.timeout_s), 1.0)
         self._timer.start(int(timeout_s * 1000))
+        if plan.environment is not None:
+            environment = QProcessEnvironment()
+            for name, value in plan.environment.items():
+                environment.insert(name, value)
+            process.setProcessEnvironment(environment)
+        if plan.working_directory:
+            process.setWorkingDirectory(plan.working_directory)
         logger.info(
-            "Analysing run %s with recipe %s (timeout %.0f s)",
+            "Analysing run %s with %s (timeout %.0f s, sandbox %s)",
             request.run_id,
-            request.recipe or "(discovered)",
+            f"script {request.script_id}" if request.script_id
+            else f"recipe {request.recipe or '(discovered)'}",
             timeout_s,
+            plan.backend,
         )
-        process.start(
-            self._python,
-            ["-m", "i2as.analysis", "run", "--spec", str(request.spec_path)],
-        )
-        self.analysis_started.emit(request.run_id)
+        process.start(plan.program, list(plan.arguments))
+        if not request.script_id:
+            self.analysis_started.emit(request.run_id)
 
     def _kill(self) -> None:
         """Kill the running worker, if there is one. Never waits."""
@@ -361,10 +504,16 @@ class AnalysisRunner(QObject):
     def _finish(self, request: _Request, report: AnalysisReport) -> None:
         """Hand one finished analysis to the publisher and announce it.
 
+        A script's report is announced on ``script_finished`` and nothing
+        else: it is never parked.
+
         Args:
             request: The analysis that ended.
             report: Its report — real or synthesized.
         """
+        if request.script_id:
+            self.script_finished.emit(request.run_id, request.script_id, report.to_dict())
+            return
         if report.ok:
             self._call_publisher(
                 "export_report", request.run_id, report, str(request.output_dir)

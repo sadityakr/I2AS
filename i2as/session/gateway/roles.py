@@ -9,16 +9,17 @@ adding a row to a table, never by writing a branch.
 
 The matrix:
 
-===============  ==========  ====================  =========  ===============
-Action class     observer    debug                 session    operator (human)
-===============  ==========  ====================  =========  ===============
-read             permitted   permitted             permitted  permitted
-recovery         refused     unattended only       permitted  permitted
-run_control      refused     refused               permitted  permitted
-envelope         refused     refused               refused    permitted
-===============  ==========  ====================  =========  ===============
+===============  ==========  ==========  ====================  =========  ===============
+Action class     observer    analyst     debug                 session    operator (human)
+===============  ==========  ==========  ====================  =========  ===============
+read             permitted   permitted   permitted             permitted  permitted
+recovery         refused     refused     unattended only       permitted  permitted
+run_control      refused     refused     refused               permitted  permitted
+envelope         refused     refused     refused               refused    permitted
+analysis         refused     permitted   refused               permitted  permitted
+===============  ==========  ==========  ====================  =========  ===============
 
-Four properties of that table are the design, not incidental:
+Five properties of that table are the design, not incidental:
 
 * **The human column is not in it.** ``authorize()`` returns ``None`` for
   any actor that is not an ``agent``: the operator's authority comes from
@@ -35,6 +36,14 @@ Four properties of that table are the design, not incidental:
   present a debug agent diagnoses and REPORTS; the human decides. Enforced
   here from the value ``Orchestrator.set_attendance()`` published, never
   left to an agent's self-restraint.
+* **Analysis is not a rung on the way to control.** ``analyst`` may write
+  and run analysis code over finished runs and park what it produced for a
+  human, and may do NOTHING to the station. It is not above ``observer`` on a
+  ladder that leads to ``session``: it is beside ``debug``, and neither is
+  within the other. That is what lets an embedded analysis agent, or an MCP
+  client connected only to analyse, be handed exactly the authority its job
+  needs — the refusal of a ``run_procedure`` comes from this table, not from
+  the agent's good behaviour.
 * **Emergency standby is outside the table.** ``authorize()`` permits it to
   every role, in every state, at every kill-switch setting, before the
   matrix is consulted. An actor that can see a problem must never be unable
@@ -105,11 +114,15 @@ class Role(str, Enum):
         OBSERVER: Reads the system and changes nothing.
         DEBUG: Reads, and — only while the experiment is UNATTENDED — takes
             recovery actions to keep a run alive.
+        ANALYST: Reads, and analyses finished runs — writes and runs
+            analysis code in the analysis worker and parks its results for a
+            human — but takes no action on the station at all.
         SESSION: Runs the experiment: recovery and run control both, within
             the session envelope the human set.
     """
 
     OBSERVER = "observer"
+    ANALYST = "analyst"
     DEBUG = "debug"
     SESSION = "session"
 
@@ -135,23 +148,33 @@ class Permission(str, Enum):
 PERMISSION_MATRIX: dict[ActionClass, dict[Role, Permission]] = {
     ActionClass.READ: {
         Role.OBSERVER: Permission.PERMITTED,
+        Role.ANALYST: Permission.PERMITTED,
         Role.DEBUG: Permission.PERMITTED,
         Role.SESSION: Permission.PERMITTED,
     },
     ActionClass.RECOVERY: {
         Role.OBSERVER: Permission.REFUSED,
+        Role.ANALYST: Permission.REFUSED,
         Role.DEBUG: Permission.UNATTENDED_ONLY,
         Role.SESSION: Permission.PERMITTED,
     },
     ActionClass.RUN_CONTROL: {
         Role.OBSERVER: Permission.REFUSED,
+        Role.ANALYST: Permission.REFUSED,
         Role.DEBUG: Permission.REFUSED,
         Role.SESSION: Permission.PERMITTED,
     },
     ActionClass.ENVELOPE: {
         Role.OBSERVER: Permission.REFUSED,
+        Role.ANALYST: Permission.REFUSED,
         Role.DEBUG: Permission.REFUSED,
         Role.SESSION: Permission.REFUSED,
+    },
+    ActionClass.ANALYSIS: {
+        Role.OBSERVER: Permission.REFUSED,
+        Role.ANALYST: Permission.PERMITTED,
+        Role.DEBUG: Permission.REFUSED,
+        Role.SESSION: Permission.PERMITTED,
     },
 }
 
@@ -373,11 +396,13 @@ def _ownership_refusal(
     return None
 
 
-#: The roles in ascending order of authority. The matrix above is monotone
-#: along it — a role never has less than the one below it in any row — which
-#: is what makes "no more than this role" (``authorize_spooled()``'s cap) a
-#: meaningful bound rather than an arbitrary comparison.
-ROLE_LADDER: tuple[Role, ...] = (Role.OBSERVER, Role.DEBUG, Role.SESSION)
+#: Every role, in the order a role selector lists them — least authority
+#: first. It is a DISPLAY order and no longer a total order of authority:
+#: ``analyst`` and ``debug`` each grant a class the other refuses, so neither
+#: is within the other. Every "no more than this role" question (a
+#: deployment's ceiling, ``authorize_spooled()``'s cap) is therefore answered
+#: cell by cell by ``role_within_ceiling()``, never by position in this tuple.
+ROLE_LADDER: tuple[Role, ...] = (Role.OBSERVER, Role.ANALYST, Role.DEBUG, Role.SESSION)
 
 
 def _outranks(role: Role, cap: Role) -> bool:
@@ -388,9 +413,10 @@ def _outranks(role: Role, cap: Role) -> bool:
         cap: The most authority that may be granted.
 
     Returns:
-        ``True`` when *role* sits above *cap* on ``ROLE_LADDER``.
+        ``True`` when *role* grants, in any row of ``PERMISSION_MATRIX``, more
+        than *cap* does — the ceiling standard's own cell-by-cell reading.
     """
-    return ROLE_LADDER.index(role) > ROLE_LADDER.index(cap)
+    return not role_within_ceiling(role, cap)
 
 
 def authorize_spooled(

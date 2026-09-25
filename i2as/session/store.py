@@ -18,7 +18,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from i2as.analysis.report import RECIPES_DIRNAME
+from i2as.analysis.report import RECIPES_DIRNAME, SCRIPTS_DIRNAME
 from i2as.session.models import SCHEMA_VERSION, ExperimentRecord, Session, User
 
 logger = logging.getLogger(__name__)
@@ -278,6 +278,25 @@ class ExperimentStore:
             ``<root>/<experiment_id>/analysis/<run_id>`` (may not exist yet).
         """
         return self.analysis_dir(experiment_id) / run_id
+
+    def script_dir(self, experiment_id: str, run_id: str, script_id: str) -> Path:
+        """Return where one **analysis script** run over one run lives.
+
+        One folder per script: the script itself, its spec, its report, its
+        figures and what it printed. Kept apart from the run's own
+        ``report.json`` so exploring a run never replaces the analysed entry
+        its recipe produced.
+
+        Args:
+            experiment_id: The store key.
+            run_id: The run the script analysed.
+            script_id: The script's id.
+
+        Returns:
+            ``<root>/<experiment_id>/analysis/<run_id>/scripts/<script_id>``
+            (may not exist yet).
+        """
+        return self.report_dir(experiment_id, run_id) / SCRIPTS_DIRNAME / script_id
 
     def relativize_data_file(self, experiment_id: str, path: str | Path) -> str:
         """Return ``path`` relative to the experiment's session folder, when inside it.

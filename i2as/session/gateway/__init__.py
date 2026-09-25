@@ -16,6 +16,7 @@ vocabulary.
 from i2as.session.gateway.action_classes import (
     COMMAND_ACTION_CLASSES,
     LIFECYCLE_ACTION_CLASSES,
+    SESSION_ONLY_ACTION_CLASSES,
     ActionClass,
     ClassifiedAction,
     UnclassifiedActionError,
@@ -59,6 +60,7 @@ __all__ = [
     "UnclassifiedActionError",
     "COMMAND_ACTION_CLASSES",
     "LIFECYCLE_ACTION_CLASSES",
+    "SESSION_ONLY_ACTION_CLASSES",
     "classify_command",
     "classify_control",
     "Role",
