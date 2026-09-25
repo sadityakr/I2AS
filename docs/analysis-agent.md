@@ -1,8 +1,9 @@
 # An analysis agent for I2AS
 
 Status: **milestone 1 implemented** (the analyst role, sandboxed scripts, the
-tool surface and the magnetoresistance recipe). The embedded agent host and
-the Analyst tab (milestones 2 and 3) are designed here and not built yet.
+tool surface and the magnetoresistance recipe). The embedded agent host
+(milestone 2) is designed here, and the Analysis screen (milestone 3) is
+planned here; neither is built yet.
 
 ## The problem
 
@@ -214,7 +215,8 @@ gateway:
 - There are **two triggers**. First, automatically: `ElnPublisher`'s
   `analysis_requested` for a procedure in `auto_procedures` starts a session
   whose instruction is "analyse run X and stage what belongs in the notebook".
-  Second, on demand: the operator types an instruction in the Analyst tab.
+  Second, on demand: the operator types an instruction in the Analysis
+  screen's "Ask the analyst…" box.
 - Every tool call is already recorded in the agent feed by the gateway. The
   loop also writes its transcript (the model's text between calls) to
   `<analysis>/<run>/analyst/<session>.jsonl`, so why it staged what it staged
@@ -223,23 +225,115 @@ gateway:
 The agent never publishes. It stages, and the human approves in the eLab tab,
 exactly as today.
 
-## Milestone 3: where it is visible in the GUI (designed, not built)
+## Milestone 3: the Analysis screen (planned)
 
-- **The "Analyst" tab**, next to "Queue" and "eLab" in the procedure
-  window's top-right quadrant (`procedure_window._build_queue_quadrant`). It
-  has a run picker, an instruction box with Run and Stop, a live list of the
-  session's tool calls and results read from the agent feed, figure
-  thumbnails from `read_analysis_script_result`'s `figure_paths`, and a
-  running count of turns and cost. A "Save as recipe" button calls
-  `save_analysis_script_as_recipe` for the selected script.
-- **The "eLab" tab** is unchanged in behaviour. Its pending entry already
-  shows the recipe that produced it, and an entry staged from a script is
-  labelled `script:<id>`.
-- **Settings**: the notebook settings dialog gets an "Analysis agent" section
-  (endpoint, model, key variable, budgets, automatic procedures) and a
-  "Sandbox" section (backend, interpreter, staging).
-- **Connections dialog**: `analyst` already appears in the role selector,
-  because the selector is drawn from `ROLE_LADDER`.
+### What is visible today, and why it is not enough
+
+| Where | Shows | Misses |
+|---|---|---|
+| eLab tab (Procedure window, top-right, beside Queue) | Recipe choice, "Run analysis", preview of the one pending entry, Publish/Discard | Every script an agent ran; anything earlier than the latest report |
+| Agents panel (Monitor window) | Agent commands and verdicts, from the engine's event stream | Analysis tool calls: they are written to `agent_actions.jsonl` and the panel reads that file only when it opens, so they never appear live |
+| `analysis/<run>/scripts/<id>/` on disk | Each script, its report, figures and printed output | Nothing in the GUI reads it |
+
+So an operator cannot currently watch what an agent is analysing, or look
+back afterwards at what it tried. The Analysis screen fixes that. Because
+the GUI never keeps its own copy of the truth, the data layer comes first.
+
+### Layer 1: a record of every analysis step (no GUI)
+
+1. **The analysis journal** (`session/analysis_journal.py`) is one
+   append-only `analysis/<run_id>/journal.jsonl` per run, with the same record
+   rules as the agent feed (`schema`, `ts`, `seq`, every key always present).
+   One line per step:
+
+   | `step` | Written by | Points at |
+   |---|---|---|
+   | `recipe_started` / `recipe_finished` | `AnalysisRunner` | `report.json`, recipe name and digest |
+   | `script_started` / `script_finished` | `run_analysis_script`, `AnalysisRunner` | `scripts/<id>/`: code, report, stdout |
+   | `note` | `annotate_analysis` | the text, optionally a `script_id` |
+   | `staged` | `stage_analysis_result` | the `script_id` whose report was parked |
+   | `saved_as_recipe` | `save_analysis_script_as_recipe` | the recipe name and digest |
+   | `approved` / `discarded` | `ExperimentManager` | the pending entry's source |
+
+   Every step names its `actor` (kind, id, role). It is written by the code
+   that performs the step, never by the agent, so it cannot be skipped or
+   forged. A conformance test asserts that every `analysis`-class tool
+   writes a step.
+2. **Live listeners.** The journal calls back its listeners
+   (`add_listener(callback)`) after each append. The gateway server runs
+   inside the application process, so an MCP agent's steps reach the screen
+   live. A thin Qt adapter (`AnalysisActivity(QObject)`, signal
+   `step_recorded(run_id, dict)`) is owned by the app next to
+   `ExperimentFeeds`.
+3. **`annotate_analysis(run_id, text, script_id?)`** is a new
+   `analysis`-class tool (recorded) that lets the agent explain why, e.g.
+   "residuals are asymmetric, so I'm symmetrising for Hall pickup". The
+   embedded analyst's commentary (milestone 2) goes to the same step kind.
+4. **Plot data, not only pictures.** `ScriptReport.plot(name, series,
+   x_label, y_label, caption)` and `AnalysisContext.plot(...)` write
+   `<name>.plot.json` (a list of series: `x`, `y`, optional `yerr`, `label`,
+   `style` of `points` / `line` / `band`, and `role` of `data` / `fit` /
+   `residual`) and render the PNG from the same data. `FigureRef` gains an
+   optional `data_file`. The eLab entry still gets the PNG; the screen draws
+   the data in pyqtgraph. A figure made only with matplotlib has no
+   `data_file` and is shown as an image. `magnetoresistance` switches to
+   `plot()`.
+
+### Layer 2: the screen
+
+**The switch.** The Procedure window's central widget becomes a
+`QStackedWidget` with two pages: **Setup** (today's 2×2 grid, unchanged) and
+**Analysis**. A two-way `Setup | Analysis` toggle in the window header
+switches between them (Ctrl+1 / Ctrl+2), and the last page is remembered.
+**It never switches on its own.** New steps from an agent add to a count
+badge on "Analysis", cleared when the page is shown. A finished run's first
+recipe or agent step raises a banner: "run-0012 analysed — View".
+
+**Layout** (`gui/analysis_workspace/`, one widget per region, each
+talking only to the journal and the manager):
+
+```
+┌ Setup | Analysis (3) ────────────────────────────────────────────────┐
+│ RUNS              │ STEPS  run-0012                 │ DETAIL           │
+│ ● run-0012 ✎ 3    │ 14:02 agent  recipe magnetoresistance ✓ │ interactive plot │
+│   run-0011 ✓      │ 14:03 agent  note "residuals asymmetric"│ values table     │
+│   run-0010        │ 14:03 agent  script mr_sym ✓ ▣▣         │ code · output    │
+│ raw: x ▾  y ▾     │ 14:04 agent  staged mr_sym              │                  │
+├───────────────────┴─────────────────────────────────┴──────────────────┤
+│ eLab entry (pending): preview · Publish · Discard · Stage · Save recipe  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+| Widget | Shows | Reads from |
+|---|---|---|
+| `RunBrowser` | The open experiment's runs, badged with pending entry, published, and step count; a raw-data quick plot (x and y columns) for the selected run | `ExperimentManager`, `RunSource` |
+| `StepTimeline` | One row per journal step: time, actor (agent id or "you"), kind, status, figure thumbnails | `AnalysisJournal` |
+| `StepDetail` | The selected step: plot (pyqtgraph from `.plot.json`, else the PNG), results table, script code, printed output, warnings or error | The step's folder |
+| `EntryStrip` | The pending entry preview and approval, taken out of `AnalysisPanel` so the eLab tab and this screen share one implementation | `ExperimentManager`, `ElnPublisher` |
+
+**What the operator can do here.** View everything; **Publish / Discard**
+the pending entry; **Stage** the selected script result; **Save as recipe**
+from the selected script. Stage and Save call the same tool functions the
+agent calls (`call_session_tool` with an operator `ToolContext`), so the
+journal tells one story whoever acted. Editing code and running recipes
+from this screen are out of scope for now; the eLab tab keeps its
+"Run analysis".
+
+**Placeholder for milestone 2.** A collapsed "Ask the analyst…" box under
+the timeline. The embedded analyst writes to the same journal, so it needs
+no screen of its own.
+
+### Order of work
+
+1. **Data layer:** `AnalysisJournal` and its listeners, `annotate_analysis`,
+   `plot()` and `FigureRef.data_file`, and journal writes in the tools, the
+   runner and the manager. Tested without a GUI.
+2. **Read-only screen:** the switch, badge and banner, `RunBrowser`,
+   `StepTimeline`, `StepDetail`, and `EntryStrip` shared with the eLab tab.
+   pytest-qt tests drive a journal and assert what is shown.
+3. **Operator actions:** Stage and Save as recipe through the shared tool
+   functions, and journal steps for approve and discard.
+4. **Milestone 2** plugs its console into the placeholder.
 
 ## Milestone 4: the container sandbox and heavier models
 
@@ -275,5 +369,5 @@ not change.
   agent-staged entries? The current answer is to park.
 - Budget defaults for the automatic trigger: turns, tokens, and dollars per
   run.
-- Whether the Analyst tab should also show figures inline in the chat, or
-  only in the eLab preview.
+- Whether the analyst console should also show figures inline, or only in
+  the step detail.
