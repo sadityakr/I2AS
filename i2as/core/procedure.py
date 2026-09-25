@@ -426,6 +426,9 @@ class BaseProcedure:
         self._sample_info = sample_info
         self._data_directory = data_directory
         self._file_prefix = file_prefix
+        # The exact data file name, when the engine placed this run (see
+        # place_data_file()); "" keeps the prefix-and-timestamp name.
+        self._file_name = ""
         self._experiment_info: dict[str, Any] = dict(experiment_info or {})
         # Every ParamSpec carries a default (enforced at ParamSpec construction),
         # so the merge is unconditional — no "default present?" guard needed.
@@ -586,6 +589,27 @@ class BaseProcedure:
     # Public read-only surface (consumed by the Orchestrator's run manifests
     # and the GUI — no caller should ever reach into _data_manager directly)
     # ------------------------------------------------------------------
+
+    @property
+    def file_prefix(self) -> str:
+        """The operator's optional label for this run's data file ("" for none)."""
+        return self._file_prefix
+
+    def place_data_file(self, data_directory: str, file_name: str) -> None:
+        """Put this run's data file where the engine placed it.
+
+        Called by the Orchestrator just before ``initiate()`` creates the
+        file, when a session layer has installed the open experiment's data
+        folder (``Orchestrator.set_run_folder``): every run then writes
+        ``<experiment>/data/run-NNNN_<Procedure>[_<label>].h5`` whatever
+        directory the client that built it asked for (``core.run_naming``).
+
+        Args:
+            data_directory: The experiment's data folder.
+            file_name: The run's file name.
+        """
+        self._data_directory = data_directory
+        self._file_name = file_name
 
     @property
     def data_filepath(self) -> str | None:
@@ -2130,6 +2154,7 @@ class SweepMeasureProcedure(BaseProcedure):
             data_directory=self._data_directory,
             procedure_name=self.name,
             file_prefix=self._file_prefix,
+            file_name=self._file_name,
             procedure_params=self._params,
             sample_info=self._sample_info,
             instrument_state=instrument_state,

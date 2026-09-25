@@ -1178,8 +1178,12 @@ def test_end_to_end_run_recorded_and_stamped(
     assert run.procedure == "Field Sweep"
     assert run.params["field_steps"] == 3
 
-    # The record's data_file is the real HDF5 file, stamped with the context.
-    with h5py.File(run.data_file, "r") as f:
+    # The record's data_file is the real HDF5 file — placed in the open
+    # experiment's own data folder whatever directory the run asked for, and
+    # stored relative to the experiment — stamped with the context.
+    assert run.run_id == "run-0001"
+    assert run.data_file == "data/run-0001_FieldSweep.h5"
+    with h5py.File(manager.store.resolve_data_file(record.experiment_id, run.data_file), "r") as f:
         info = json.loads(f["metadata"].attrs["experiment_info"])
     assert info["experiment"]["experiment_id"] == record.experiment_id
     assert info["experiment"]["user_id"] == "jdoe"

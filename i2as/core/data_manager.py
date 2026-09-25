@@ -43,6 +43,7 @@ class DataManager:
         file_prefix: str = "",
         experiment_info: dict | None = None,
         run_kind: str = "run",
+        file_name: str = "",
     ) -> None:
         """Create the HDF5 file and write all metadata.
 
@@ -58,6 +59,11 @@ class DataManager:
             ``{file_prefix}_{timestamp}.h5`` instead of
             ``{procedure_name}_{timestamp}.h5``. Metadata still records the
             true ``procedure_name`` regardless.
+        file_name:
+            The exact file name, when the run was placed
+            (``core.run_naming``: ``run-NNNN_<Procedure>[_<label>].h5``).
+            Overrides the prefix-and-timestamp name, and an existing file of
+            that name is never overwritten.
         procedure_params:
             Arbitrary procedure parameters (JSON-serialisable dict).
         sample_info:
@@ -160,8 +166,15 @@ class DataManager:
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         data_dir = Path(data_directory)
         data_dir.mkdir(parents=True, exist_ok=True)
-        stem = file_prefix.strip() or procedure_name
-        self._filepath = data_dir / f"{stem}_{timestamp_str}.h5"
+        if file_name:
+            if Path(file_name).name != file_name:
+                raise ValueError(f"file_name {file_name!r} must be a plain file name")
+            self._filepath = data_dir / file_name
+            if self._filepath.exists():
+                raise FileExistsError(f"refusing to overwrite the run file {self._filepath}")
+        else:
+            stem = file_prefix.strip() or procedure_name
+            self._filepath = data_dir / f"{stem}_{timestamp_str}.h5"
 
         logger.info("DataManager: creating HDF5 file at %s", self._filepath)
 

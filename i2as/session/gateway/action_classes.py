@@ -220,6 +220,13 @@ COMMAND_ACTION_CLASSES: dict[CommandName, ClassifiedAction] = {
         "Declares whether a human is watching — an input to this very "
         "matrix, so no agent may set it about itself.",
     ),
+    CommandName.SET_RUN_FOLDER: ClassifiedAction(
+        ActionClass.ENVELOPE,
+        "Says which experiment's folder every run writes into, and whether "
+        "any run may start at all. The session layer installs it when an "
+        "experiment opens or closes; an agent that could point runs elsewhere "
+        "would decide where the evidence goes.",
+    ),
     CommandName.SET_AGENT_GATE: ClassifiedAction(
         ActionClass.ENVELOPE,
         "The kill switch. An agent that could reopen its own gate would not "

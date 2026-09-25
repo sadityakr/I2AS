@@ -301,6 +301,7 @@ class ExperimentManager(QObject):
         self._experiment = record
         self._orchestrator.set_experiment_envelope(envelope)
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info(
             "Experiment %s started (user=%s, attended=%s)",
             record.experiment_id,
@@ -362,6 +363,7 @@ class ExperimentManager(QObject):
         self._save_current()
         self._store.set_active(None)
         self._orchestrator.set_experiment_envelope(None)
+        self._install_run_folder(None)
         logger.info("Experiment %s closed", self._experiment.experiment_id)
         self._reconcile_session_index()
         self._experiment = None
@@ -506,6 +508,7 @@ class ExperimentManager(QObject):
         self._store.set_active(record.experiment_id)
         self._orchestrator.set_experiment_envelope(envelope_from_dict(record.envelope))
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info("Switched to experiment %s", record.experiment_id)
         self._reconcile_session_index()
         self.experiment_changed.emit(record.to_dict())
@@ -1085,6 +1088,23 @@ class ExperimentManager(QObject):
     # Internals
     # ------------------------------------------------------------------
 
+    def _install_run_folder(self, experiment_id: str | None) -> None:
+        """Tell the engine where every run writes: this experiment's data folder.
+
+        The third policy value pushed down beside the envelope and attendance
+        (``Orchestrator.set_run_folder``). ``None`` — no experiment open —
+        installs ``""``, which refuses every run. An engine that predates the
+        command (a test double) is skipped rather than failed.
+
+        Args:
+            experiment_id: The open experiment, or ``None``.
+        """
+        setter = getattr(self._orchestrator, "set_run_folder", None)
+        if not callable(setter):
+            return
+        folder = "" if experiment_id is None else str(self._store.data_dir(experiment_id))
+        setter(folder)
+
     def _current_session_folder(self) -> Path | None:
         """Return the session folder owning ``self._store``, or ``None``.
 
@@ -1208,6 +1228,9 @@ class ExperimentManager(QObject):
         look like live work. The envelope stored on the record is re-installed
         on the Orchestrator.
         """
+        # No experiment until one is resumed below: until then every run is
+        # refused, because a run's data always belongs to an experiment.
+        self._install_run_folder(None)
         active_id = self._store.get_active()
         if active_id is None:
             return
@@ -1234,5 +1257,6 @@ class ExperimentManager(QObject):
             envelope_from_dict(record.envelope)
         )
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info("Resumed experiment %s (%d runs)", record.experiment_id, len(record.runs))
         self.experiment_changed.emit(record.to_dict())

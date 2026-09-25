@@ -453,11 +453,18 @@ def _run_properties(kind: str = "procedure", *, probe: bool = True) -> dict[str,
                 },
                 "data_directory": {
                     "type": "string",
-                    "description": "Directory the run writes its HDF5 file into.",
+                    "description": (
+                        "Ignored while an experiment is open, which every run "
+                        "needs: the run is saved in that experiment's data "
+                        "folder as run-NNNN_<Procedure>[_<file_prefix>].h5."
+                    ),
                 },
                 "file_prefix": {
                     "type": "string",
-                    "description": "Optional filename prefix for the data file.",
+                    "description": (
+                        "Optional label for people, added after the run's "
+                        "number and procedure in its file name."
+                    ),
                 },
                 "experiment_info": {
                     "type": ["object", "null"],
@@ -1147,9 +1154,12 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "sample_info": {"type": "object", "description": "Sample metadata."},
             "data_directory": {
                 "type": "string",
-                "description": "Directory it would write into; never created here.",
+                "description": (
+                    "Ignored while an experiment is open: a run is saved in "
+                    "that experiment's data folder. Never created here."
+                ),
             },
-            "file_prefix": {"type": "string", "description": "Filename prefix."},
+            "file_prefix": {"type": "string", "description": "Optional file-name label."},
             "probe_spec": dict(_PROBE_SPEC_SCHEMA),
         },
         ("procedure",),

@@ -459,6 +459,18 @@ class ExperimentInfoPanel(QWidget):
         dir_row.addWidget(self._data_dir_input)
         dir_row.addWidget(browse_btn)
         form.addRow("Data Dir:", dir_row)
+        # With a session layer, where a run writes is not a choice: the
+        # engine places every run in the open experiment's data folder
+        # (Orchestrator.set_run_folder, core.run_naming), so the field only
+        # shows that folder and the operator's one choice of location is the
+        # session folder (User → Session Folder…).
+        if self._session_manager is not None:
+            self._data_dir_input.setReadOnly(True)
+            self._data_dir_input.setToolTip(
+                "Every run is saved here, as run-NNNN_<Procedure>[_<label>].h5 — "
+                "the open experiment's data folder inside the session folder."
+            )
+            browse_btn.hide()
 
         self._data_dir_note = QLabel(_OUTSIDE_SESSION_NOTE_TEXT)
         self._data_dir_note.setObjectName("data_dir_note")

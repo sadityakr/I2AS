@@ -295,6 +295,7 @@ def test_a_station_companion_is_built_and_stopped_on_the_engines_thread(
 _COMMANDS: tuple[tuple[str, tuple[Any, ...], dict[str, Any]], ...] = (
     ("start_monitoring", (), {}),
     ("set_attendance", (False,), {}),
+    ("set_run_folder", ("",), {}),
     ("set_agent_gate", (ev.AgentGate.READ_ONLY,), {}),
     ("submit_vi_action", ("magnet_z", "set_field"), {"target_T": 0.05}),
     ("submit_global_action", ("initiate",), {}),

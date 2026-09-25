@@ -44,6 +44,7 @@ from i2as.core.plan import (
 )
 from i2as.core.ramps import RampRecord, build_ramp_records
 from i2as.core.request_spool import RequestSpool
+from i2as.core.run_naming import RunPlacement, place_run
 from i2as.core.run_builder import build_procedure
 from i2as.core.stall_detection import (
     StallConfig,
@@ -637,6 +638,12 @@ class Orchestrator(QObject):
         # limits) — set by the session layer, enforced here so it binds every
         # writer (GUI and agents alike). None = no envelope active.
         self._session_envelope: ExperimentEnvelope | None = None
+        # The open experiment's data folder, pushed down by the session layer
+        # (set_run_folder). None: no session layer — a run writes where its
+        # client asked. "": no experiment open — every run is refused. A path:
+        # every run is placed there as run-NNNN (core.run_naming).
+        self._run_folder: str | None = None
+        self._run_placement: RunPlacement | None = None
 
         # Attendance and the kill switch: two session-owned policy VALUES
         # pushed down here for the same reason the envelope is, and enforced
@@ -1193,6 +1200,45 @@ class Orchestrator(QObject):
         self._emit_status_snapshot()
 
     @command
+    def set_run_folder(self, data_directory: str) -> None:
+        """Install the open experiment's data folder, where every run writes.
+
+        The third session-owned policy value pushed DOWN into the engine,
+        beside the session envelope and attendance, and for the same reason
+        (contract C12). With a folder installed, every run — the operator's,
+        a queued one, an agent's — writes ``run-NNNN_<Procedure>[_<label>].h5``
+        into it and is identified as ``run-NNNN`` (``core.run_naming``),
+        whatever directory the client that built the run asked for; so every
+        session has one fixed tree an analysis can walk. An empty string
+        means no experiment is open, and every run is refused until one is:
+        a run's data always belongs to an experiment.
+
+        Args:
+            data_directory: The open experiment's data folder, or ``""`` when
+                no experiment is open.
+        """
+        self._run_folder = str(data_directory)
+        if self._run_folder:
+            logger.info("Run folder set: %s", self._run_folder)
+        else:
+            logger.info("Run folder cleared: runs are refused until an experiment is open")
+
+    def _no_experiment_refusal(self) -> bool:
+        """Refuse the run in flight when the session layer says no experiment is open.
+
+        Returns:
+            ``True`` when the run was refused (the verdict is already out).
+        """
+        if self._run_folder != "":
+            return False
+        self._action_blocked(
+            "No experiment is open: open or create an experiment before "
+            "starting a run — every run's data belongs to one.",
+            detail={"rule": "no_experiment"},
+        )
+        return True
+
+    @command
     def set_agent_gate(self, state: ev.AgentGate | str) -> None:
         """Set the kill switch: how much of the engine agents may reach.
 
@@ -1278,6 +1324,8 @@ class Orchestrator(QObject):
         stopped) and the Orchestrator degrades to ERROR instead of crashing
         the application.
         """
+        if self._no_experiment_refusal():
+            return
         manual_ramping = (
             self._state == OrchestratorState.RAMPING and self._procedure is None
         )
@@ -1300,6 +1348,33 @@ class Orchestrator(QObject):
 
         self._start_run(procedure)
 
+
+    def _place_run(self, procedure: Any) -> RunPlacement | None:
+        """Place the run's data file in the open experiment's folder, if one is installed.
+
+        Duck-typed like every other procedure accessor here (contract C5): a
+        procedure without ``place_data_file`` — a test double — is left
+        where it is.
+
+        Args:
+            procedure: The run about to start.
+
+        Returns:
+            The placement applied, or ``None`` when no folder is installed or
+            the procedure cannot be placed.
+        """
+        place = getattr(procedure, "place_data_file", None)
+        if not self._run_folder or not callable(place):
+            return None
+        placement = place_run(
+            self._run_folder,
+            type(procedure).__name__,
+            str(getattr(procedure, "file_prefix", "") or ""),
+            str(getattr(procedure, "run_kind", "run") or "run"),
+        )
+        place(placement.data_directory, placement.file_name)
+        logger.info("Run placed: %s → %s", placement.run_id, placement.file_name)
+        return placement
 
     def _start_run(self, procedure: Any) -> None:
         """Shared setup path for starting a run.
@@ -1333,6 +1408,7 @@ class Orchestrator(QObject):
         self._pending_gates = []
         self._pause_requested = False
         try:
+            self._run_placement = self._place_run(procedure)
             plan = procedure.initiate()
             # The frozen-dataclass repr is the permanent record of exactly what
             # was requested — logged once, at INFO, on receipt.
@@ -1430,6 +1506,8 @@ class Orchestrator(QObject):
         Args:
             procedure: The ready procedure instance to queue.
         """
+        if self._no_experiment_refusal():
+            return
         self._procedure_queue.append(procedure)
         self._queued_actors[id(procedure)] = self._current_actor()
         self._emit_queue_changed()
@@ -2655,7 +2733,11 @@ class Orchestrator(QObject):
         # not have to wait a tick for.
         owner = self._run_owner
         self._active_run_manifest = {
-            "run_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{self._run_counter:03d}_{slug}",
+            "run_id": (
+                self._run_placement.run_id
+                if self._run_placement is not None
+                else f"{time.strftime('%Y%m%d_%H%M%S')}_{self._run_counter:03d}_{slug}"
+            ),
             "procedure": name,
             "procedure_class": type(procedure).__name__,
             "kind": getattr(procedure, "run_kind", "run"),
