@@ -21,9 +21,11 @@ a change to either belongs here too. Parsing is tolerant in the same spirit as
 the session layer's own ``from_dict()``: junk degrades to a default, it never
 raises, because a half-written record must still produce a readable report.
 
-The folder layout this walks::
+The folder layout this walks — the session folders the machine's registry
+(``<measurement_root>/sessions.json``: ``active`` and ``recent``) names, and
+the fixed shape below each::
 
-    <measurement_root>/sessions/<user_id>/<session_id>/<experiment_id>/
+    <session folder>/<experiment_id>/
         experiment.json     the record parsed here
         data/               HDF5 files a run's data_file points into
         incidents/*.md      incident reports filed against this experiment
@@ -44,7 +46,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_SESSIONS_DIRNAME = "sessions"
+_SESSIONS_REGISTRY_FILENAME = "sessions.json"
 _EXPERIMENT_FILENAME = "experiment.json"
 _DATA_DIRNAME = "data"
 _INCIDENTS_DIRNAME = "incidents"
@@ -59,28 +61,55 @@ _RUN_STATUS_ORDER = ("running", "done", "failed", "aborted")
 # ── Locating the experiment folder ────────────────────────────────────────────
 
 
-def find_experiment_dirs(root: Path) -> list[Path]:
-    """Return every experiment folder under a measurement root.
+def session_folders(root: Path) -> list[Path]:
+    """Return the session folders the machine's registry names.
 
-    Walks ``<root>/sessions/<user_id>/<session_id>/<experiment_id>/`` — the
-    fixed depth ``SessionStore`` and ``ExperimentStore`` write — and keeps
-    only folders that actually carry an ``experiment.json``, so a stray
-    directory is never mistaken for an experiment.
+    Read straight from ``<root>/sessions.json`` (``active`` first, then
+    ``recent``), because a session may be anywhere on disk: the operator
+    chooses its folder. Tolerant: a missing or corrupt registry names none.
 
     Args:
-        root: The measurement root to search.
+        root: The measurement root.
 
     Returns:
-        Every experiment folder found, sorted by path (empty when the root
-        or its ``sessions/`` folder does not exist).
+        The existing folders, active first, without duplicates.
     """
-    sessions_dir = Path(root) / _SESSIONS_DIRNAME
-    if not sessions_dir.is_dir():
+    try:
+        registry = json.loads((Path(root) / _SESSIONS_REGISTRY_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return []
+    if not isinstance(registry, dict):
+        return []
+    named = [registry.get("active"), *(registry.get("recent") or [])]
+    folders: list[Path] = []
+    for entry in named:
+        if isinstance(entry, str) and entry and Path(entry).is_dir() and Path(entry) not in folders:
+            folders.append(Path(entry))
+    return folders
+
+
+def find_experiment_dirs(root: Path) -> list[Path]:
+    """Return every experiment folder in the sessions the registry names.
+
+    Walks ``<session folder>/<experiment_id>/`` for each folder
+    ``session_folders()`` returns, and keeps only folders that actually carry
+    an ``experiment.json``, so a stray directory is never mistaken for an
+    experiment.
+
+    Args:
+        root: The measurement root holding the registry.
+
+    Returns:
+        Every experiment folder found, sorted by path (empty when there is no
+        registry or no session in it).
+    """
     return sorted(
-        path.parent
-        for path in sessions_dir.glob(f"*/*/*/{_EXPERIMENT_FILENAME}")
-        if path.is_file()
+        {
+            path.parent
+            for folder in session_folders(root)
+            for path in folder.glob(f"*/{_EXPERIMENT_FILENAME}")
+            if path.is_file()
+        }
     )
 
 

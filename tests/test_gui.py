@@ -1946,71 +1946,90 @@ def test_load_session_dialog_lists_open_and_closed(station, orchestrator, qtbot,
     assert dialog.selected_experiment_id() == open_item.data(Qt.ItemDataRole.UserRole)
 
 
-def test_resume_session_dialog_lists_only_owner_sessions(qtbot, tmp_path):
-    """list_sessions(user_id=...) filters the dialog to one user's own sessions."""
-    from i2as.gui.session_dialogs import ResumeSessionDialog
+def test_session_folder_dialog_lists_recent_sessions_with_their_names(qtbot, tmp_path):
+    """Recent sessions from the registry, shown by name with their folder."""
+    from i2as.gui.session_dialogs import SessionFolderDialog
     from i2as.session.store import SessionStore
 
-    store = SessionStore(tmp_path / "sessions")
-    mine = store.create_session(name="My Cooldown", user_id="jdoe")
-    store.create_session(name="Someone Else's", user_id="asmith")
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "anywhere" / "cooldown3"
+    store.create_session(folder, "My Cooldown", "jdoe")
+    store.set_active(folder)
 
-    dialog = ResumeSessionDialog(store, "jdoe")
+    dialog = SessionFolderDialog(store, "jdoe", current_folder=folder)
     qtbot.addWidget(dialog)
 
     assert dialog._list.count() == 1
     item = dialog._list.item(0)
-    assert item.data(Qt.ItemDataRole.UserRole) == mine.session_id
+    assert item.text().startswith("My Cooldown — ")
+    assert item.data(Qt.ItemDataRole.UserRole) == str(folder.resolve())
+    dialog._list.setCurrentItem(item)
+    dialog._accept_selected()
+    assert dialog.selected_folder() == folder.resolve()
 
 
-def test_resume_session_dialog_select_and_accept(qtbot, tmp_path):
-    """Selecting a listed session and accepting exposes it via selected_session_id()."""
-    from i2as.gui.session_dialogs import ResumeSessionDialog
+def test_session_folder_dialog_opens_only_a_session_folder(qtbot, tmp_path, monkeypatch):
+    """Open Folder… accepts a folder with session.json and refuses any other."""
+    from i2as.gui.session_dialogs import SessionFolderDialog
     from i2as.session.store import SessionStore
 
-    store = SessionStore(tmp_path / "sessions")
-    session = store.create_session(name="My Cooldown", user_id="jdoe")
+    store = SessionStore(tmp_path / "root")
+    session_folder = tmp_path / "s1"
+    store.create_session(session_folder, "S1", "jdoe")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
 
-    dialog = ResumeSessionDialog(store, "jdoe")
+    dialog = SessionFolderDialog(store, "jdoe")
     qtbot.addWidget(dialog)
+    dialog._pick_directory = lambda caption: plain
+    dialog._on_open_folder()
+    assert warned and dialog.selected_folder() is None
 
-    dialog._list.setCurrentItem(dialog._list.item(0))
-    dialog.accept()
-    assert dialog.selected_session_id() == session.session_id
-
-
-def test_resume_session_dialog_create_new_session(qtbot, tmp_path):
-    """The inline "New session…" name field + Create button creates and selects one."""
-    from i2as.gui.session_dialogs import ResumeSessionDialog
-    from i2as.session.store import SessionStore
-
-    store = SessionStore(tmp_path / "sessions")
-    dialog = ResumeSessionDialog(store, "jdoe")
-    qtbot.addWidget(dialog)
-
-    assert dialog._list.count() == 0
-    assert not dialog._create_btn.isEnabled()
-
-    dialog._new_name_input.setText("Fresh Cooldown")
-    assert dialog._create_btn.isEnabled()
-    dialog._create_btn.click()
-
-    assert store.list_sessions(user_id="jdoe")
-    created_id = store.list_sessions(user_id="jdoe")[0]
-    assert dialog.selected_session_id() == created_id
+    dialog._pick_directory = lambda caption: session_folder
+    dialog._on_open_folder()
+    assert dialog.selected_folder() == session_folder
     assert dialog.result() == QDialog.DialogCode.Accepted
 
 
-def test_resume_session_dialog_no_selection_returns_none(qtbot, tmp_path):
-    """selected_session_id() is None when nothing was ever selected."""
-    from i2as.gui.session_dialogs import ResumeSessionDialog
+@pytest.mark.parametrize("empty", [True, False])
+def test_session_folder_dialog_creates_a_session_in_the_picked_folder(qtbot, tmp_path, empty):
+    """An empty folder becomes the session; any other gets a new folder inside it."""
+    from i2as.gui.session_dialogs import SessionFolderDialog
     from i2as.session.store import SessionStore
 
-    store = SessionStore(tmp_path / "sessions")
-    dialog = ResumeSessionDialog(store, "jdoe")
+    store = SessionStore(tmp_path / "root")
+    picked = tmp_path / "picked"
+    picked.mkdir()
+    if not empty:
+        (picked / "other.txt").write_text("x", encoding="utf-8")
+
+    dialog = SessionFolderDialog(store, "jdoe")
+    qtbot.addWidget(dialog)
+    assert not dialog._create_btn.isEnabled()
+    dialog._new_name_input.setText("Fresh Cooldown")
+    assert dialog._create_btn.isEnabled()
+    dialog._pick_directory = lambda caption: picked
+    dialog._create_btn.click()
+
+    chosen = dialog.selected_folder()
+    assert (chosen == picked) is empty
+    if not empty:
+        assert chosen.parent == picked and chosen.name.endswith("_fresh_cooldown")
+    assert store.load(chosen).name == "Fresh Cooldown"
+    assert store.load(chosen).user_id == "jdoe"
+    assert dialog.result() == QDialog.DialogCode.Accepted
+
+
+def test_session_folder_dialog_no_selection_returns_none(qtbot, tmp_path):
+    from i2as.gui.session_dialogs import SessionFolderDialog
+    from i2as.session.store import SessionStore
+
+    dialog = SessionFolderDialog(SessionStore(tmp_path / "root"), "jdoe")
     qtbot.addWidget(dialog)
 
-    assert dialog.selected_session_id() is None
+    assert dialog.selected_folder() is None
 
 
 def test_switch_session_saves_outgoing_and_loads_incoming(
@@ -2099,23 +2118,41 @@ def test_open_load_session_dialog_without_session_manager_shows_message(monitor_
     assert shown
 
 
-def test_open_resume_session_dialog_without_session_store_shows_message(monitor_win, monkeypatch):
-    """No SessionStore wired: Resume Session informs rather than crashing."""
+def test_open_session_folder_dialog_without_session_store_shows_message(monitor_win, monkeypatch):
+    """No SessionStore wired: Session Folder informs rather than crashing."""
     shown = []
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
-    monitor_win._open_resume_session_dialog()
+    monitor_win._open_session_folder_dialog()
     assert shown
 
 
-def test_open_resume_session_dialog_sets_active_and_notes_status(
+def _fake_session_folder_dialog(folder, seen_user_ids=None):
+    class _FakeSessionFolderDialog:
+        DialogCode = QDialog.DialogCode
+
+        def __init__(self, store, user_id, current_folder=None, parent=None):
+            if seen_user_ids is not None:
+                seen_user_ids.append(user_id)
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def selected_folder(self):
+            return folder
+
+    return _FakeSessionFolderDialog
+
+
+def test_open_session_folder_dialog_sets_active_and_notes_status(
     station, orchestrator, session_manager, qtbot, tmp_path, monkeypatch
 ):
-    """Picking a session persists it via SessionStore.set_active and notes the status bar."""
+    """Picking a session folder persists it in the registry and notes the status bar."""
     from i2as.gui import monitor_window as mw
     from i2as.session.store import SessionStore
 
-    store = SessionStore(tmp_path / "sessions")
-    created = store.create_session(name="Cooldown 3", user_id="jdoe")
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "Cooldown 3"
+    store.create_session(folder, "Cooldown 3", "jdoe")
 
     win = MonitorWindow(
         station, orchestrator, session_manager=session_manager, session_store=store
@@ -2124,36 +2161,24 @@ def test_open_resume_session_dialog_sets_active_and_notes_status(
     win.show()
     win._switch_user("jdoe")
 
-    class _FakeResumeSessionDialog:
-        DialogCode = QDialog.DialogCode
+    monkeypatch.setattr(mw, "SessionFolderDialog", _fake_session_folder_dialog(folder))
+    win._open_session_folder_dialog()
 
-        def __init__(self, *a, **k):
-            pass
-
-        def exec(self):
-            return QDialog.DialogCode.Accepted
-
-        def selected_session_id(self):
-            return created.session_id
-
-    monkeypatch.setattr(mw, "ResumeSessionDialog", _FakeResumeSessionDialog)
-    win._open_resume_session_dialog()
-
-    assert store.get_active() == ("jdoe", created.session_id)
+    assert store.get_active() == folder.resolve()
     assert "next launch" in win._status_bar.currentMessage()
 
 
-def test_open_resume_session_dialog_resolves_logged_out_user_to_guest(
+def test_open_session_folder_dialog_resolves_logged_out_user_to_guest(
     station, orchestrator, session_manager, qtbot, tmp_path, monkeypatch
 ):
-    """Nobody logged in: the dialog lists/activates sessions under the Guest identity."""
+    """Nobody logged in: a session created from the dialog is owned by Guest."""
     from i2as.gui import monitor_window as mw
     from i2as.session.models import GUEST_USER_ID
     from i2as.session.store import SessionStore
 
-    store = SessionStore(tmp_path / "sessions")
-    created = store.create_session(name="Walk-in Cooldown", user_id=GUEST_USER_ID)
-
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "walk-in"
+    store.create_session(folder, "Walk-in Cooldown", GUEST_USER_ID)
     win = MonitorWindow(
         station, orchestrator, session_manager=session_manager, session_store=store
     )
@@ -2161,25 +2186,36 @@ def test_open_resume_session_dialog_resolves_logged_out_user_to_guest(
     win.show()
     assert win._current_user_id is None
 
-    seen_user_ids = []
-
-    class _FakeResumeSessionDialog:
-        DialogCode = QDialog.DialogCode
-
-        def __init__(self, store, user_id, parent=None):
-            seen_user_ids.append(user_id)
-
-        def exec(self):
-            return QDialog.DialogCode.Accepted
-
-        def selected_session_id(self):
-            return created.session_id
-
-    monkeypatch.setattr(mw, "ResumeSessionDialog", _FakeResumeSessionDialog)
-    win._open_resume_session_dialog()
+    seen_user_ids: list[str] = []
+    monkeypatch.setattr(
+        mw, "SessionFolderDialog", _fake_session_folder_dialog(folder, seen_user_ids)
+    )
+    win._open_session_folder_dialog()
 
     assert seen_user_ids == [GUEST_USER_ID]
-    assert store.get_active() == (GUEST_USER_ID, created.session_id)
+    assert store.get_active() == folder.resolve()
+
+
+def test_the_header_names_the_session_in_use(
+    station, orchestrator, session_manager, qtbot, tmp_path
+):
+    """The Monitor header shows the session's name, with its folder as the tooltip."""
+    from PyQt6.QtWidgets import QLabel
+
+    from i2as.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "root")
+    folder = session_manager.store.root
+    store.create_session(folder, "MnSi cooldown 4", "jdoe")
+
+    win = MonitorWindow(
+        station, orchestrator, session_manager=session_manager, session_store=store
+    )
+    qtbot.addWidget(win)
+
+    label = win.findChild(QLabel, "session_label")
+    assert label.text() == "Session: MnSi cooldown 4"
+    assert label.toolTip() == str(folder)
 
 
 # ── Data Dir: derived-but-editable from the open session ───────────────────────

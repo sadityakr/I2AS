@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import qtawesome as qta
@@ -43,7 +44,7 @@ from i2as.gui.notification_banner import NotificationBanner
 from i2as.gui.offline_panel import OfflineInstrumentPanel
 from i2as.gui.open_experiment_dialog import OpenExperimentDialog
 from i2as.gui.ramp_tracker_panel import RampTrackerPanel
-from i2as.gui.session_dialogs import ResumeSessionDialog
+from i2as.gui.session_dialogs import SessionFolderDialog
 from i2as.core.status_mirror import StatusMirror
 from i2as.gui.setup_dialogs import InstrumentInfoDialog, LoginDialog
 from i2as.gui.theme import (
@@ -338,13 +339,13 @@ class MonitorWindow(QMainWindow):
         load_session_action.triggered.connect(self._open_load_session_dialog)
         user_menu.addAction(load_session_action)
 
-        resume_session_action = QAction("Resume Session…", self)
-        resume_session_action.setToolTip(
-            "Pick or create the Session (folder holding multiple experiments) "
-            "to use — applies fully on next launch"
+        session_folder_action = QAction("Session Folder…", self)
+        session_folder_action.setToolTip(
+            "Open or create the session folder — the one folder every "
+            "experiment, run file and analysis lives in; applies on next launch"
         )
-        resume_session_action.triggered.connect(self._open_resume_session_dialog)
-        user_menu.addAction(resume_session_action)
+        session_folder_action.triggered.connect(self._open_session_folder_dialog)
+        user_menu.addAction(session_folder_action)
 
         # The notebook account is a property of the PERSON, like the login
         # above and unlike a config: an API key must never travel with a
@@ -561,6 +562,13 @@ class MonitorWindow(QMainWindow):
         self._current_user_label.setObjectName("current_user_label")
         self._sync_current_user_label()
         row.addWidget(self._current_user_label)
+
+        # The session in use — the one folder the operator chooses; its path
+        # is the tooltip, and User → Session Folder… changes it.
+        self._session_label = QLabel()
+        self._session_label.setObjectName("session_label")
+        self._sync_session_label()
+        row.addWidget(self._session_label)
 
         # Slim page switcher: Page 1 (Monitor, the quadrant grid, unchanged)
         # / Page 2 (Logs). Not connected here — the pages
@@ -1145,30 +1153,48 @@ class MonitorWindow(QMainWindow):
         if experiment_id:
             self._switch_experiment(experiment_id)
 
-    def _open_resume_session_dialog(self) -> None:
-        """Open ResumeSessionDialog and persist the picked/created session as active.
+    def _open_session_folder_dialog(self) -> None:
+        """Open SessionFolderDialog and persist the picked or created folder as active.
 
-        Deferred-until-restart, same precedent the old sessions-root relocate
-        action used: ``session_manager``'s own ``ExperimentStore`` stays fixed
-        for the rest of this run regardless of what is picked here (see
-        ``GLOSSARY.md``'s **Session**).
+        Deferred until the next launch: ``session_manager``'s own
+        ``ExperimentStore`` stays rooted at the session folder it started
+        with for the rest of this run (see ``GLOSSARY.md``'s **Session**).
         """
         if self._session_store is None:
             QMessageBox.information(
-                self, "Resume Session", "Session management is not available."
+                self, "Session Folder", "Session management is not available."
             )
             return
         user_id = self._current_user_id or GUEST_USER_ID
-        dialog = ResumeSessionDialog(self._session_store, user_id, self)
+        dialog = SessionFolderDialog(
+            self._session_store, user_id, self._session_folder(), self
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        session_id = dialog.selected_session_id()
-        if not session_id:
+        folder = dialog.selected_folder()
+        if folder is None:
             return
-        self._session_store.set_active(user_id, session_id)
+        self._session_store.set_active(folder)
         self._status_bar.showMessage(
-            "Session updated — applies fully on next launch", 5000
+            f"Session folder set to {folder} — applies on next launch", 8000
         )
+
+    def _session_folder(self) -> Path | None:
+        """Return the session folder in use: the experiment store's own root."""
+        store = getattr(self._session_manager, "store", None)
+        root = getattr(store, "root", None)
+        return Path(root) if root is not None else None
+
+    def _sync_session_label(self) -> None:
+        """Show the session in use in the header: its name, with the folder as tooltip."""
+        folder = self._session_folder()
+        if folder is None:
+            self._session_label.setText("")
+            return
+        session = self._session_store.load(folder) if self._session_store is not None else None
+        name = session.name if session is not None and session.name else folder.name
+        self._session_label.setText(f"Session: {name}")
+        self._session_label.setToolTip(str(folder))
 
     def _switch_experiment(self, experiment_id: str) -> None:
         """Save the outgoing session's fields and load the incoming session's own.

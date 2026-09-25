@@ -106,9 +106,9 @@ class ExperimentManager(QObject):
                 ``None`` (e.g. in unit tests that only exercise the
                 Experiment tier) simply skips index maintenance — every
                 other feature works unchanged. When given, the session
-                identity is derived from ``store.root``'s own two path
-                segments (``sessions/<user_id>/<session_id>``), not passed
-                separately, so there is no second source of truth to drift.
+                folder IS ``store.root`` — the experiment store is rooted at
+                the session folder — so there is no second source of truth
+                to drift.
             station: The Station a queued run would drive — needed to build a
                 run headlessly for ``validate_run()`` and to construct the one
                 live object the engine pulls. ``None`` (a unit test that only
@@ -1087,18 +1087,18 @@ class ExperimentManager(QObject):
     # Internals
     # ------------------------------------------------------------------
 
-    def _current_session_identity(self) -> tuple[str, str] | None:
-        """Return the ``(user_id, session_id)`` owning ``self._store``, or ``None``.
+    def _current_session_folder(self) -> Path | None:
+        """Return the session folder owning ``self._store``, or ``None``.
 
         ``None`` when no ``session_store`` was given at construction — the
-        caller then knows to skip index maintenance entirely. Otherwise
-        derived from ``self._store.root``'s own two path segments
-        (``sessions/<user_id>/<session_id>``), never passed or cached
-        separately, so this can never disagree with the store it describes.
+        caller then knows to skip index maintenance entirely. Otherwise it is
+        ``self._store.root`` itself: the experiment store is rooted AT the
+        session folder, so this can never disagree with the store it
+        describes.
         """
         if self._session_store is None:
             return None
-        return self._store.root.parent.name, self._store.root.name
+        return self._store.root
 
     def _reconcile_session_index(self) -> None:
         """Rebuild the active session's ``experiments`` index from its folder.
@@ -1126,16 +1126,13 @@ class ExperimentManager(QObject):
         lifecycle, it must never be allowed to block it. No-op when this
         manager was built without a ``session_store``.
         """
-        identity = self._current_session_identity()
-        if identity is None:
+        folder = self._current_session_folder()
+        if folder is None:
             return
-        user_id, session_id = identity
-        session = self._session_store.load(user_id, session_id)
+        session = self._session_store.load(folder)
         if session is None:
             logger.warning(
-                "Could not load session %s/%s to reconcile its experiment index",
-                user_id,
-                session_id,
+                "Could not load session %s to reconcile its experiment index", folder
             )
             return
         entries: list[ExperimentIndexEntry] = []
@@ -1144,10 +1141,9 @@ class ExperimentManager(QObject):
             if record is None:
                 logger.warning(
                     "Skipping unreadable experiment %r while reconciling "
-                    "session %s/%s's index",
+                    "session %s's index",
                     experiment_id,
-                    user_id,
-                    session_id,
+                    folder,
                 )
                 continue
             entries.append(
@@ -1162,12 +1158,10 @@ class ExperimentManager(QObject):
             )
         session.experiments = entries
         try:
-            self._session_store.save(session)
+            self._session_store.save(session, folder)
         except OSError:
             logger.exception(
-                "Could not save session %s/%s's reconciled experiment index",
-                user_id,
-                session_id,
+                "Could not save session %s's reconciled experiment index", folder
             )
 
     def _save_current(self) -> None:

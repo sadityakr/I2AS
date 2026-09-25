@@ -607,20 +607,19 @@ class ExperimentIndexEntry:
 class Session:
     """The new middle tier between the measurement root and an experiment.
 
-    A named, resumable, per-user folder holding multiple experiments —
-    ``<measurement_root>/sessions/<user_id>/<session_id>/``, one level above
-    ``<experiment_id>/`` (the filesystem layout in ``GLOSSARY.md``'s
-    **Session**). One user can own several sessions; a session is not
+    A named, resumable folder holding multiple experiments — the one folder
+    the operator chooses, anywhere on disk, with ``<experiment_id>/`` folders
+    directly inside it (the layout in ``SessionStore``'s docstring). One user can own several sessions; a session is not
     identified by its owner alone. Persisted as ``session.json`` by
     ``SessionStore``.
 
     Attributes:
-        session_id: Unique store key (slug + date, see
-            ``SessionStore.make_session_id``).
-        user_id: Roster key of the session's owner. Also the session's path
-            segment (``sessions/<user_id>/<session_id>/``) — the two must
-            never disagree; ``SessionStore.save()`` derives the path from
-            this field.
+        session_id: The session folder's own name. Set from the folder
+            whenever the record is loaded, so a moved or renamed session is
+            still itself.
+        user_id: Roster key of the session's owner (who created it). A
+            record, not a path segment: any user may open any session
+            folder.
         name: Display name, user-chosen at creation.
         default_experiment_dir: The saved default parent folder offered when
             starting a new experiment inside this session; user-editable.

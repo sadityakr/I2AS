@@ -178,31 +178,22 @@ def _ensure_guest_user_registered(roster: UserRoster) -> None:
         roster.add(User(user_id=GUEST_USER_ID, name=GUEST_USER_NAME))
 
 
-def _resolve_active_session(store: SessionStore) -> tuple[str, str]:
-    """Return the active ``(user_id, session_id)``, auto-creating a bootstrap session if needed.
+def _resolve_active_session(store: SessionStore) -> Path:
+    """Return the active session folder, creating one on first launch.
 
     The app must never fail to start for lack of an explicit session choice
-    (the startup-wiring rule behind the Session tier — see ``GLOSSARY.md``'s
-    **Session**): when the store's active pointer is unset, points at a
-    session record that fails to load, or is in the pre-per-user-nesting
-    shape (first-ever launch, a corrupt pointer, or an older install), a
-    bootstrap session is created and activated on the spot, owned by
-    whoever is logged in (or ``GUEST_USER_ID`` when nobody is).
+    (see ``GLOSSARY.md``'s **Session**): ``SessionStore.resolve_active()``
+    creates a session under the measurement root's ``sessions/`` folder,
+    owned by whoever is logged in (or ``GUEST_USER_ID`` when nobody is),
+    whenever none is active or the active folder is gone.
 
     Args:
-        store: The ``SessionStore`` rooted at ``measurement_root() / "sessions"``.
+        store: The session registry (rooted at ``measurement_root()``).
 
     Returns:
-        The active session's ``(user_id, session_id)`` — either the pair
-        already pointed to, or a freshly created bootstrap session's.
+        The active session folder.
     """
-    active = store.get_active()
-    if active is not None and store.load(*active) is not None:
-        return active
-    user_id = app_settings.current_user_id() or GUEST_USER_ID
-    session = store.create_session(name=user_id, user_id=user_id)
-    store.set_active(user_id, session.session_id)
-    return user_id, session.session_id
+    return store.resolve_active(app_settings.current_user_id() or GUEST_USER_ID)
 
 
 def gateway_tool_context(
@@ -546,29 +537,23 @@ def main(
     # Session layer (L6 + the Session tier above it). measurement_root() is
     # the fixed, machine-level, admin-set root (never derived from the Data
     # Directory form field, which is itself now *derived from* the open
-    # experiment — see i2as.core.paths.measurement_root()). SessionStore
-    # owns the Session tier: sessions/<user_id>/<session_id>/ folders one
-    # level above experiments, nested per owner so ownership is structural,
-    # not just a field inside session.json. _ensure_guest_user_registered()
-    # guarantees the fixed Guest roster identity exists before anything looks
-    # it up; _resolve_active_session() auto-creates a bootstrap session on
-    # first-ever launch (or a corrupt/legacy-shape pointer) so the app never
-    # refuses to start for lack of an explicit session choice, owned by
-    # whoever is logged in or Guest otherwise. ExperimentStore is then rooted
-    # two levels deeper, inside that one active session's own folder —
-    # switching sessions (User menu, Resume Session…) only updates
-    # SessionStore's active pointer and takes effect on the next launch;
-    # ExperimentManager keeps this ExperimentStore for the process lifetime:
-    # it is always constructed with one real, already-resolved
-    # ExperimentStore and grows no live rebind machinery (GLOSSARY.md's
-    # Session). The user roster relocates to
-    # measurement_root()/"users.json", alongside "sessions/".
+    # experiment — see i2as.core.paths.measurement_root()). The session is
+    # the one folder the operator chooses, anywhere on disk; SessionStore is
+    # the machine's registry of them (measurement_root()/sessions.json) and
+    # _resolve_active_session() creates one under measurement_root()/sessions
+    # on first launch, so the app never refuses to start for lack of a
+    # choice. ExperimentStore is rooted AT the session folder, and every
+    # experiment, run file and analysis output lives below it in one fixed
+    # shape. Switching sessions (User menu → Session Folder…) only updates
+    # the registry and takes effect on the next launch: ExperimentManager
+    # keeps this ExperimentStore for the process lifetime (GLOSSARY.md's
+    # Session). The user roster lives at measurement_root()/"users.json".
     roster = UserRoster(measurement_root() / "users.json")
     _ensure_guest_user_registered(roster)
-    session_store = SessionStore(measurement_root() / "sessions")
-    active_user_id, active_session_id = _resolve_active_session(session_store)
+    session_store = SessionStore(measurement_root())
+    session_folder = _resolve_active_session(session_store)
     session_manager = ExperimentManager(
-        store=ExperimentStore(measurement_root() / "sessions" / active_user_id / active_session_id),
+        store=ExperimentStore(session_folder),
         roster=roster,
         orchestrator=orchestrator,
         config_name=used_entry.name if used_entry is not None else Path(used_path).name,

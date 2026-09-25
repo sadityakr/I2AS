@@ -293,12 +293,7 @@ def ticking_spool(qtbot, tmp_path, monkeypatch):
     session is created too, because that is what a live client reads its
     ``runs`` and ``feed`` out of.
     """
-    SessionStore(tmp_path / "data" / "sessions").set_active(
-        GUEST_USER_ID,
-        SessionStore(tmp_path / "data" / "sessions")
-        .create_session(name=GUEST_USER_ID, user_id=GUEST_USER_ID)
-        .session_id,
-    )
+    SessionStore(tmp_path / "data").resolve_active(GUEST_USER_ID)
     engines = []
 
     def _build(max_role: str = Role.SESSION.value):

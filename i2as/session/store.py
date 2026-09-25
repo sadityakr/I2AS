@@ -30,6 +30,16 @@ _GUI_STATE_FILENAME = "gui_state.json"
 _OUTBOX_FILENAME = "outbox.jsonl"
 _AGENT_FEED_FILENAME = "agent_actions.jsonl"
 _DATA_DIRNAME = "data"
+
+#: The machine-level registry of session folders, in the measurement root.
+SESSIONS_REGISTRY_FILENAME = "sessions.json"
+
+#: Where a session is created when nobody chose a folder (first launch), and
+#: where the session folder dialog starts.
+DEFAULT_SESSIONS_DIRNAME = "sessions"
+
+#: How many recently active sessions the registry remembers.
+MAX_RECENT_SESSIONS = 10
 _ANALYSIS_DIRNAME = "analysis"
 
 
@@ -126,9 +136,9 @@ class ExperimentStore:
         """Remember the store root without touching the filesystem.
 
         Args:
-            root: Directory holding the experiment folders (normally
-                ``<measurement_root>/sessions/<user_id>/<session_id>``, one
-                active ``SessionStore`` session's own folder).
+            root: Directory holding the experiment folders — the session
+                folder the operator chose (``SessionStore``), which holds
+                ``session.json`` beside the experiments.
         """
         self._root = Path(root)
 
@@ -437,106 +447,102 @@ class ExperimentStore:
 
 
 class SessionStore:
-    """One-folder-per-session store rooted at ``<measurement_root>/sessions``.
+    """The machine's registry of session folders, and the one way to create them.
 
-    The tier above ``ExperimentStore``: a session is a named, resumable,
-    per-user folder holding multiple experiments (see ``GLOSSARY.md``'s
-    **Session** for the tier and its filesystem layout).
-    Sessions nest one level deeper than the store's own root, under their
-    owner's ``user_id`` — ownership is structural (a directory), not just a
-    field inside ``session.json`` that has to be read to be known. Each
-    session's own ``ExperimentStore`` is rooted one level deeper still, at
-    ``<root>/<user_id>/<session_id>``.
+    **A session is a folder the operator chooses** — anywhere on disk, picked
+    in a folder dialog — and it is the only place on disk they choose. Its
+    ``session.json`` names it; everything below it has one fixed shape, so
+    a person, a script or an analysis agent can walk a whole session without
+    being told where anything is:
 
-    Layout::
+    Layout of one session::
 
-        <root>/                             <measurement_root>/sessions
-            active.json                     {"active_user_id": ..., "active_session_id": ..., ...}
-            <user_id>/
-                <session_id>/
-                    session.json
-                    <experiment_id>/         an ExperimentStore rooted here
+        <session folder>/                  chosen by the operator
+            session.json                   name, owner, experiment index
+            active.json                    the session's active experiment
+            001_<experiment>/              an ExperimentStore is rooted at
+            002_<experiment>/              the session folder itself
 
-    This ``active.json`` tracks the one active *session* for the whole
-    machine; it is a distinct file from ``ExperimentStore``'s own
-    ``active.json``, which lives two levels deeper (inside a session
-    folder) and tracks that session's active *experiment*. The two must
-    never be confused.
+    The registry lives in the machine's measurement root, next to the user
+    roster, because which session is active is a fact about this machine::
 
-    The store creates nothing on construction — directories appear on the
-    first ``save()``, exactly like ``ExperimentStore``.
+        <measurement_root>/
+            sessions.json                  {"active": <folder>, "recent": [<folder>, …]}
+            sessions/                      where a session is created when
+                                           nobody chose one (first launch)
+
+    Switching sessions is deferred until the next launch: the open
+    ``ExperimentStore`` stays rooted where it started (see ``GLOSSARY.md``'s
+    **Session**). The store creates nothing on construction.
     """
 
     def __init__(self, root: Path) -> None:
-        """Remember the store root without touching the filesystem.
+        """Remember the registry's folder without touching the filesystem.
 
         Args:
-            root: Directory holding the session folders (normally
-                ``<measurement_root>/sessions``).
+            root: The measurement root; ``sessions.json`` is read and written
+                here.
         """
         self._root = Path(root)
 
     @property
     def root(self) -> Path:
-        """The store's root directory."""
+        """The registry's folder (the measurement root)."""
         return self._root
 
-    def make_session_id(self, name: str, created_utc: str, user_id: str) -> str:
-        """Derive a unique session id from the name, date, and owner.
+    @property
+    def registry_path(self) -> Path:
+        """The registry file, ``<root>/sessions.json``."""
+        return self._root / SESSIONS_REGISTRY_FILENAME
 
-        ``YYYYMMDD_<slug>`` with a ``_2``, ``_3`` … suffix on collision —
-        the same scheme as ``ExperimentStore.make_experiment_id``, checked
-        against ``list_sessions(user_id)`` instead of ``list_experiments()``.
-        Collisions are scoped to one user's own folder, not the whole store:
-        two different users picking the same name on the same day never
-        fight over a shared suffix counter, since their paths never collide.
-
-        Args:
-            name: The session's display name (any text; slugged).
-            created_utc: ISO 8601 creation time (its date part is used).
-            user_id: Roster key of the intended owner.
+    def default_parent(self) -> Path:
+        """Return where a session nobody chose a folder for is created.
 
         Returns:
-            A store-unique (within ``user_id``'s own folder) session id.
+            ``<root>/sessions`` — also where the folder dialog starts.
+        """
+        return self._root / DEFAULT_SESSIONS_DIRNAME
+
+    @staticmethod
+    def is_session_folder(folder: str | Path) -> bool:
+        """Whether a folder is a session (holds a ``session.json``).
+
+        Args:
+            folder: The folder.
+
+        Returns:
+            ``True`` when ``<folder>/session.json`` exists.
+        """
+        return (Path(folder) / _SESSION_FILENAME).is_file()
+
+    def make_session_folder(self, parent: str | Path, name: str, created_utc: str) -> Path:
+        """Return a new, unused ``<parent>/YYYYMMDD_<slug>`` folder path.
+
+        Args:
+            parent: The folder the session goes into.
+            name: The session's display name (slugged).
+            created_utc: ISO 8601 creation time (its date part is used).
+
+        Returns:
+            A path that does not exist yet (``_2``, ``_3`` … on collision).
         """
         date_part = re.sub(r"[^0-9]", "", created_utc[:10]) or "00000000"
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "session"
-        base = f"{date_part}_{slug}"
-        candidate = base
-        counter = 2
-        existing = set(self.list_sessions(user_id))
-        while candidate in existing:
-            candidate = f"{base}_{counter}"
+        base = Path(parent) / f"{date_part}_{slug}"
+        candidate, counter = base, 2
+        while candidate.exists():
+            candidate = base.with_name(f"{base.name}_{counter}")
             counter += 1
         return candidate
 
-    def list_sessions(self, user_id: str) -> list[str]:
-        """Return every session id owned by ``user_id`` (sorted; [] when none).
+    def create_session(self, folder: str | Path, name: str, user_id: str) -> Session:
+        """Make *folder* a new session, owned by *user_id*, and save it.
 
-        Ownership is structural (a directory, ``<root>/<user_id>/``), so
-        this is a cheap directory listing — no need to open every
-        ``session.json`` to filter, unlike the flat, unnested layout this
-        replaced.
+        The folder must be new or empty: a session's layout is fixed, and a
+        folder that already holds other things would not be one.
 
         Args:
-            user_id: Roster key whose sessions to list.
-
-        Returns:
-            Sorted session ids owned by ``user_id``.
-        """
-        user_dir = self._root / user_id
-        if not user_dir.is_dir():
-            return []
-        return sorted(
-            entry.name
-            for entry in user_dir.iterdir()
-            if entry.is_dir() and (entry / _SESSION_FILENAME).is_file()
-        )
-
-    def create_session(self, name: str, user_id: str) -> Session:
-        """Create, save, and return a new ``Session`` owned by ``user_id``.
-
-        Args:
+            folder: The session folder the operator chose.
             name: The session's display name.
             user_id: Roster key of the owner.
 
@@ -544,101 +550,152 @@ class SessionStore:
             The newly created, already-saved ``Session``.
 
         Raises:
-            OSError: If the file cannot be written.
+            ValueError: If *folder* is already a session or is not empty.
+            OSError: If the folder or file cannot be written.
         """
+        path = Path(folder)
+        if self.is_session_folder(path):
+            raise ValueError(f"{path} is already a session; open it instead")
+        if path.exists() and any(path.iterdir()):
+            raise ValueError(f"{path} is not empty; a new session needs an empty folder")
         created = _utc_now_iso()
         session = Session(
-            session_id=self.make_session_id(name, created, user_id),
+            session_id=path.name,
             user_id=user_id,
             name=name,
             created_utc=created,
             last_opened_utc=created,
         )
-        self.save(session)
+        self.save(session, path)
         return session
 
-    def load(self, user_id: str, session_id: str) -> Session | None:
-        """Load one session record, tolerating a corrupt file.
+    def load(self, folder: str | Path) -> Session | None:
+        """Load one session's record, tolerating a corrupt file.
 
         Args:
-            user_id: Roster key of the owner (the session's path segment).
-            session_id: The store key.
+            folder: The session folder.
 
         Returns:
-            The record, or ``None`` when missing/unreadable/not JSON. The
-            record still loads (tolerant-parse) even when its
-            ``schema_version`` is newer than this app's ``SCHEMA_VERSION``
-            (logged at WARNING) — same contract as ``ExperimentStore.load``.
+            The record, or ``None`` when missing/unreadable/not JSON. Its
+            ``session_id`` is always the folder's own name, whatever the file
+            says, so a session folder that was renamed or moved is still
+            itself. A record from a newer app still loads (logged at
+            WARNING) — same contract as ``ExperimentStore.load``.
         """
-        data = _read_json(self._root / user_id / session_id / _SESSION_FILENAME)
+        path = Path(folder)
+        data = _read_json(path / _SESSION_FILENAME)
         if data is None:
             return None
         session = Session.from_dict(data)
+        session.session_id = path.name
         if session.schema_version > SCHEMA_VERSION:
             logger.warning(
                 "Session %s was written by a newer app (schema_version=%d > %d); "
                 "loading read-only",
-                session_id,
+                path,
                 session.schema_version,
                 SCHEMA_VERSION,
             )
         return session
 
-    def save(self, session: Session) -> None:
-        """Persist ``session`` atomically under its ``user_id``/``session_id``.
+    def save(self, session: Session, folder: str | Path) -> None:
+        """Persist ``session`` atomically as ``<folder>/session.json``.
 
         Args:
-            session: The record to write; ``user_id`` and ``session_id``
-                must both be non-empty.
+            session: The record to write; ``user_id`` must be non-empty.
+            folder: The session folder.
 
         Raises:
-            ValueError: If ``session.user_id`` or ``session.session_id`` is
-                empty.
+            ValueError: If ``session.user_id`` is empty.
             OSError: If the file cannot be written.
         """
         if not session.user_id:
             raise ValueError("Session.user_id must be set before save()")
-        if not session.session_id:
-            raise ValueError("Session.session_id must be set before save()")
-        path = self._root / session.user_id / session.session_id / _SESSION_FILENAME
-        _write_json_atomic(path, session.to_dict())
+        _write_json_atomic(Path(folder) / _SESSION_FILENAME, session.to_dict())
 
-    def get_active(self) -> tuple[str, str] | None:
-        """Return the persisted ``(user_id, session_id)`` active pair, or ``None``.
+    def _registry(self) -> dict[str, object]:
+        data = _read_json(self.registry_path)
+        return data if isinstance(data, dict) else {}
 
-        Returns ``None`` for an unset pointer, a corrupt file, or a pointer
-        written in the pre-per-user-nesting shape (``{"active": "..."}``,
-        which has neither of the keys this reads) — all three tolerantly
-        fall through to the caller's "unset" bootstrap branch (see
-        ``i2as.main._resolve_active_session``).
+    def get_active(self) -> Path | None:
+        """Return the active session folder, or ``None``.
+
+        Returns:
+            The folder the registry names, when it still is a session;
+            ``None`` for an unset pointer, a corrupt file, or a folder that
+            is gone or no longer holds a ``session.json`` — all of which fall
+            through to the caller's bootstrap branch.
         """
-        data = _read_json(self._root / _ACTIVE_FILENAME)
-        if not isinstance(data, dict):
+        active = self._registry().get("active")
+        if not isinstance(active, str) or not active:
             return None
-        user_id = data.get("active_user_id")
-        session_id = data.get("active_session_id")
-        if isinstance(user_id, str) and user_id and isinstance(session_id, str) and session_id:
-            return user_id, session_id
-        return None
+        folder = Path(active)
+        return folder if self.is_session_folder(folder) else None
 
-    def set_active(self, user_id: str, session_id: str) -> None:
-        """Persist the active ``(user_id, session_id)`` pair.
+    def set_active(self, folder: str | Path) -> None:
+        """Make *folder* the session the next launch opens, and put it first in recents.
 
         Args:
-            user_id: Owner of the session to resume on next start.
-            session_id: The session to resume on next start.
+            folder: A session folder.
 
         Raises:
-            OSError: If the pointer file cannot be written.
+            ValueError: If *folder* is not a session.
+            OSError: If the registry cannot be written.
         """
+        path = Path(folder).resolve()
+        if not self.is_session_folder(path):
+            raise ValueError(f"{path} is not a session folder (no session.json)")
+        recent = [str(path)] + [
+            entry for entry in self._recent_entries() if entry != str(path)
+        ]
         _write_json_atomic(
-            self._root / _ACTIVE_FILENAME,
+            self.registry_path,
             {
-                "active_user_id": user_id,
-                "active_session_id": session_id,
+                "active": str(path),
+                "recent": recent[:MAX_RECENT_SESSIONS],
                 "schema_version": SCHEMA_VERSION,
             },
         )
+
+    def resolve_active(self, user_id: str) -> Path:
+        """Return the active session folder, creating one on first launch.
+
+        The application must never refuse to start for lack of a session
+        choice: when no session is active (first launch, a corrupt registry,
+        a folder that was moved or deleted), a session named after
+        *user_id* is created under ``default_parent()`` and made active.
+
+        Args:
+            user_id: Who owns a session created here.
+
+        Returns:
+            The active session folder.
+
+        Raises:
+            OSError: If a bootstrap session cannot be written.
+        """
+        active = self.get_active()
+        if active is not None and self.load(active) is not None:
+            return active
+        folder = self.make_session_folder(self.default_parent(), user_id, _utc_now_iso())
+        self.create_session(folder, name=user_id, user_id=user_id)
+        self.set_active(folder)
+        return folder.resolve()
+
+    def _recent_entries(self) -> list[str]:
+        recent = self._registry().get("recent")
+        return [entry for entry in recent if isinstance(entry, str)] if isinstance(recent, list) else []
+
+    def recent(self) -> list[Path]:
+        """Return the recently active session folders that still exist, newest first.
+
+        Returns:
+            Up to ``MAX_RECENT_SESSIONS`` folders, each holding a
+            ``session.json``.
+        """
+        return [
+            Path(entry) for entry in self._recent_entries() if self.is_session_folder(entry)
+        ]
 
 
 class UserRoster:
