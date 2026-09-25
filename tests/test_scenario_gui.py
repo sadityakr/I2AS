@@ -352,9 +352,9 @@ def test_click_storm_during_a_long_datapoint(
 
         # Toggle the takeover strip.
         strip = monitor_win._takeover_strip
-        strip._radios[ev.AgentGate.READ_ONLY.value].click()
+        strip._gate_buttons[ev.AgentGate.READ_ONLY.value].click()
         QApplication.processEvents()
-        strip._radios[ev.AgentGate.ACTIVE.value].click()
+        strip._gate_buttons[ev.AgentGate.ACTIVE.value].click()
         QApplication.processEvents()
 
         # Open the Procedure window (already built; bring it to front) and
@@ -894,7 +894,7 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
     assert not any(action.refused for action in panel.actions() if action.actor_id == "runner-7")
 
     # A refusal is visually distinct and names the rule.
-    strip._radios[ev.AgentGate.REVOKED.value].click()
+    strip._gate_buttons[ev.AgentGate.REVOKED.value].click()
     settled(orchestrator)
     gateway.submit(ev.CommandName.START_MONITORING)
     settled(orchestrator)
@@ -912,7 +912,7 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
 
     # The strip's own gate/attendance are what the gateway's permission check
     # reads — set here, seen there.
-    strip._radios[ev.AgentGate.ACTIVE.value].click()
+    strip._gate_buttons[ev.AgentGate.ACTIVE.value].click()
     settled(orchestrator)
     assert gateway.agent_gate() == ev.AgentGate.ACTIVE
     win.close()

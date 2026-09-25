@@ -238,6 +238,65 @@ QPushButton[class="danger"]:disabled {{
     color: {TEXT_ON_ACCENT};
 }}
 
+/* ── Buttons — segmented control (the header's Agent access switch) ──── */
+/* Joined, checkable buttons: exactly one filled, in the colour of the state
+   it selects, so the switch reads as a control and its current setting at
+   a glance. The status bar says the same thing in words. */
+QPushButton[class="segment"] {{
+    border-radius: 0px;
+    padding: 4px 12px;
+    min-width: 76px;
+}}
+QPushButton[class="segment"][position="middle"],
+QPushButton[class="segment"][position="last"] {{
+    border-left: none;
+}}
+QPushButton[class="segment"][position="first"] {{
+    border-top-left-radius: 4px;
+    border-bottom-left-radius: 4px;
+}}
+QPushButton[class="segment"][position="last"] {{
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}}
+QPushButton[class="segment"]:checked {{
+    color: {TEXT_ON_ACCENT};
+    font-weight: bold;
+}}
+QPushButton[class="segment"][gate="active"]:checked {{
+    background-color: {STATUS_OK};
+    border-color: {STATUS_OK};
+}}
+QPushButton[class="segment"][gate="read_only"]:checked {{
+    background-color: {STATUS_WARN};
+    border-color: {STATUS_WARN};
+    color: {TEXT_PRIMARY};
+}}
+QPushButton[class="segment"][gate="revoked"]:checked {{
+    background-color: {STATUS_ERROR};
+    border-color: {STATUS_ERROR};
+}}
+
+/* ── Buttons — toggle (on/off, e.g. Attended) ──────────────────────────── */
+QPushButton[class="toggle"] {{
+    border-radius: 12px;
+    padding: 3px 12px;
+    min-width: 88px;
+    color: {TEXT_SECONDARY};
+}}
+
+/* The status bar's agent line sits on the bar's own colour. */
+QWidget#agent_status_line,
+QWidget#agent_status_line QLabel {{
+    background: transparent;
+}}
+QPushButton[class="toggle"]:checked {{
+    background-color: {BTN_SECONDARY_PRESSED};
+    border-color: {ACCENT};
+    color: {ACCENT};
+    font-weight: bold;
+}}
+
 /* ── Emergency acknowledge (targeted by objectName) ──────────────────── */
 /* Deliberately at the smallest size/padding used anywhere in this
    stylesheet (matches QLabel[class="secondary_label"]'s 9pt) — it must

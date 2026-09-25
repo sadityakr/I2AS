@@ -543,6 +543,10 @@ class MonitorWindow(QMainWindow):
         self._state_name = OrchestratorState.IDLE.value
         self._state_label = QLabel(f"State: {self._state_name}")
         self._status_bar.addWidget(self._state_label)
+        # The strip's INDICATORS go to the status bar, beside the state:
+        # the header holds only what the operator sets, the status bar what
+        # the station reports (gui/takeover_strip.py).
+        self._status_bar.addPermanentWidget(self._takeover_strip.status_line)
         # Current status-bar 'level' ("", "active", "error"); tracked so the
         # dynamic-property restyle only fires when the level actually changes.
         self._status_level = ""
