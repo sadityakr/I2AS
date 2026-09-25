@@ -68,6 +68,23 @@ from i2as.gui.theme import (
     build_stylesheet,
 )
 from i2as.gui.trend_plot_panel import TrendPlotPanel
+
+
+def _alert_text(win) -> str:
+    """Every alert the Monitor window holds, as one string."""
+    return " | ".join(alert.message for alert in win._alerts.alerts())
+
+
+def _alert_button(win, name: str):
+    """The action button *name* on a row the alert band draws now, or ``None``.
+
+    Searches the band's current rows, not its children: a row it has just
+    replaced is only scheduled for deletion.
+    """
+    for row in win._alert_band.rows:
+        if row.action_button is not None and row.action_button.objectName() == name:
+            return row.action_button
+    return None
 from i2as.gui import widget_lifecycle
 from i2as.virtual_instruments.base import BaseVirtualInstrument
 from tests.instrument_modes import (
@@ -655,11 +672,11 @@ def test_instrument_panel_retry_button_blocked_while_run_claims_the_instrument(
         orch.shutdown()
 
 
-def test_monitor_window_banner_shows_and_clears_vi_fault_warning(
+def test_monitor_window_alert_shows_and_clears_vi_fault_warning(
     station, orchestrator, monitor_win, qtbot
 ):
-    """MonitorWindow's banner shows a per-VI fault warning (error_event) and
-    calms once every runtime fault clears."""
+    """A per-VI fault (error_event) raises its own alert, with Retry, and
+    only the fault's clearing removes it — never an unrelated alert."""
     vi_name = "magnet_z"
     vi = station._virtual_instruments[vi_name]
 
@@ -672,13 +689,19 @@ def test_monitor_window_banner_shows_and_clears_vi_fault_warning(
     )
     with qtbot.waitSignal(orchestrator.error_event, timeout=500):
         orchestrator.error_event.emit(event)
-    assert monitor_win._banner.isVisible()
-    assert vi_name in monitor_win._banner._label.text()
+    alert = monitor_win._alerts.get(f"fault:{vi_name}")
+    assert alert is not None and vi_name in alert.message
+    assert alert.action_label == "Retry" and not alert.dismissible
+    assert _alert_button(monitor_win, f"retry_fault_{vi_name}_btn") is not None
+    assert monitor_win._alert_band.isVisible()
+    # An unrelated alert that must survive the fault's clearing — the old
+    # single-slot banner erased whatever was showing.
+    monitor_win._on_action_failed("temp", "set_setpoint", "above limit")
 
     vi._driver._simulate_error = False
     station.get_state()  # clears the Station-side fault record
     _publish_state(orchestrator, state)  # MonitorWindow polls vi_faults() here
-    assert not monitor_win._banner.isVisible()
+    assert monitor_win._alerts.keys() == ["failed:temp.set_setpoint"]
 
 
 class _SpecControlVI(BaseVirtualInstrument):
@@ -1909,13 +1932,13 @@ def test_switch_user_saves_outgoing_and_loads_incoming_session(
 
     win._switch_user("jdoe")
     assert win._current_user_id == "jdoe"
-    assert win._current_user_label.text() == "Logged in as J. Doe"
+    assert win._current_user_label.text() == "J. Doe"
     assert _app_settings.current_user_id() == "jdoe"
     assert win._session_info._sample_name_input.text() == ""  # jdoe's file is fresh
 
     win._session_info._sample_name_input.setText("SampleB")
     win._switch_user("asmith")
-    assert win._current_user_label.text() == "Logged in as A. Smith"
+    assert win._current_user_label.text() == "A. Smith"
     assert win._session_info._sample_name_input.text() == ""  # asmith's file is fresh
 
     win._switch_user("jdoe")
@@ -2212,7 +2235,7 @@ def test_open_session_folder_dialog_resolves_logged_out_user_to_guest(
 def test_the_header_names_the_session_in_use(
     station, orchestrator, session_manager, qtbot, tmp_path
 ):
-    """The Monitor header shows the session's name, with its folder as the tooltip."""
+    """The context bar shows the session's name, with its folder as the tooltip."""
     from PyQt6.QtWidgets import QLabel
 
     from i2as.session.store import SessionStore
@@ -2227,8 +2250,9 @@ def test_the_header_names_the_session_in_use(
     qtbot.addWidget(win)
 
     label = win.findChild(QLabel, "session_label")
-    assert label.text() == "Session: MnSi cooldown 4"
+    assert label.text() == "Session <b>MnSi cooldown 4</b>"
     assert label.toolTip() == str(folder)
+    assert "MnSi cooldown 4" in win.windowTitle()
 
 
 # ── Data Dir: derived-but-editable from the open session ───────────────────────
@@ -2350,17 +2374,21 @@ def test_get_data_dir_for_run_returns_path_when_no_experiment_open(monitor_win):
     assert monitor_win.get_data_dir_for_run() == "D:/anywhere"
 
 
-# ── store_health_changed → banner ───────────────────────────────────────────────
+# ── store_health_changed → alert ────────────────────────────────────────────────
 
-def test_store_health_changed_shows_and_clears_banner(monitor_win_session, session_manager):
-    """A save failure shows a persistent banner error; recovery clears it."""
+def test_store_health_changed_shows_and_clears_its_alert(monitor_win_session, session_manager):
+    """A save failure raises a persistent alert; recovery resolves only that one."""
     win = monitor_win_session
+    win._on_action_blocked("Cannot initiate: procedure running")
     session_manager.store_health_changed.emit({"ok": False, "detail": "disk full"})
-    assert win._banner.isVisible()
-    assert "disk full" in win._banner._label.text()
+    alert = win._alerts.get("store")
+    assert alert is not None and "disk full" in alert.message
+    assert not alert.dismissible
+    assert win._alert_band.isVisible()
 
     session_manager.store_health_changed.emit({"ok": True, "detail": ""})
-    assert not win._banner.isVisible()
+    assert win._alerts.get("store") is None
+    assert win._alerts.keys() == ["blocked:Cannot initiate: procedure running"]
 
 
 # ── _save_session targets the correct tier ──────────────────────────────────────
@@ -2418,7 +2446,7 @@ def test_open_login_dialog_full_flow(station, orchestrator, qtbot, tmp_path, mon
     win._open_login_dialog()
 
     assert win._current_user_id == "jdoe"
-    assert win._current_user_label.text() == "Logged in as J. Doe"
+    assert win._current_user_label.text() == "J. Doe"
 
 
 def test_instrument_info_action_opens_dialog_with_config_metadata(
@@ -2466,17 +2494,20 @@ def test_procedure_control_buttons_exist(procedure_win, qtbot):
 
 
 def test_ack_button_visible_in_emergency(monitor_win, orchestrator):
-    """Emergency acknowledge button appears when EMERGENCY state is emitted.
+    """The emergency alert, with its acknowledge button, appears in EMERGENCY.
 
     Single home is the Monitor window — see
     test_ack_button_absent_from_procedure_window for the ProcedureWindow side.
     """
     orchestrator.state_changed.emit(OrchestratorState.EMERGENCY.value)
-    assert monitor_win._ack_btn.isVisible()
+    ack = _alert_button(monitor_win, "ack_emergency_btn")
+    assert ack is not None and ack.isVisible()
+    assert monitor_win._alerts.get("emergency").severity == "emergency"
 
     # Disappears on acknowledge
     orchestrator.state_changed.emit(OrchestratorState.IDLE.value)
-    assert not monitor_win._ack_btn.isVisible()
+    assert _alert_button(monitor_win, "ack_emergency_btn") is None
+    assert monitor_win._alerts.get("emergency") is None
 
 
 def test_ack_button_visible_when_window_opened_after_emergency_already_active(
@@ -2503,7 +2534,8 @@ def test_ack_button_visible_when_window_opened_after_emergency_already_active(
     qtbot.addWidget(win)
     win.show()
 
-    assert win._ack_btn.isVisible()
+    ack = _alert_button(win, "ack_emergency_btn")
+    assert ack is not None and ack.isVisible()
 
 
 def test_ack_button_absent_from_procedure_window(procedure_win):
@@ -2515,11 +2547,11 @@ def test_ack_button_absent_from_procedure_window(procedure_win):
     assert procedure_win.findChild(QPushButton, "ack_emergency_btn") is None
 
 
-def test_hold_banner_shows_message_and_dismisses_on_clear(monitor_win, orchestrator, monkeypatch):
-    """A plain hold condition (NOT emergency) populates the banner.
+def test_hold_alert_shows_message_and_resolves_on_clear(monitor_win, orchestrator, monkeypatch):
+    """A plain hold condition (NOT emergency) raises its own alert with the acknowledge.
 
     Regression test: previously the ACK button appeared alone with no
-    explanation on the banner above it (see _refresh_hold_banner()). Stubs
+    explanation beside it (see _refresh_hold_alerts()). Stubs
     the window's own read surface — the status mirror (held_vi_names /
     get_operational_status) — rather than reaching into the Station's private
     condition registry.
@@ -2549,20 +2581,53 @@ def test_hold_banner_shows_message_and_dismisses_on_clear(monitor_win, orchestra
     monitor_win._in_emergency = False
     monitor_win._refresh_ack_controls()
 
-    assert monitor_win._ack_btn.isVisible()
-    assert monitor_win._banner.isVisible()
-    assert "coolant_low" in monitor_win._banner._label.text()
-    assert "magnet_z" in monitor_win._banner._label.text()
+    alert = monitor_win._alerts.get("hold:safety:coolant_low")
+    assert alert is not None
+    assert "coolant_low" in alert.message and "magnet_z" in alert.message
+    assert _alert_button(monitor_win, "ack_unlock_btn").isVisible()
 
-    # Clearing the hold condition dismisses the banner it owns.
+    # Clearing the hold condition resolves the alert it owns.
     held.clear()
     monkeypatch.setattr(mirror, "held_vi_names", lambda: frozenset())
     monkeypatch.setattr(mirror, "get_operational_status", lambda: {"conditions": []})
 
     monitor_win._refresh_ack_controls()
 
-    assert not monitor_win._ack_btn.isVisible()
-    assert not monitor_win._banner.isVisible()
+    assert monitor_win._alerts.keys("hold:") == []
+    assert not monitor_win._alert_band.isVisible()
+
+
+def test_a_station_wide_hold_reads_every_instrument(monitor_win, monkeypatch):
+    """``affected == "all"`` is a word, not a list of letters."""
+    mirror = monitor_win._mirror
+    monkeypatch.setattr(mirror, "held_vi_names", lambda: frozenset({"magnet_z"}))
+    monkeypatch.setattr(
+        mirror,
+        "get_operational_status",
+        lambda: {
+            "conditions": [
+                {"key": "k", "severity": "hold", "message": "Held", "affected": "all"}
+            ]
+        },
+    )
+    monitor_win._in_emergency = False
+    monitor_win._refresh_ack_controls()
+    assert monitor_win._alerts.get("hold:k").message == "Held — affecting every instrument"
+
+
+def test_the_context_bar_shows_user_session_and_experiment(monitor_win_session, session_manager):
+    """Band 1 names the open experiment by number and title, and says when none is open."""
+    win = monitor_win_session
+    label = win._experiment_label
+    if session_manager.current_experiment() is None:
+        assert label.text() == "No experiment open"
+        assert label.property("open") == "false"
+    session_manager.start_experiment("Hall bar B", "jdoe", {})
+    record = session_manager.current_experiment()
+    number = record.experiment_id.split("_", 1)[0]
+    assert label.text() == f"{number} Hall bar B"
+    assert label.property("open") == "true"
+    assert f"{number} Hall bar B" in win.windowTitle()
 
 
 def test_progress_bar_updates(procedure_win, orchestrator):
@@ -3246,19 +3311,42 @@ def test_banner_repeat_increments_counter_no_stack(qtbot):
     assert banner.isVisible()
 
 
-def test_monitor_error_signal_drives_banner(monitor_win, orchestrator):
-    """error_occurred routes to the MonitorWindow banner (no modal dialog)."""
+def test_monitor_error_signal_drives_an_alert(monitor_win, orchestrator):
+    """error_occurred adds an error alert (no modal dialog); a repeat counts."""
     orchestrator.error_occurred.emit("Interlock tripped")
-    assert monitor_win._banner.isVisible()
-    assert monitor_win._banner.property("severity") == "error"
-    assert "Interlock tripped" in monitor_win._banner._label.text()
+    orchestrator.error_occurred.emit("Interlock tripped")
+    [alert] = monitor_win._alerts.alerts()
+    assert alert.severity == "error" and alert.message == "Interlock tripped"
+    assert alert.count == 2
+    assert monitor_win._alert_band.row_for(alert.key).property("severity") == "error"
 
 
-def test_monitor_action_blocked_drives_banner(monitor_win, orchestrator):
-    """action_blocked routes to the MonitorWindow banner as a warning."""
+def test_monitor_action_blocked_drives_an_expiring_warning(monitor_win, orchestrator):
+    """action_blocked adds a warning that expires once it stops recurring."""
     orchestrator.action_blocked.emit("Cannot initiate: procedure running")
-    assert monitor_win._banner.isVisible()
-    assert monitor_win._banner.property("severity") == "warning"
+    [alert] = monitor_win._alerts.alerts()
+    assert alert.severity == "warning" and alert.expires
+    assert monitor_win._alert_band.isVisible()
+
+
+def test_an_emergency_carries_its_cause_once(monitor_win, orchestrator):
+    """The error that caused the emergency is the emergency's text, not a second row."""
+    orchestrator.error_occurred.emit("EMERGENCY: coolant low")
+    orchestrator.state_changed.emit(OrchestratorState.EMERGENCY.value)
+    orchestrator.error_occurred.emit("Emergency shutdown executed.")
+
+    assert monitor_win._alerts.get("emergency").message == "EMERGENCY — coolant low"
+    assert monitor_win._alerts.keys("engine:") == ["engine:Emergency shutdown executed."]
+
+    orchestrator.state_changed.emit(OrchestratorState.IDLE.value)
+    assert monitor_win._alerts.get("emergency") is None
+
+
+def test_two_errors_are_two_rows_not_a_replacement(monitor_win, orchestrator):
+    """The old banner showed only the latest message; each cause now keeps its row."""
+    orchestrator.error_occurred.emit("Interlock tripped")
+    monitor_win._on_action_failed("magnet_z", "set_field", "above limit")
+    assert len(monitor_win._alert_band.rows) == 2
 
 
 def test_procedure_error_signal_drives_banner(procedure_win, orchestrator):
@@ -3663,13 +3751,14 @@ def test_startup_candidates_inserts_shipped_baseline_for_user_config(tmp_path, m
     assert shipped_sim in candidates
 
 
-def test_startup_warning_shown_in_banner(station, orchestrator, qtbot):
-    """A startup fallback warning is surfaced in the notification banner."""
+def test_startup_warning_shown_as_an_alert(station, orchestrator, qtbot):
+    """A startup fallback warning is surfaced in the alert band."""
     win = MonitorWindow(
         station, orchestrator, startup_warning="active config was invalid"
     )
     qtbot.addWidget(win)
-    assert not win._banner.isHidden()
+    assert not win._alert_band.isHidden()
+    assert "active config was invalid" in win._alerts.get("startup:config").message
 
 
 def test_offscreen_saved_geometry_recenters(station, orchestrator, qtbot):
@@ -3721,7 +3810,7 @@ def test_monitoring_button_mirrors_orchestrator_state(monitor_win, orchestrator)
 def test_monitoring_button_snaps_back_when_stop_refused(
     monitor_win, orchestrator, qtbot
 ):
-    """A refused stop (non-IDLE state) re-syncs the button and warns via banner."""
+    """A refused stop (non-IDLE state) re-syncs the button and raises a warning."""
     btn = monitor_win.findChild(QPushButton, "monitoring_btn")
     orchestrator.start_monitoring()
     qtbot.waitUntil(lambda: btn.isChecked(), timeout=2000)
@@ -3732,7 +3821,7 @@ def test_monitoring_button_snaps_back_when_stop_refused(
     with ticks_paused(orchestrator):
         set_on_engine(orchestrator, "_state", OrchestratorState.RAMPING)
         btn.click()  # attempt to stop
-        qtbot.waitUntil(lambda: monitor_win._banner.isVisible(), timeout=2000)
+        qtbot.waitUntil(lambda: monitor_win._alert_band.isVisible(), timeout=2000)
         assert orchestrator.is_monitoring() is True
         assert btn.isChecked(), "button must snap back to the confirmed state"
         set_on_engine(orchestrator, "_state", OrchestratorState.IDLE)
@@ -3760,8 +3849,8 @@ def _degraded_monitor_setup(tmp_path, fail_times: int):
     return station, orch
 
 
-def test_offline_instrument_gets_fault_card_and_banner(tmp_path, qtbot):
-    """An offline VI renders a control-free fault card and a startup banner."""
+def test_offline_instrument_gets_fault_card_and_alert(tmp_path, qtbot):
+    """An offline VI renders a control-free fault card and a startup alert."""
     station, orch = _degraded_monitor_setup(tmp_path, fail_times=0)
     try:
         win = MonitorWindow(station, orch)
@@ -3778,10 +3867,10 @@ def test_offline_instrument_gets_fault_card_and_banner(tmp_path, qtbot):
         assert card.findChild(QPushButton, "bad_vi_offline_details_btn") is not None
         assert card.findChild(QPushButton, "bad_vi_connect_btn") is not None
         assert card.findChild(QPushButton, "bad_vi_lifecycle_btn") is None
-        # Banner announces the degraded state.
-        assert win._banner.isVisible()
-        assert "bad_vi" in win._banner._label.text()
-        assert "offline" in win._banner._label.text()
+        # An alert announces the degraded state.
+        assert win._alert_band.isVisible()
+        message = win._alerts.get("startup:offline").message
+        assert "bad_vi" in message and "offline" in message
     finally:
         orch.shutdown()
 
@@ -4018,7 +4107,7 @@ def test_connect_click_swaps_the_offline_card_back(qtbot):
 
 
 def test_disconnect_is_blocked_for_a_vi_the_running_run_claims(qtbot):
-    """The refusal reaches the operator through the banner, not a dialog.
+    """The refusal reaches the operator through the alert band, not a dialog.
 
     Disconnect is gated by the claim, not by the state (see
     ``Orchestrator.disconnect_instrument()``), so the card that gets the
@@ -4034,8 +4123,8 @@ def test_disconnect_is_blocked_for_a_vi_the_running_run_claims(qtbot):
         ).click()
 
         assert station.has_vi("magnet_z") is True
-        assert win._banner.isVisible()
-        assert "magnet_z" in win._banner._label.text()
+        assert win._alert_band.isVisible()
+        assert "magnet_z" in _alert_text(win)
     finally:
         orch._state = OrchestratorState.IDLE
         orch._procedure = None

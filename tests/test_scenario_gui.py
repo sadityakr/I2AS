@@ -516,15 +516,15 @@ def test_disconnect_mid_run_is_refused_for_the_claimed_vi_and_allowed_for_the_fr
     qtbot.waitUntil(lambda: orchestrator.state != "IDLE", timeout=5000)
 
     # The VI the run claims: refused, named, still connected.
-    monitor_win._banner.hide()
+    monitor_win._alerts.dismiss_all()
     monitor_win.findChild(QGroupBox, "magnet_z_panel").findChild(
         QPushButton, "magnet_z_disconnect_btn"
     ).click()
     settled(orchestrator)
     assert station.has_vi("magnet_z") is True, "the claimed VI must stay connected"
     assert monitor_win._offline_cards == {}
-    assert monitor_win._banner.isVisible()
-    assert "magnet_z" in monitor_win._banner._label.text()
+    assert monitor_win._alert_band.isVisible()
+    assert any("magnet_z" in a.message for a in monitor_win._alerts.alerts())
 
     # The VI it does not claim: released mid-run, card swapped, run continues.
     monitor_win.findChild(QGroupBox, "temperature_panel").findChild(
@@ -561,7 +561,7 @@ def test_a_fault_during_a_run_fails_it_and_acknowledge_retry_recover_it(
     qtbot.waitUntil(lambda: orchestrator.state == "IDLE", timeout=10000)
     qtbot.waitUntil(lambda: "magnet_z" in station.vi_faults(), timeout=5000)
 
-    assert monitor_win._banner.isVisible()
+    assert monitor_win._alert_band.isVisible()
 
     panel = next(p for p in monitor_win._panels if p.vi_name == "magnet_z")
     qtbot.waitUntil(lambda: panel._fault_row.isVisible(), timeout=5000)
@@ -630,14 +630,16 @@ def test_emergency_standby_during_measuring_reaches_emergency_and_acknowledge_re
     orchestrator.emergency_standby("scenario test")
     qtbot.waitUntil(lambda: orchestrator.state == "EMERGENCY", timeout=10000)
 
-    assert monitor_win._ack_btn.isVisible()
-    assert monitor_win._banner.isVisible()
+    # The current row's button: a replaced row is only scheduled for deletion.
+    ack = monitor_win._alert_band.row_for("emergency").action_button
+    assert ack is not None and ack.isVisible()
+    assert monitor_win._alerts.get("emergency") is not None
     _screenshot(monitor_win, "04_emergency")
 
-    monitor_win._ack_btn.click()
+    ack.click()
     settled(orchestrator)
     qtbot.waitUntil(lambda: orchestrator.state == "IDLE", timeout=10000)
-    assert not monitor_win._ack_btn.isVisible()
+    assert monitor_win._alerts.get("emergency") is None
 
     # A queued item does not auto-start on acknowledge (no chain, per the
     # Orchestrator's own run_queue() docstring: "_acknowledge_emergency() —
@@ -688,7 +690,7 @@ def test_cards_reflect_the_standby_emergency_standby_actually_performed(
         "but its card still shows it as initiated"
     )
 
-    monitor_win._ack_btn.click()
+    monitor_win._alert_band.row_for("emergency").action_button.click()
     settled(orchestrator)
 
 
