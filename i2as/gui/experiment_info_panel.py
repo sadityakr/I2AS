@@ -303,6 +303,7 @@ class ExperimentInfoPanel(QWidget):
             self._session_manager.roster,
             self,
             envelope_variables=self._session_manager.envelope_variables(),
+            next_number=self._next_experiment_number(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -378,6 +379,12 @@ class ExperimentInfoPanel(QWidget):
             self._eln_status_label.setText(f"Not published yet — {_ELN_NOT_CONFIGURED_TEXT}")
 
         self._force_data_dir_on_open(record.get("experiment_id", ""))
+
+    def _next_experiment_number(self) -> int | None:
+        """Return the session's next experiment number, or ``None`` when unknown."""
+        store = getattr(self._session_manager, "store", None)
+        method = getattr(store, "next_experiment_number", None)
+        return method() if callable(method) else None
 
     def _force_data_dir_on_open(self, experiment_id: str) -> None:
         """Force Data Dir to the (newly) active session's own folder.

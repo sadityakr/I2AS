@@ -396,7 +396,7 @@ class ExperimentRecord:
     directory, so the record archives with the data it describes.
 
     Attributes:
-        experiment_id: Unique store key (slug + date, see
+        experiment_id: Unique store key, ``NNN_<label>`` (serial number + slug, see
             ``ExperimentStore.make_experiment_id``).
         title: Human title (e.g. "Hall bar A3 — SOT switching vs T").
         user_id: Roster key of the person running the experiment.

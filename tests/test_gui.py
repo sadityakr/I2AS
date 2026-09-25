@@ -1443,7 +1443,7 @@ def _stub_start_dialog(
     monkeypatch.setattr(
         sip,
         "StartExperimentDialog",
-        lambda roster, parent=None, envelope_variables=None: _FakeStartDialog(
+        lambda roster, parent=None, envelope_variables=None, next_number=None: _FakeStartDialog(
             (title, user_id, attended, dirname), envelope
         ),
     )
@@ -1620,14 +1620,27 @@ def test_start_experiment_dialog_result_values_dirname_none_when_empty(qtbot, tm
 def test_start_experiment_with_custom_dirname_creates_expected_directory(
     monitor_win_session, session_manager, monkeypatch
 ):
-    """A folder name entered in the dialog becomes the experiment's directory on disk."""
+    """A folder label entered in the dialog names the directory, after its serial number."""
     _stub_start_dialog(monkeypatch, "Hall bar A3", "jdoe", dirname="my_custom_folder")
     panel = monitor_win_session._session_info
     panel._start_close_btn.click()
 
     record = session_manager.current_experiment()
-    assert record.experiment_id == "my_custom_folder"
-    assert (session_manager.store.root / "my_custom_folder" / "experiment.json").is_file()
+    assert record.experiment_id == "001_my_custom_folder"
+    assert (session_manager.store.root / "001_my_custom_folder" / "experiment.json").is_file()
+
+
+def test_start_dialog_previews_the_numbered_folder(qtbot, tmp_path):
+    """The operator sees NNN_<label> before the folder exists."""
+    from i2as.gui.experiment_dialogs import StartExperimentDialog
+
+    dialog = StartExperimentDialog(_start_dialog_roster(tmp_path), next_number=4)
+    qtbot.addWidget(dialog)
+
+    dialog._title_input.setText("Hall bar A3")
+    assert dialog._folder_preview.text() == "Folder: 004_hall_bar_a3"
+    dialog._dirname_input.setText("MnSi sweep")
+    assert dialog._folder_preview.text() == "Folder: 004_mnsi_sweep"
 
 
 def test_start_experiment_with_invalid_dirname_shows_warning_and_stays_closed(
@@ -1778,7 +1791,7 @@ def test_start_dialog_is_offered_the_setups_envelope_variables(
 
     from i2as.gui import experiment_info_panel as sip
 
-    def _capture(roster, parent=None, envelope_variables=None):
+    def _capture(roster, parent=None, envelope_variables=None, next_number=None):
         seen.append(envelope_variables)
         return _FakeStartDialog(("Hall bar A3", "jdoe", True, None))
 

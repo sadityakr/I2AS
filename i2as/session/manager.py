@@ -249,18 +249,18 @@ class ExperimentManager(QObject):
         a record live — ``switch_experiment`` and the resume on construction.
 
         Args:
-            title: Human title (also slugged into the experiment id when
-                ``experiment_dirname`` is not given).
+            title: Human title (also slugged into the experiment id's label
+                when ``experiment_dirname`` is not given).
             user_id: Roster key of the person running the experiment.
             sample_info: The sample fields to snapshot onto the record.
             envelope: Optional per-experiment sample bounds, enforced by the
                 Orchestrator for every writer until the experiment closes.
             attended: Initial attendance flag.
-            experiment_dirname: Optional override for the experiment's
-                folder name (and therefore its ``experiment_id``), directly
-                under the session folder — flat only, no nesting. ``None``
-                (the default) falls back to
-                ``self._store.make_experiment_id(title, created)``.
+            experiment_dirname: Optional label for the experiment's folder,
+                directly under the session folder — flat only, no nesting.
+                The folder is always ``NNN_<label>``: the session's next
+                serial number, then this label slugged, or the title's when
+                it is ``None`` (``ExperimentStore.make_experiment_id``).
 
         Returns:
             The persisted, now-active ``ExperimentRecord``.
@@ -268,9 +268,8 @@ class ExperimentManager(QObject):
         Raises:
             ValueError: If ``title`` is empty, another experiment is open,
                 ``user_id`` is not in the roster, or ``experiment_dirname``
-                is given but is empty, contains a path separator, is
-                ``"."``/``".."``, or collides with an existing experiment
-                folder in this session.
+                is given but is empty, contains a path separator, or is
+                ``"."``/``".."``.
             OSError: If the record cannot be written.
         """
         if not title.strip():
@@ -318,20 +317,20 @@ class ExperimentManager(QObject):
         """Return the experiment id to use — auto-derived or user-chosen.
 
         Args:
-            title: The experiment title (used for the auto-derived id).
-            created_utc: ISO 8601 creation time (used for the auto-derived id).
-            experiment_dirname: The caller's override, or ``None`` for the
-                default auto-derived id.
+            title: The experiment title (the label when no folder name is given).
+            created_utc: ISO 8601 creation time (recorded on the experiment;
+                the id itself is serial).
+            experiment_dirname: The operator's folder label, or ``None``.
 
         Returns:
-            A valid, non-colliding experiment id.
+            A valid, non-colliding ``NNN_<label>`` experiment id.
 
         Raises:
             ValueError: If ``experiment_dirname`` is given but invalid (see
                 ``start_experiment``'s docstring for the exact rules).
         """
         if experiment_dirname is None:
-            return self._store.make_experiment_id(title, created_utc)
+            return self._store.make_experiment_id(title)
         candidate = experiment_dirname.strip()
         if not candidate:
             raise ValueError("Experiment folder name must not be empty")
@@ -349,11 +348,10 @@ class ExperimentManager(QObject):
             )
         if candidate in (".", ".."):
             raise ValueError(f"Experiment folder name {experiment_dirname!r} is not allowed")
-        if candidate in self._store.list_experiments():
-            raise ValueError(
-                f"An experiment folder named {candidate!r} already exists in this session"
-            )
-        return candidate
+        # The operator's name is the label; the serial number always comes
+        # first, so every experiment in a session sorts in the order it was
+        # started and no two can collide.
+        return self._store.make_experiment_id(candidate)
 
     def close_experiment(self) -> None:
         """Close the open experiment and clear the envelope. No-op when none."""

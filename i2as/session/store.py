@@ -31,6 +31,14 @@ _OUTBOX_FILENAME = "outbox.jsonl"
 _AGENT_FEED_FILENAME = "agent_actions.jsonl"
 _DATA_DIRNAME = "data"
 
+#: Digits of an experiment's serial number (``001_…``). A session with more
+#: experiments than this still works; its numbers simply grow a digit.
+EXPERIMENT_NUMBER_DIGITS = 3
+
+#: An experiment folder's serial-number prefix: up to six digits, so a
+#: date-named folder (``20260717_…``) is never read as experiment 20260717.
+_SERIAL_PREFIX = re.compile(r"^(\d{1,6})_")
+
 #: The machine-level registry of session folders, in the measurement root.
 SESSIONS_REGISTRY_FILENAME = "sessions.json"
 
@@ -115,7 +123,7 @@ class ExperimentStore:
 
         <root>/
             active.json                     {"active": "<experiment_id>", ...}
-            <experiment_id>/
+            <NNN_label>/                    one experiment, serially numbered
                 experiment.json
                 gui_state.json              # GUI-authored, opaque to this store
                 outbox.jsonl                # the ELN publish journal
@@ -167,29 +175,41 @@ class ExperimentStore:
             raise ValueError(f"{experiment_id!r} is not an experiment id of this store")
         return self._root / experiment_id
 
-    def make_experiment_id(self, title: str, created_utc: str) -> str:
-        """Derive a unique experiment id from the title and creation date.
+    def next_experiment_number(self) -> int:
+        """Return the serial number the next experiment in this session gets.
 
-        ``YYYYMMDD_<slug>`` with a ``_2``, ``_3`` … suffix on collision, so
-        ids stay human-readable in the filesystem and unique in the store.
-
-        Args:
-            title: The experiment title (any text; slugged).
-            created_utc: ISO 8601 creation time (its date part is used).
+        One more than the highest ``NNN_`` prefix of any experiment folder
+        here, so numbers are never reused — even after a folder is deleted
+        or moved out — and the session's experiments sort in the order they
+        were started.
 
         Returns:
-            A store-unique experiment id.
+            The next number, from 1.
         """
-        date_part = re.sub(r"[^0-9]", "", created_utc[:10]) or "00000000"
-        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "experiment"
-        base = f"{date_part}_{slug}"
-        candidate = base
-        counter = 2
-        existing = set(self.list_experiments())
-        while candidate in existing:
-            candidate = f"{base}_{counter}"
-            counter += 1
-        return candidate
+        numbers = [
+            int(match.group(1))
+            for name in self.list_experiments()
+            if (match := _SERIAL_PREFIX.match(name))
+        ]
+        return max(numbers, default=0) + 1
+
+    def make_experiment_id(self, label: str) -> str:
+        """Return the next experiment id in this session: ``NNN_<slug>``.
+
+        Every experiment folder in a session carries its serial number first,
+        so a whole session reads — and an agent walks it — in the order it
+        was measured. The label after it is for people: the operator's own
+        folder name, or the experiment's title.
+
+        Args:
+            label: The operator's folder name or the experiment title (any
+                text; slugged).
+
+        Returns:
+            A store-unique experiment id, e.g. ``"003_hall_bar_a3"``.
+        """
+        slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "experiment"
+        return f"{self.next_experiment_number():0{EXPERIMENT_NUMBER_DIGITS}d}_{slug}"
 
     def list_experiments(self) -> list[str]:
         """Return every stored experiment id (sorted; [] when none/no root)."""

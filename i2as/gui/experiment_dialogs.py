@@ -497,9 +497,11 @@ class StartExperimentDialog(QDialog):
         roster: UserRoster,
         parent: QWidget | None = None,
         envelope_variables: Mapping[str, Mapping[str, Any]] | None = None,
+        next_number: int | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Start Experiment")
+        self._next_number = next_number
         self._dirname_edited_by_hand = False
 
         form = QFormLayout()
@@ -515,11 +517,21 @@ class StartExperimentDialog(QDialog):
         self._dirname_input.setObjectName("experiment_dirname_input")
         self._dirname_input.setPlaceholderText("auto (from title)")
         self._dirname_input.setToolTip(
-            "Optional — override where this experiment's folder lives inside "
-            "the active session. Defaults to a name derived from the title."
+            "Optional — the label of this experiment's folder inside the "
+            "session. The session's next serial number always comes first "
+            "(NNN_<label>); the label defaults to the title."
         )
         self._dirname_input.textEdited.connect(self._on_dirname_edited)
-        form.addRow("Folder name:", self._dirname_input)
+        self._dirname_input.textChanged.connect(self._update_folder_preview)
+        form.addRow("Folder label:", self._dirname_input)
+
+        # The folder the experiment will actually get, when the caller knows
+        # the session's next number — so the operator sees the uniform name
+        # before it is created, not after.
+        self._folder_preview = QLabel()
+        self._folder_preview.setObjectName("experiment_folder_preview")
+        form.addRow("", self._folder_preview)
+        self._update_folder_preview()
 
         self._user_picker = UserPickerWidget(roster)
         self._user_picker.selection_changed_signal().connect(self._update_ok_enabled)
@@ -557,6 +569,14 @@ class StartExperimentDialog(QDialog):
 
     def _on_dirname_edited(self, _text: str) -> None:
         self._dirname_edited_by_hand = True
+
+    def _update_folder_preview(self, _text: str = "") -> None:
+        """Show ``Folder: NNN_<label>`` when the next number is known."""
+        if self._next_number is None:
+            self._folder_preview.setText("")
+            return
+        label = _slugify(self._dirname_input.text()) or "experiment"
+        self._folder_preview.setText(f"Folder: {self._next_number:03d}_{label}")
 
     def _update_ok_enabled(self) -> None:
         envelope_ok = (

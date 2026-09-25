@@ -240,12 +240,21 @@ def test_store_load_tolerates_corrupt_file(store):
     assert "bad" in store.list_experiments()  # listed (folder exists) but unloadable
 
 
-def test_store_make_experiment_id_slug_and_collisions(store):
-    created = "2026-07-17T12:00:00+00:00"
-    first = store.make_experiment_id("Hall bar A3 — SOT!", created)
-    assert first == "20260717_hall_bar_a3_sot"
-    store.save(ExperimentRecord(experiment_id=first))
-    assert store.make_experiment_id("Hall bar A3 — SOT!", created) == f"{first}_2"
+def test_experiment_ids_are_serial_within_the_session(store):
+    """NNN_<slug>, never reused: after a folder goes, the next number still grows."""
+    assert store.make_experiment_id("Hall bar A3 — SOT!") == "001_hall_bar_a3_sot"
+    store.save(ExperimentRecord(experiment_id="001_hall_bar_a3_sot"))
+    store.save(ExperimentRecord(experiment_id="002_other"))
+    assert store.make_experiment_id("Hall bar A3 — SOT!") == "003_hall_bar_a3_sot"
+    shutil.rmtree(store.root / "002_other")
+    store.save(ExperimentRecord(experiment_id="007_jumped"))
+    assert store.next_experiment_number() == 8
+    assert store.make_experiment_id("") == "008_experiment"
+
+
+def test_folders_without_a_serial_prefix_do_not_set_the_number(store):
+    store.save(ExperimentRecord(experiment_id="20260717_x"))
+    assert store.next_experiment_number() == 1
 
 
 def test_store_load_warns_on_future_schema_version(store, caplog):
@@ -621,12 +630,16 @@ def test_start_experiment_rejects_unknown_user_and_double_open(manager):
         manager.start_experiment("Y", "jdoe", SAMPLE_INFO)
 
 
-def test_start_experiment_with_custom_dirname_uses_it_as_experiment_id(manager, store):
-    record = manager.start_experiment(
+def test_start_experiment_numbers_every_experiment_in_order(manager, store):
+    """The operator's folder name is the label; the serial number comes first."""
+    first = manager.start_experiment(
         "X", "jdoe", SAMPLE_INFO, experiment_dirname="my_custom_folder"
     )
-    assert record.experiment_id == "my_custom_folder"
-    assert store.load("my_custom_folder") == record
+    assert first.experiment_id == "001_my_custom_folder"
+    assert store.load("001_my_custom_folder") == first
+    manager.close_experiment()
+    second = manager.start_experiment("Hall bar A3", "jdoe", SAMPLE_INFO)
+    assert second.experiment_id == "002_hall_bar_a3"
 
 
 def test_start_experiment_rejects_empty_dirname(manager):
@@ -640,11 +653,11 @@ def test_start_experiment_rejects_separator_or_dot_dirname(manager, bad_dirname)
         manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname=bad_dirname)
 
 
-def test_start_experiment_rejects_dirname_collision(manager):
-    manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+def test_the_same_folder_label_twice_gets_two_numbers(manager):
+    one = manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
     manager.close_experiment()
-    with pytest.raises(ValueError, match="already exists"):
-        manager.start_experiment("Y", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+    two = manager.start_experiment("Y", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+    assert (one.experiment_id, two.experiment_id) == ("001_taken", "002_taken")
 
 
 def test_start_experiment_updates_session_index(indexed_manager):
