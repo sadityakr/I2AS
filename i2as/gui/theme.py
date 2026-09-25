@@ -112,6 +112,20 @@ BTN_CLASS_SECONDARY = "secondary"
 BTN_CLASS_DANGER = "danger"
 
 
+#: Text colour of an alert row, per severity (``gui/alerts.py``).
+ALERT_TEXT: dict[str, str] = {
+    "emergency": TEXT_ON_ACCENT,
+    "error": BANNER_ERROR_TEXT,
+    "warning": BANNER_WARNING_TEXT,
+    "info": TEXT_SECONDARY,
+}
+
+
+def alert_text_color(severity: str) -> str:
+    """Return the text colour an alert of *severity* is drawn in."""
+    return ALERT_TEXT.get(severity, TEXT_SECONDARY)
+
+
 def build_stylesheet() -> str:
     """Return the full application QSS string.
 
@@ -236,6 +250,129 @@ QPushButton[class="danger"]:pressed {{
 QPushButton[class="danger"]:disabled {{
     background-color: {BTN_DANGER_DISABLED};
     color: {TEXT_ON_ACCENT};
+}}
+
+/* ── Buttons — segmented control (the header's Agent access switch) ──── */
+/* Joined, checkable buttons: exactly one filled, in the colour of the state
+   it selects, so the switch reads as a control and its current setting at
+   a glance. The status bar says the same thing in words. */
+QPushButton[class="segment"] {{
+    border-radius: 0px;
+    padding: 4px 12px;
+    min-width: 76px;
+}}
+QPushButton[class="segment"][position="middle"],
+QPushButton[class="segment"][position="last"] {{
+    border-left: none;
+}}
+QPushButton[class="segment"][position="first"] {{
+    border-top-left-radius: 4px;
+    border-bottom-left-radius: 4px;
+}}
+QPushButton[class="segment"][position="last"] {{
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}}
+QPushButton[class="segment"]:checked {{
+    color: {TEXT_ON_ACCENT};
+    font-weight: bold;
+}}
+QPushButton[class="segment"][gate="active"]:checked {{
+    background-color: {STATUS_OK};
+    border-color: {STATUS_OK};
+}}
+QPushButton[class="segment"][gate="read_only"]:checked {{
+    background-color: {STATUS_WARN};
+    border-color: {STATUS_WARN};
+    color: {TEXT_PRIMARY};
+}}
+QPushButton[class="segment"][gate="revoked"]:checked {{
+    background-color: {STATUS_ERROR};
+    border-color: {STATUS_ERROR};
+}}
+
+/* ── Buttons — toggle (on/off, e.g. Attended) ──────────────────────────── */
+QPushButton[class="toggle"] {{
+    border-radius: 12px;
+    padding: 3px 12px;
+    min-width: 88px;
+    color: {TEXT_SECONDARY};
+}}
+
+/* The status bar's agent line sits on the bar's own colour. */
+QWidget#agent_status_line,
+QWidget#agent_status_line QLabel {{
+    background: transparent;
+}}
+QPushButton[class="toggle"]:checked {{
+    background-color: {BTN_SECONDARY_PRESSED};
+    border-color: {ACCENT};
+    color: {ACCENT};
+    font-weight: bold;
+}}
+
+/* ── Alert band (gui/alerts.py): one row per alert, by severity ────────── */
+QWidget#alert_row {{
+    border-left: 4px solid {BORDER_STRONG};
+    background-color: {BG_SURFACE};
+}}
+QWidget#alert_row QLabel {{
+    background: transparent;
+    color: {TEXT_SECONDARY};
+}}
+QWidget#alert_row[severity="emergency"] {{
+    background-color: {STATUS_ERROR};
+    border-left-color: {BANNER_ERROR_TEXT};
+}}
+QWidget#alert_row[severity="emergency"] QLabel {{
+    color: {TEXT_ON_ACCENT};
+    font-weight: bold;
+}}
+QWidget#alert_row[severity="error"] {{
+    background-color: {BANNER_ERROR_BG};
+    border-left-color: {BANNER_ERROR_BORDER};
+}}
+QWidget#alert_row[severity="error"] QLabel {{
+    color: {BANNER_ERROR_TEXT};
+}}
+QWidget#alert_row[severity="warning"] {{
+    background-color: {BANNER_WARNING_BG};
+    border-left-color: {BANNER_WARNING_BORDER};
+}}
+QWidget#alert_row[severity="warning"] QLabel {{
+    color: {BANNER_WARNING_TEXT};
+}}
+QWidget#alert_row[severity="info"] {{
+    background-color: {BTN_SECONDARY_PRESSED};
+    border-left-color: {ACCENT};
+}}
+QWidget#alert_row[severity="emergency"] QPushButton[class="alert_action"] {{
+    background-color: {BG_ELEVATED};
+    color: {BANNER_ERROR_TEXT};
+    font-weight: bold;
+    border: none;
+}}
+QPushButton[class="alert_action"] {{
+    padding: 2px 10px;
+}}
+QPushButton[class="alert_dismiss"],
+QPushButton[class="alert_link"] {{
+    background: transparent;
+    border: none;
+    color: {TEXT_SECONDARY};
+    padding: 2px 6px;
+}}
+QPushButton[class="alert_dismiss"]:hover,
+QPushButton[class="alert_link"]:hover {{
+    color: {ACCENT};
+}}
+QWidget#alert_row[severity="emergency"] QPushButton[class="alert_dismiss"] {{
+    color: {TEXT_ON_ACCENT};
+}}
+
+/* ── Context bar (who · session › experiment) ─────────────────────────── */
+QLabel#context_experiment_label[open="false"] {{
+    color: {BANNER_WARNING_TEXT};
 }}
 
 /* ── Emergency acknowledge (targeted by objectName) ──────────────────── */

@@ -193,6 +193,14 @@ def session_manager(tmp_path, station, orchestrator):
 
 
 @pytest.fixture
+def open_experiment(session_manager, orchestrator):
+    """An open experiment: a run's data always belongs to one, so a run needs it."""
+    record = session_manager.start_experiment("Scenario", "jdoe", {})
+    settled(orchestrator)
+    return record
+
+
+@pytest.fixture
 def monitor_win(station, orchestrator, session_manager, qtbot):
     """MonitorWindow shown via qtbot, closed on teardown.
 
@@ -299,7 +307,7 @@ class _MagnetOnlyClaimProcedure(_SlowDatapointProcedure):
 
 
 def test_click_storm_during_a_long_datapoint(
-    monitor_win, procedure_win, station, orchestrator, qtbot
+    open_experiment, monitor_win, procedure_win, station, orchestrator, qtbot
 ):
     """Clicking through the GUI mid-datapoint never freezes it; Pause lands after the point.
 
@@ -344,9 +352,9 @@ def test_click_storm_during_a_long_datapoint(
 
         # Toggle the takeover strip.
         strip = monitor_win._takeover_strip
-        strip._radios[ev.AgentGate.READ_ONLY.value].click()
+        strip._gate_buttons[ev.AgentGate.READ_ONLY.value].click()
         QApplication.processEvents()
-        strip._radios[ev.AgentGate.ACTIVE.value].click()
+        strip._gate_buttons[ev.AgentGate.ACTIVE.value].click()
         QApplication.processEvents()
 
         # Open the Procedure window (already built; bring it to front) and
@@ -488,7 +496,7 @@ def test_disconnect_swaps_the_card_reconnect_swaps_it_back_and_station_info_rede
 
 
 def test_disconnect_mid_run_is_refused_for_the_claimed_vi_and_allowed_for_the_free_one(
-    monitor_win, station, orchestrator, qtbot
+    open_experiment, monitor_win, station, orchestrator, qtbot
 ):
     """Mid-run, Disconnect follows the CLAIM: refused for the run's VI, allowed for the rest.
 
@@ -508,15 +516,15 @@ def test_disconnect_mid_run_is_refused_for_the_claimed_vi_and_allowed_for_the_fr
     qtbot.waitUntil(lambda: orchestrator.state != "IDLE", timeout=5000)
 
     # The VI the run claims: refused, named, still connected.
-    monitor_win._banner.hide()
+    monitor_win._alerts.dismiss_all()
     monitor_win.findChild(QGroupBox, "magnet_z_panel").findChild(
         QPushButton, "magnet_z_disconnect_btn"
     ).click()
     settled(orchestrator)
     assert station.has_vi("magnet_z") is True, "the claimed VI must stay connected"
     assert monitor_win._offline_cards == {}
-    assert monitor_win._banner.isVisible()
-    assert "magnet_z" in monitor_win._banner._label.text()
+    assert monitor_win._alert_band.isVisible()
+    assert any("magnet_z" in a.message for a in monitor_win._alerts.alerts())
 
     # The VI it does not claim: released mid-run, card swapped, run continues.
     monitor_win.findChild(QGroupBox, "temperature_panel").findChild(
@@ -541,7 +549,7 @@ def test_disconnect_mid_run_is_refused_for_the_claimed_vi_and_allowed_for_the_fr
 
 
 def test_a_fault_during_a_run_fails_it_and_acknowledge_retry_recover_it(
-    monitor_win, station, orchestrator, qtbot
+    open_experiment, monitor_win, station, orchestrator, qtbot
 ):
     """A comm fault on the claimed VI fails the run; Acknowledge/Retry recover it."""
 
@@ -553,7 +561,7 @@ def test_a_fault_during_a_run_fails_it_and_acknowledge_retry_recover_it(
     qtbot.waitUntil(lambda: orchestrator.state == "IDLE", timeout=10000)
     qtbot.waitUntil(lambda: "magnet_z" in station.vi_faults(), timeout=5000)
 
-    assert monitor_win._banner.isVisible()
+    assert monitor_win._alert_band.isVisible()
 
     panel = next(p for p in monitor_win._panels if p.vi_name == "magnet_z")
     qtbot.waitUntil(lambda: panel._fault_row.isVisible(), timeout=5000)
@@ -592,7 +600,7 @@ def test_a_fault_during_a_run_fails_it_and_acknowledge_retry_recover_it(
 
 
 def test_emergency_standby_during_measuring_reaches_emergency_and_acknowledge_restores(
-    monitor_win, procedure_win, station, orchestrator, tmp_path, qtbot
+    open_experiment, monitor_win, procedure_win, station, orchestrator, tmp_path, qtbot
 ):
     """``emergency_standby()`` from MEASURING reaches EMERGENCY; Acknowledge restores IDLE.
 
@@ -622,14 +630,16 @@ def test_emergency_standby_during_measuring_reaches_emergency_and_acknowledge_re
     orchestrator.emergency_standby("scenario test")
     qtbot.waitUntil(lambda: orchestrator.state == "EMERGENCY", timeout=10000)
 
-    assert monitor_win._ack_btn.isVisible()
-    assert monitor_win._banner.isVisible()
+    # The current row's button: a replaced row is only scheduled for deletion.
+    ack = monitor_win._alert_band.row_for("emergency").action_button
+    assert ack is not None and ack.isVisible()
+    assert monitor_win._alerts.get("emergency") is not None
     _screenshot(monitor_win, "04_emergency")
 
-    monitor_win._ack_btn.click()
+    ack.click()
     settled(orchestrator)
     qtbot.waitUntil(lambda: orchestrator.state == "IDLE", timeout=10000)
-    assert not monitor_win._ack_btn.isVisible()
+    assert monitor_win._alerts.get("emergency") is None
 
     # A queued item does not auto-start on acknowledge (no chain, per the
     # Orchestrator's own run_queue() docstring: "_acknowledge_emergency() —
@@ -680,7 +690,7 @@ def test_cards_reflect_the_standby_emergency_standby_actually_performed(
         "but its card still shows it as initiated"
     )
 
-    monitor_win._ack_btn.click()
+    monitor_win._alert_band.row_for("emergency").action_button.click()
     settled(orchestrator)
 
 
@@ -815,6 +825,8 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
         station=station,
         run_catalog={"FieldSweep": FieldSweep},
     )
+    manager.start_experiment("Agent story", "jdoe", {})
+    settled(orchestrator)
     context = ToolContext(experiments=manager, run_catalog={"FieldSweep": FieldSweep})
     gateway = Gateway(
         engine_of(orchestrator),
@@ -884,7 +896,7 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
     assert not any(action.refused for action in panel.actions() if action.actor_id == "runner-7")
 
     # A refusal is visually distinct and names the rule.
-    strip._radios[ev.AgentGate.REVOKED.value].click()
+    strip._gate_buttons[ev.AgentGate.REVOKED.value].click()
     settled(orchestrator)
     gateway.submit(ev.CommandName.START_MONITORING)
     settled(orchestrator)
@@ -902,7 +914,7 @@ def test_the_agent_panel_shows_an_agents_validate_probe_run_story(
 
     # The strip's own gate/attendance are what the gateway's permission check
     # reads — set here, seen there.
-    strip._radios[ev.AgentGate.ACTIVE.value].click()
+    strip._gate_buttons[ev.AgentGate.ACTIVE.value].click()
     settled(orchestrator)
     assert gateway.agent_gate() == ev.AgentGate.ACTIVE
     win.close()
@@ -975,7 +987,7 @@ def test_a_narrow_envelope_blocks_an_agent_and_widening_it_lets_the_command_thro
 
 
 def test_probe_first_then_run_queue_yields_a_probe_file_then_the_full_run(
-    procedure_win, station, orchestrator, session_manager, qtbot
+    open_experiment, procedure_win, station, orchestrator, session_manager, qtbot
 ):
     """Probe first queues a probe ahead of the run; Run Queue yields probe, then full run."""
     on_engine(orchestrator, lambda: _fast_magnet(station))
@@ -1019,7 +1031,9 @@ def test_probe_first_then_run_queue_yields_a_probe_file_then_the_full_run(
 
     files = sorted(data_dir.glob("*.h5"))
     assert len(files) == 2, f"expected a probe file then the full run's file, got {files}"
-    probe_files = [f for f in files if f.name.startswith("probe")]
+    # Every run is run-NNNN_<Procedure>[_<label>]; the probe's name says probe once.
+    assert [f.name[:9] for f in files] == ["run-0001_", "run-0002_"]
+    probe_files = [f for f in files if "probe" in f.stem.split("_")]
     assert len(probe_files) == 1, files
 
     import h5py

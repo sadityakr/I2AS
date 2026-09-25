@@ -29,7 +29,6 @@ and a status line saying so, rather than a window that will not open.
 from __future__ import annotations
 
 import html
-import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -52,7 +51,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from i2as.analysis.report import REPORT_FILENAME, AnalysisReport
+from i2as.analysis.report import (
+    REPORT_FILENAME,
+    AnalysisReport,
+    output_file,
+    read_report_file,
+)
 from i2as.gui.eln_settings_dialog import persist_eln_settings
 from i2as.gui.theme import BTN_CLASS_PRIMARY, BTN_CLASS_SECONDARY
 
@@ -598,12 +602,7 @@ class AnalysisPanel(QWidget):
         report_dir = self._store_dir("report_dir")
         if report_dir is None:
             return None
-        path = report_dir / REPORT_FILENAME
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        return AnalysisReport.from_dict(payload)
+        return read_report_file(report_dir / REPORT_FILENAME)
 
     def _figure_width(self, declared: int) -> int:
         """Return the width one preview figure is rendered at, in pixels.
@@ -650,7 +649,12 @@ class AnalysisPanel(QWidget):
 
         if report is not None and report_dir is not None:
             for figure in report.figures:
-                url = QUrl.fromLocalFile(str(report_dir / figure.file)).toString()
+                # Only a plain PNG in the report's own folder is shown; a
+                # name the worker claimed is never trusted as a path.
+                path = output_file(report_dir, figure.file)
+                if path is None:
+                    continue
+                url = QUrl.fromLocalFile(str(path)).toString()
                 width = self._figure_width(figure.width_px)
                 attribute = f' width="{width}"' if width else ""
                 parts.append(f'<p><img src="{html.escape(url)}"{attribute}></p>')

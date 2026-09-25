@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import qtawesome as qta
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -37,18 +40,23 @@ from i2as.gui.connections_dialog import ConnectionsDialog
 from i2as.gui.eln_settings_dialog import ElnSettingsDialog, persist_eln_settings
 from i2as.gui.experiment_info_panel import ExperimentInfoPanel
 from i2as.gui.agent_panel import AgentPanel
+from i2as.gui.alerts import (
+    SEVERITY_EMERGENCY,
+    SEVERITY_ERROR,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    AlertBand,
+    AlertCenter,
+)
 from i2as.gui.instrument_panel import InstrumentPanel
 from i2as.gui.log_panel import LogPanel
-from i2as.gui.notification_banner import NotificationBanner
 from i2as.gui.offline_panel import OfflineInstrumentPanel
 from i2as.gui.open_experiment_dialog import OpenExperimentDialog
 from i2as.gui.ramp_tracker_panel import RampTrackerPanel
-from i2as.gui.session_dialogs import ResumeSessionDialog
+from i2as.gui.session_dialogs import SessionFolderDialog
 from i2as.core.status_mirror import StatusMirror
 from i2as.gui.setup_dialogs import InstrumentInfoDialog, LoginDialog
 from i2as.gui.theme import (
-    BANNER_SEVERITY_ERROR,
-    BANNER_SEVERITY_WARNING,
     BTN_CLASS_PRIMARY,
     BTN_CLASS_SECONDARY,
     TEXT_ON_ACCENT,
@@ -275,24 +283,24 @@ class MonitorWindow(QMainWindow):
         self._log_panel.attach()
 
         # Surface a startup config fallback (a bad active config was skipped)
-        # and/or instruments that failed to connect (degraded build). One
-        # combined banner: show_message replaces, so two calls would hide the
-        # first message.
-        startup_notes: list[str] = []
+        # and instruments that failed to connect (degraded build) — each its
+        # own alert, so neither can hide the other.
         if self._startup_warning:
-            startup_notes.append(
-                f"Config fallback in effect — {self._startup_warning}"
+            self._alerts.raise_alert(
+                "startup:config",
+                SEVERITY_WARNING,
+                "config",
+                f"Config fallback in effect — {self._startup_warning}",
             )
         offline_names = self._station.offline_vi_names()
         if offline_names:
-            startup_notes.append(
+            self._alerts.raise_alert(
+                "startup:offline",
+                SEVERITY_WARNING,
+                "station",
                 f"{len(offline_names)} instrument(s) offline: "
                 f"{', '.join(offline_names)}. Everything else is operational — "
-                "open the instrument's details (sliders icon) to retry."
-            )
-        if startup_notes:
-            self._banner.show_message(
-                " | ".join(startup_notes), BANNER_SEVERITY_WARNING
+                "open the instrument's details (sliders icon) to retry.",
             )
 
         # The window-liveness standard (gui/widget_lifecycle.py): this window
@@ -338,13 +346,13 @@ class MonitorWindow(QMainWindow):
         load_session_action.triggered.connect(self._open_load_session_dialog)
         user_menu.addAction(load_session_action)
 
-        resume_session_action = QAction("Resume Session…", self)
-        resume_session_action.setToolTip(
-            "Pick or create the Session (folder holding multiple experiments) "
-            "to use — applies fully on next launch"
+        session_folder_action = QAction("Session Folder…", self)
+        session_folder_action.setToolTip(
+            "Open or create the session folder — the one folder every "
+            "experiment, run file and analysis lives in; applies on next launch"
         )
-        resume_session_action.triggered.connect(self._open_resume_session_dialog)
-        user_menu.addAction(resume_session_action)
+        session_folder_action.triggered.connect(self._open_session_folder_dialog)
+        user_menu.addAction(session_folder_action)
 
         # The notebook account is a property of the PERSON, like the login
         # above and unlike a config: an API key must never travel with a
@@ -421,6 +429,7 @@ class MonitorWindow(QMainWindow):
                 eln_publisher=self._eln_publisher,
                 analysis_runner=self._analysis_runner,
             )
+            self._sync_context()  # titles the new window with the context
         self._procedure_window.show()
         self._procedure_window.raise_()
         self._procedure_window.activateWindow()
@@ -444,43 +453,23 @@ class MonitorWindow(QMainWindow):
             if self._station.get_vi_type(n) == "measurement"
         ]
 
-        # ── Header ────────────────────────────────────────────────────
-        root.addLayout(self._build_header())
-
-        # ── Notification banner (hidden until a warning/error arrives) ─
-        self._banner = NotificationBanner()
-        root.addWidget(self._banner)
-
-        # ── Acknowledge (single home; moved off ProcedureWindow) ────────
-        # Unified control for both EMERGENCY and a plain hold-severity
-        # System condition — see Orchestrator.acknowledge() and GLOSSARY.md's
-        # **Hold acknowledge**. Right-aligned in the top bar, next to the
-        # countdown that reports how long the override it grants stays
-        # unlocked.
+        # ── The top of the window: three bands, three kinds of thing ───
+        # 1. Who and where — user · session › experiment (a read).
+        # 2. What you can do — the page switcher and every control.
+        # 3. What needs attention — one row per alert, hidden when there
+        #    are none (gui/alerts.py). Every warning and error the window
+        #    raises goes there, keyed by its cause, so one cause clearing
+        #    can never erase another.
         self._in_emergency = False
-        ack_row = QHBoxLayout()
-        ack_row.addStretch()
-        self._ack_countdown_label = QLabel("")
-        self._ack_countdown_label.setObjectName("ack_countdown_label")
-        self._ack_countdown_label.setVisible(False)
-        ack_row.addWidget(self._ack_countdown_label)
-        self._ack_btn = QPushButton("Acknowledge emergency")
-        self._ack_btn.setObjectName("ack_emergency_btn")
-        self._ack_btn.setVisible(False)
-        self._ack_btn.clicked.connect(self._on_ack_clicked)
-        ack_row.addWidget(self._ack_btn)
-        root.addLayout(ack_row)
-
-        # Tracks the last per-VI fault warning message shown on the banner,
-        # so states_updated can dismiss it once every fault clears without
-        # stomping on an unrelated banner message.
-        self._last_fault_message: str | None = None
-
-        # Tracks the last hold-severity condition message shown on the
-        # banner (see _refresh_ack_controls()), so it can be dismissed once
-        # every hold condition clears without stomping on an unrelated
-        # banner message (e.g. a fault warning that appeared since).
-        self._last_hold_message: str | None = None
+        self._last_engine_error = ""
+        # What put the station into EMERGENCY: shown on the emergency alert
+        # itself rather than as a second row (``_refresh_ack_controls``).
+        self._emergency_cause = ""
+        self._alerts = AlertCenter(parent=self)
+        root.addWidget(self._build_context_bar())
+        root.addLayout(self._build_control_bar())
+        self._alert_band = AlertBand(self._alerts)
+        root.addWidget(self._alert_band)
 
         # ── Fixed 2x2 quadrant grid (Page 1 — Monitor) ───────────────
         top_left = self._build_instruments_quadrant(measurement_vis)
@@ -542,25 +531,58 @@ class MonitorWindow(QMainWindow):
         self._state_name = OrchestratorState.IDLE.value
         self._state_label = QLabel(f"State: {self._state_name}")
         self._status_bar.addWidget(self._state_label)
+        # The strip's INDICATORS go to the status bar, beside the state:
+        # the header holds only what the operator sets, the status bar what
+        # the station reports (gui/takeover_strip.py).
+        self._status_bar.addPermanentWidget(self._takeover_strip.status_line)
         # Current status-bar 'level' ("", "active", "error"); tracked so the
         # dynamic-property restyle only fires when the level actually changes.
         self._status_level = ""
 
-    def _build_header(self) -> QHBoxLayout:
-        """Build the top toolbar with title and global action buttons.
+    def _build_context_bar(self) -> QWidget:
+        """Build band 1: who is working, in which session, on which experiment.
+
+        A read, never a control: the user changes in User → Log in as…, the
+        session in User → Session Folder…, the experiment in the Session Info
+        panel. The same words title the window (``_sync_context``).
 
         Returns:
-            A QHBoxLayout containing the header widgets.
+            The context bar.
         """
-        row = QHBoxLayout()
-
-        title = QLabel("<b>I2AS</b>  — Instrument Monitor")
+        bar = QWidget()
+        bar.setObjectName("context_bar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        title = QLabel("<b>I2AS</b>")
+        title.setObjectName("context_title")
         row.addWidget(title)
 
         self._current_user_label = QLabel()
         self._current_user_label.setObjectName("current_user_label")
-        self._sync_current_user_label()
+        self._current_user_label.setProperty("class", "secondary_label")
         row.addWidget(self._current_user_label)
+        row.addWidget(QLabel("·"))
+        # The session in use — the one folder the operator chooses; its path
+        # is the tooltip.
+        self._session_label = QLabel()
+        self._session_label.setObjectName("session_label")
+        row.addWidget(self._session_label)
+        row.addWidget(QLabel("›"))
+        self._experiment_label = QLabel()
+        self._experiment_label.setObjectName("context_experiment_label")
+        row.addWidget(self._experiment_label)
+        row.addStretch()
+        self._sync_context()
+        return bar
+
+    def _build_control_bar(self) -> QHBoxLayout:
+        """Build band 2: the page switcher on the left, every control on the right.
+
+        Returns:
+            The control bar's layout.
+        """
+        row = QHBoxLayout()
 
         # Slim page switcher: Page 1 (Monitor, the quadrant grid, unchanged)
         # / Page 2 (Logs). Not connected here — the pages
@@ -586,6 +608,10 @@ class MonitorWindow(QMainWindow):
             parent=self,
         )
         row.addWidget(self._takeover_strip)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setObjectName("control_divider")
+        row.addWidget(divider)
 
         # Monitoring toggle: the Orchestrator polls no instrument until
         # monitoring is started (typically after "Initiate All" has brought
@@ -1145,30 +1171,102 @@ class MonitorWindow(QMainWindow):
         if experiment_id:
             self._switch_experiment(experiment_id)
 
-    def _open_resume_session_dialog(self) -> None:
-        """Open ResumeSessionDialog and persist the picked/created session as active.
+    def _open_session_folder_dialog(self) -> None:
+        """Open SessionFolderDialog and persist the picked or created folder as active.
 
-        Deferred-until-restart, same precedent the old sessions-root relocate
-        action used: ``session_manager``'s own ``ExperimentStore`` stays fixed
-        for the rest of this run regardless of what is picked here (see
-        ``GLOSSARY.md``'s **Session**).
+        Deferred until the next launch: ``session_manager``'s own
+        ``ExperimentStore`` stays rooted at the session folder it started
+        with for the rest of this run (see ``GLOSSARY.md``'s **Session**).
         """
         if self._session_store is None:
             QMessageBox.information(
-                self, "Resume Session", "Session management is not available."
+                self, "Session Folder", "Session management is not available."
             )
             return
         user_id = self._current_user_id or GUEST_USER_ID
-        dialog = ResumeSessionDialog(self._session_store, user_id, self)
+        dialog = SessionFolderDialog(
+            self._session_store, user_id, self._session_folder(), self
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        session_id = dialog.selected_session_id()
-        if not session_id:
+        folder = dialog.selected_folder()
+        if folder is None:
             return
-        self._session_store.set_active(user_id, session_id)
+        self._session_store.set_active(folder)
         self._status_bar.showMessage(
-            "Session updated — applies fully on next launch", 5000
+            f"Session folder set to {folder} — applies on next launch", 8000
         )
+
+    def _session_folder(self) -> Path | None:
+        """Return the session folder in use: the experiment store's own root."""
+        store = getattr(self._session_manager, "store", None)
+        root = getattr(store, "root", None)
+        return Path(root) if root is not None else None
+
+    def _sync_session_label(self) -> None:
+        """Refresh the session shown in the context bar (see ``_sync_context``)."""
+        self._sync_context()
+
+    def _context(self) -> tuple[str, str, str, str]:
+        """Return who, which session, which experiment — as the context bar shows them.
+
+        Returns:
+            ``(user, session name, session folder, experiment)``; the
+            experiment is ``""`` when none is open, the folder ``""`` when
+            session management is unavailable.
+        """
+        user = "Not logged in"
+        if self._current_user_id:
+            user = self._current_user_id
+            if self._session_manager is not None:
+                member = self._session_manager.roster.get(self._current_user_id)
+                if member is not None and member.name:
+                    user = member.name
+        folder = self._session_folder()
+        session_name = ""
+        if folder is not None:
+            session = (
+                self._session_store.load(folder) if self._session_store is not None else None
+            )
+            session_name = session.name if session is not None and session.name else folder.name
+        experiment = ""
+        record = (
+            self._session_manager.current_experiment()
+            if self._session_manager is not None
+            else None
+        )
+        if record is not None:
+            experiment_id = getattr(record, "experiment_id", "") or ""
+            title = getattr(record, "title", "") or ""
+            number = re.match(r"^(\d+)_", experiment_id)
+            if number and title:
+                experiment = f"{number.group(1)} {title}"
+            else:
+                experiment = title or experiment_id
+        return user, session_name, str(folder) if folder is not None else "", experiment
+
+    def _sync_context(self) -> None:
+        """Show user, session and experiment in the context bar and both window titles."""
+        user, session_name, folder, experiment = self._context()
+        self._current_user_label.setText(user)
+        if session_name:
+            self._session_label.setText(f"Session <b>{session_name}</b>")
+        else:
+            self._session_label.setText("No session")
+        self._session_label.setToolTip(folder)
+        is_open = bool(experiment)
+        self._experiment_label.setText(experiment if is_open else "No experiment open")
+        self._experiment_label.setProperty("open", "true" if is_open else "false")
+        self._experiment_label.style().unpolish(self._experiment_label)
+        self._experiment_label.style().polish(self._experiment_label)
+
+        where = " › ".join(part for part in (session_name, experiment) if part)
+        self.setWindowTitle(f"I2AS — {where}" if where else "I2AS — Monitor")
+        procedure_window = getattr(self, "_procedure_window", None)
+        if procedure_window is not None:
+            procedure_window.setWindowTitle(
+                f"I2AS Procedure — {where}" if where else "I2AS — Procedure"
+            )
 
     def _switch_experiment(self, experiment_id: str) -> None:
         """Save the outgoing session's fields and load the incoming session's own.
@@ -1205,16 +1303,8 @@ class MonitorWindow(QMainWindow):
         self._session_info.apply_session(self._session)
 
     def _sync_current_user_label(self) -> None:
-        """Reflect the current login in the header label."""
-        if not self._current_user_id:
-            self._current_user_label.setText("Not logged in")
-            return
-        name = self._current_user_id
-        if self._session_manager is not None:
-            user = self._session_manager.roster.get(self._current_user_id)
-            if user is not None and user.name:
-                name = user.name
-        self._current_user_label.setText(f"Logged in as {name}")
+        """Refresh the user shown in the context bar (see ``_sync_context``)."""
+        self._sync_context()
 
     def _open_instrument_info(self) -> None:
         """Open a read-only view of each VI's devices.yaml metadata block."""
@@ -1306,6 +1396,7 @@ class MonitorWindow(QMainWindow):
         Args:
             record: ``ExperimentRecord.to_dict()``, or ``{}`` when none open.
         """
+        self._sync_context()
         experiment_id = record.get("experiment_id", "") if record else ""
         if not experiment_id or experiment_id == self._last_session_experiment_id:
             self._last_session_experiment_id = experiment_id or None
@@ -1320,25 +1411,28 @@ class MonitorWindow(QMainWindow):
         self._session_info.apply_session(self._session)
 
     def _on_store_health_changed(self, info: dict) -> None:
-        """Surface a session-record save failure/recovery via the banner + status bar.
+        """Keep one ``store`` alert up while the session record is not being saved.
 
-        ``ok=False`` shows a persistent banner error — the physicist should
-        know before losing work that the record is not reaching disk.
-        ``ok=True`` clears it (the banner's own dismiss, not another
-        message) and confirms recovery as a routine status-bar note instead
-        of a second banner.
+        ``ok=False`` raises it (a condition: only recovery removes it — the
+        physicist should know before losing work that the record is not
+        reaching disk); ``ok=True`` resolves exactly that alert, never any
+        other, and confirms recovery in the status bar.
 
         Args:
             info: ``{"ok": bool, "detail": str}`` from
                 ``ExperimentManager.store_health_changed``.
         """
         if info.get("ok"):
-            self._banner.dismiss()
-            self._status_bar.showMessage("Session record saving recovered", 5000)
+            if self._alerts.resolve("store"):
+                self._status_bar.showMessage("Session record saving recovered", 5000)
             return
         detail = info.get("detail", "")
-        self._banner.show_message(
-            f"Session record is NOT being saved: {detail}", BANNER_SEVERITY_ERROR
+        self._alerts.raise_alert(
+            "store",
+            SEVERITY_ERROR,
+            "session",
+            f"Session record is NOT being saved: {detail}",
+            dismissible=False,
         )
 
     def _on_states_updated(self, state: dict) -> None:
@@ -1357,34 +1451,58 @@ class MonitorWindow(QMainWindow):
         """
         self._trends.on_states_updated(state)
 
-        # Calm a shown fault-warning banner once every runtime fault has
-        # cleared — but only if THIS banner is the one showing
-        # (never steal a dismiss from an unrelated message, e.g. the
-        # save-health error).
-        if self._last_fault_message is not None and not self._mirror.vi_faults():
-            self._banner.dismiss()
-            self._last_fault_message = None
+        self._sync_fault_alerts()
 
     def _on_error_event(self, event: ErrorEvent) -> None:
-        """Show a per-VI fault warning on the banner.
+        """Bring a new per-VI fault into the alert list without waiting a tick.
 
         Only ``kind="fault"``/``severity="warning"`` events are handled
         here — everything more severe (``run_failure``, ``safety``,
-        ``internal``) already reaches the banner via the compat
-        ``error_occurred`` -> ``_on_error`` path, which fires alongside
-        every such ``error_event`` (see ``Orchestrator._error()``).
+        ``internal``) already arrives via the compat ``error_occurred`` ->
+        ``_on_error`` path. The fault alerts themselves always follow the
+        mirror's fault registry (``_sync_fault_alerts``), so one instrument
+        recovering can never remove another's fault or any other alert.
 
         Args:
             event: The structured error/fault payload.
         """
         if event.severity != "warning" or event.kind != "fault":
             return
-        message = f"{event.vi_name}: {event.message}" if event.vi_name else event.message
-        if message == self._last_fault_message:
+        if event.vi_name and event.vi_name not in self._mirror.vi_faults():
+            # The event beat the mirror: show it now; the next tick's sync
+            # keeps or resolves it by the registry.
+            self._alerts.sync_group(
+                "fault:",
+                {
+                    **{f"fault:{vi}": self._fault_alert(vi, rec.get("message", ""))
+                       for vi, rec in self._mirror.vi_faults().items()},
+                    f"fault:{event.vi_name}": self._fault_alert(event.vi_name, event.message),
+                },
+            )
             return
-        self._last_fault_message = message
-        self._banner.show_message(message, BANNER_SEVERITY_WARNING)
+        self._sync_fault_alerts()
 
+    def _fault_alert(self, vi_name: str, message: str) -> dict[str, Any]:
+        """Return the ``raise_alert`` arguments for one faulted instrument."""
+        return {
+            "severity": SEVERITY_WARNING,
+            "source": vi_name,
+            "message": f"{vi_name}: {message}" if message else f"{vi_name} is faulted",
+            "action_label": "Retry",
+            "action": lambda: self._orchestrator.retry_fault(vi_name),
+            "action_name": f"retry_fault_{vi_name}_btn",
+            "dismissible": False,
+        }
+
+    def _sync_fault_alerts(self) -> None:
+        """Make the ``fault:`` alerts exactly the mirror's faulted instruments."""
+        self._alerts.sync_group(
+            "fault:",
+            {
+                f"fault:{vi}": self._fault_alert(vi, record.get("message", ""))
+                for vi, record in self._mirror.vi_faults().items()
+            },
+        )
 
     def _on_ramps_updated(self, records: list) -> None:
         """Forward this tick's running-ramp records to the Ramps sub-panel.
@@ -1492,7 +1610,17 @@ class MonitorWindow(QMainWindow):
         self._refresh_state_label()
         logger.debug("MonitorWindow: orchestrator state → %s", state_name)
 
+        entering = state_name == OrchestratorState.EMERGENCY.value and not self._in_emergency
         self._in_emergency = state_name == OrchestratorState.EMERGENCY.value
+        if entering and self._last_engine_error:
+            # The error that arrived with the transition is its cause: it
+            # moves onto the emergency alert instead of standing beside it.
+            self._emergency_cause = self._last_engine_error
+            self._alerts.resolve(f"engine:{self._emergency_cause}")
+        if state_name not in _ERROR_STATES:
+            # Recovered: the next emergency must not borrow this one's cause.
+            self._last_engine_error = ""
+            self._emergency_cause = ""
         self._refresh_ack_controls()
 
         if state_name in _ERROR_STATES:
@@ -1540,103 +1668,119 @@ class MonitorWindow(QMainWindow):
         self._refresh_ack_controls()
 
     def _refresh_ack_controls(self) -> None:
-        """Sync the ACKNOWLEDGE button and its "Acknowledged (mm:ss)" countdown.
+        """Sync the emergency, hold and override alerts with the mirror.
 
-        Called on every ``state_changed`` AND every tick's ``ramps_updated``
-        (not just state transitions) — a hold-severity condition can appear
-        or clear mid-IDLE with no state transition at all, so the button
-        must not wait for one to show up or disappear; ``ramps_updated``,
-        not ``states_updated``, is the tick-driven trigger deliberately,
-        since it fires AFTER that tick's condition computation (see
-        ``_on_ramps_updated()``'s docstring) — using ``states_updated``
-        would show the previous tick's held-VI set. The countdown is a
-        plain top-bar label rather than a popup: it never steals focus, and
-        it reports the SAME override window every subsequent action either
-        succeeds or is refused against (Orchestrator.acknowledge()), so a
-        refusal after it reads 00:00 is never a silent surprise.
+        Called on every ``state_changed`` AND every status snapshot (not
+        just state transitions) — a hold-severity condition can appear or
+        clear mid-IDLE with no state transition at all. Each is its own
+        alert: the emergency (with "Acknowledge emergency"), one alert per
+        hold condition (with "Acknowledge & unlock"), and while an
+        acknowledgement is in force an info countdown reporting the SAME
+        override window every later action succeeds or is refused against
+        (Orchestrator.acknowledge()), so a refusal after it reads 00:00 is
+        never a surprise.
         """
-        held = self._mirror.held_vi_names()
-        self._ack_btn.setVisible(self._in_emergency or bool(held))
-        self._ack_btn.setText(
-            "Acknowledge emergency" if self._in_emergency else "Acknowledge & unlock"
-        )
-        self._refresh_hold_banner(held)
+        emergency: dict[str, dict[str, Any]] = {}
+        if self._in_emergency:
+            cause = re.sub(r"^EMERGENCY:\s*", "", self._emergency_cause)
+            detail = cause or "the station is locked"
+            emergency["emergency"] = {
+                "severity": SEVERITY_EMERGENCY,
+                "source": "station",
+                "message": f"EMERGENCY — {detail}",
+                **self._ack_button("Acknowledge emergency", "ack_emergency_btn"),
+                "dismissible": False,
+            }
+        # A group of one: raised once, redrawn only when its text changes.
+        self._alerts.sync_group("emergency", emergency)
+        self._refresh_hold_alerts()
+
         expires_at = self._mirror.manual_override_expires_at()
         if expires_at is None:
-            self._ack_countdown_label.setVisible(False)
+            self._alerts.resolve("override")
             return
         remaining = max(0.0, expires_at - time.time())
         minutes, seconds = divmod(int(remaining), 60)
-        self._ack_countdown_label.setText(
-            f"Acknowledged ({minutes:02d}:{seconds:02d}) — held VIs return to standby at 00:00"
+        text = (
+            f"Acknowledged ({minutes:02d}:{seconds:02d}) — "
+            "held VIs return to standby at 00:00"
         )
-        self._ack_countdown_label.setVisible(True)
+        if self._alerts.get("override") is None:
+            self._alerts.raise_alert(
+                "override", SEVERITY_INFO, "station", text, dismissible=False
+            )
+        else:
+            self._alerts.update_message("override", text)
 
-    def _refresh_hold_banner(self, held: frozenset[str]) -> None:
-        """Show why the ACKNOWLEDGE & UNLOCK button appeared, on the banner.
+    def _ack_button(self, label: str, name: str) -> dict[str, Any]:
+        """Return the action arguments of an acknowledge alert."""
+        return {"action_label": label, "action": self._on_ack_clicked, "action_name": name}
 
-        A plain hold-severity condition (one that never escalated to
-        EMERGENCY) drives ``_ack_btn``'s visibility but never goes
-        through ``Orchestrator._error()`` — that path is reserved for
-        ``internal``/``run_failure``/EMERGENCY-severity events (see
-        ``_on_error()``) — so nothing else ever puts its description on the
-        banner. This fills that gap from the same public
-        ``get_operational_status()`` conditions list that
-        ``held_vi_names()`` is derived from, without duplicating or
-        pre-empting the EMERGENCY message path.
+    def _refresh_hold_alerts(self) -> None:
+        """Keep one alert per hold-severity condition, each with "Acknowledge & unlock".
 
-        Args:
-            held: The currently held VI names, as returned by
-                ``Orchestrator.held_vi_names()`` (only used to short-circuit
-                when nothing is held).
+        A plain hold (one that never escalated to EMERGENCY) never goes
+        through ``Orchestrator._error()``, so nothing else would say why the
+        instruments are held. Read from the same public
+        ``get_operational_status()`` conditions list that ``held_vi_names()``
+        is derived from. During an emergency the emergency alert's own
+        acknowledge covers them, so none is shown.
         """
-        if self._in_emergency or not held:
-            if self._last_hold_message is not None:
-                self._banner.dismiss()
-                self._last_hold_message = None
-            return
-
-        conditions = self._mirror.get_operational_status().get("conditions", [])
-        hold_conditions = [c for c in conditions if c.get("severity") == "hold"]
-        if not hold_conditions:
-            if self._last_hold_message is not None:
-                self._banner.dismiss()
-                self._last_hold_message = None
-            return
-
-        message = "; ".join(
-            f"{c['message']} — affecting {', '.join(c.get('affected', []))}"
-            if c.get("affected")
-            else c["message"]
-            for c in hold_conditions
-        )
-        if message == self._last_hold_message:
-            return
-        self._last_hold_message = message
-        self._banner.show_message(message, BANNER_SEVERITY_WARNING)
+        current: dict[str, dict[str, Any]] = {}
+        if not self._in_emergency and self._mirror.held_vi_names():
+            conditions = self._mirror.get_operational_status().get("conditions", [])
+            for index, condition in enumerate(conditions):
+                if condition.get("severity") != "hold":
+                    continue
+                affected = condition.get("affected")
+                if affected == "all":
+                    where = " — affecting every instrument"
+                elif affected:
+                    where = f" — affecting {', '.join(affected)}"
+                else:
+                    where = ""
+                key = f"hold:{condition.get('key') or index}"
+                current[key] = {
+                    "severity": SEVERITY_ERROR,
+                    "source": "station",
+                    "message": f"{condition.get('message', 'Held')}{where}",
+                    **self._ack_button("Acknowledge & unlock", "ack_unlock_btn"),
+                    "dismissible": False,
+                }
+        self._alerts.sync_group("hold:", current)
 
     def _on_error(self, message: str) -> None:
-        """Show a non-modal error banner when ERROR or EMERGENCY is entered.
+        """Add an engine error to the alert list (ERROR or EMERGENCY entered).
 
-        Replaces the old blocking ``QMessageBox.critical`` so repeated error
-        signals no longer stack modal dialogs over the GUI.
+        Keyed by its text: a repeat counts instead of stacking, and a
+        different error is a second row rather than a replacement. The
+        first error of an emergency is its cause and is shown on the
+        emergency alert itself; later ones (the shutdown's own reports) are
+        rows of their own.
 
         Args:
             message: Human-readable error description.
         """
         logger.error("MonitorWindow: %s", message)
-        self._banner.show_message(message, BANNER_SEVERITY_ERROR)
+        self._last_engine_error = message
+        if self._in_emergency and not self._emergency_cause:
+            self._emergency_cause = message
+            self._refresh_ack_controls()
+            return
+        self._alerts.raise_alert(f"engine:{message}", SEVERITY_ERROR, "station", message)
 
     def _on_action_blocked(self, message: str) -> None:
-        """Show a non-modal warning banner when the Orchestrator blocks an action.
+        """Add a refused action to the alert list; it expires once it stops recurring.
 
         Args:
             message: Human-readable reason the action was blocked.
         """
-        self._banner.show_message(message, BANNER_SEVERITY_WARNING)
+        self._alerts.raise_alert(
+            f"blocked:{message}", SEVERITY_WARNING, "station", message, expires=True
+        )
 
     def _on_action_failed(self, vi_name: str, method_name: str, reason: str) -> None:
-        """Show a non-modal error banner when a submitted GUI action raises.
+        """Add a failed GUI action to the alert list until the operator dismisses it.
 
         This is the uniform failure verdict of the control-validation
         standard: limit rejections and VI safety-interlock refusals arrive
@@ -1647,8 +1791,11 @@ class MonitorWindow(QMainWindow):
             method_name: The @control method that was called.
             reason: The exception message explaining why it was refused.
         """
-        self._banner.show_message(
-            f"{vi_name}.{method_name} failed: {reason}", BANNER_SEVERITY_ERROR
+        self._alerts.raise_alert(
+            f"failed:{vi_name}.{method_name}",
+            SEVERITY_ERROR,
+            vi_name,
+            f"{vi_name}.{method_name} failed: {reason}",
         )
 
     def _on_action_confirmed(self, vi_name: str, method_name: str) -> None:

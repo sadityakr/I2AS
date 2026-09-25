@@ -857,6 +857,18 @@ class OrchestratorProxy(QObject):
         """
         return self._submit(ev.CommandName.SET_ATTENDANCE, attended=bool(attended))
 
+    def set_run_folder(self, data_directory: str) -> str:
+        """Install the open experiment's data folder, where every run writes.
+
+        Args:
+            data_directory: The folder, or ``""`` when no experiment is open
+                (every run is then refused).
+
+        Returns:
+            The command's request id.
+        """
+        return self._submit(ev.CommandName.SET_RUN_FOLDER, data_directory=str(data_directory))
+
     def set_agent_gate(self, state: ev.AgentGate | str) -> str:
         """Set the kill switch: how much of the engine agents may reach.
 

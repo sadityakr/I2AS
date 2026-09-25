@@ -393,6 +393,7 @@ class CommandName(str, Enum):
     STOP_MONITORING = "stop_monitoring"
     SET_EXPERIMENT_ENVELOPE = "set_experiment_envelope"
     SET_ATTENDANCE = "set_attendance"
+    SET_RUN_FOLDER = "set_run_folder"
     SET_AGENT_GATE = "set_agent_gate"
 
 

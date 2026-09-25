@@ -303,6 +303,7 @@ class ExperimentInfoPanel(QWidget):
             self._session_manager.roster,
             self,
             envelope_variables=self._session_manager.envelope_variables(),
+            next_number=self._next_experiment_number(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -379,6 +380,12 @@ class ExperimentInfoPanel(QWidget):
 
         self._force_data_dir_on_open(record.get("experiment_id", ""))
 
+    def _next_experiment_number(self) -> int | None:
+        """Return the session's next experiment number, or ``None`` when unknown."""
+        store = getattr(self._session_manager, "store", None)
+        method = getattr(store, "next_experiment_number", None)
+        return method() if callable(method) else None
+
     def _force_data_dir_on_open(self, experiment_id: str) -> None:
         """Force Data Dir to the (newly) active session's own folder.
 
@@ -452,6 +459,18 @@ class ExperimentInfoPanel(QWidget):
         dir_row.addWidget(self._data_dir_input)
         dir_row.addWidget(browse_btn)
         form.addRow("Data Dir:", dir_row)
+        # With a session layer, where a run writes is not a choice: the
+        # engine places every run in the open experiment's data folder
+        # (Orchestrator.set_run_folder, core.run_naming), so the field only
+        # shows that folder and the operator's one choice of location is the
+        # session folder (User → Session Folder…).
+        if self._session_manager is not None:
+            self._data_dir_input.setReadOnly(True)
+            self._data_dir_input.setToolTip(
+                "Every run is saved here, as run-NNNN_<Procedure>[_<label>].h5 — "
+                "the open experiment's data folder inside the session folder."
+            )
+            browse_btn.hide()
 
         self._data_dir_note = QLabel(_OUTSIDE_SESSION_NOTE_TEXT)
         self._data_dir_note.setObjectName("data_dir_note")

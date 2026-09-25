@@ -611,7 +611,8 @@ def open_client(
     Args:
         offline: A config directory to build a simulated station from, or
             ``None`` for live mode.
-        role: The declared **Role** (``observer`` / ``debug`` / ``session``).
+        role: The declared **Role** (``observer`` / ``analyst`` / ``debug`` /
+            ``session``).
         actor_id: The declared identity; defaults to
             :func:`default_actor_id`.
         timeout_s: How long a live request waits for its verdict.
@@ -789,15 +790,10 @@ def _open_session_layer(
     roster = UserRoster(root / "users.json")
     if roster.get(GUEST_USER_ID) is None:
         roster.add(User(user_id=GUEST_USER_ID, name=GUEST_USER_NAME))
-    sessions = SessionStore(root / "sessions")
-    active = sessions.get_active()
-    if active is None or sessions.load(*active) is None:
-        session = sessions.create_session(name=GUEST_USER_ID, user_id=GUEST_USER_ID)
-        active = (GUEST_USER_ID, session.session_id)
-        sessions.set_active(*active)
-    user_id, session_id = active
+    sessions = SessionStore(root)
+    folder = sessions.resolve_active(GUEST_USER_ID)
     return ExperimentManager(
-        store=ExperimentStore(root / "sessions" / user_id / session_id),
+        store=ExperimentStore(folder),
         roster=roster,
         orchestrator=engine,
         config_name=Path(config_path).name,
@@ -820,9 +816,8 @@ def _stored_experiments() -> _StoredExperiments | None:
     except Exception as exc:  # noqa: BLE001 — no data root is not a failure to start
         logger.warning("ctl: no measurement root, so no session reads: %s", exc)
         return None
-    active = SessionStore(root / "sessions").get_active()
+    active = SessionStore(root).get_active()
     if active is None:
         logger.info("ctl: no active session, so the session tools have nothing to read")
         return None
-    user_id, session_id = active
-    return _StoredExperiments(ExperimentStore(root / "sessions" / user_id / session_id))
+    return _StoredExperiments(ExperimentStore(active))

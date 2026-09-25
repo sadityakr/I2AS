@@ -288,6 +288,74 @@ class AssistantSettings:
         )
 
 
+#: The analysis sandbox backends a settings file may name. ``local`` is the
+#: worker as it always ran: this interpreter, this environment. ``venv`` runs
+#: it with a separately installed interpreter, a scrubbed environment and a
+#: private copy of the run file — see ``i2as.session.analysis_sandbox``.
+SANDBOX_BACKENDS: tuple[str, ...] = ("local", "venv")
+
+
+@dataclass(frozen=True)
+class SandboxSettings:
+    """Where the analysis worker runs — the ``analysis.sandbox`` block.
+
+    Attributes:
+        backend: One of ``SANDBOX_BACKENDS``. An unknown value parses as
+            ``local`` — the behaviour the worker had before sandboxes existed
+            — rather than as a backend that needs an interpreter nobody
+            configured.
+        python: The interpreter of the sandbox's own virtual environment
+            (``venv`` only) — one with ``i2as[analysis]`` and whatever else
+            the lab's analysis needs installed into it, and nothing of this
+            application's configuration.
+        stage_inputs: Copy the run file into the analysis folder and point the
+            worker at the copy (``venv`` only), so the worker is handed a file
+            it may do anything to without touching the recorded original.
+        env_passthrough: Extra environment variable names the ``venv``
+            worker may see beside the minimal default allow-list. A name that
+            looks like a credential is dropped even when listed here.
+    """
+
+    backend: str = "local"
+    python: str = ""
+    stage_inputs: bool = True
+    env_passthrough: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe dict representation.
+
+        Returns:
+            A JSON-serialisable dict of every setting.
+        """
+        return {
+            "backend": self.backend,
+            "python": self.python,
+            "stage_inputs": self.stage_inputs,
+            "env_passthrough": list(self.env_passthrough),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> SandboxSettings:
+        """Build ``SandboxSettings`` from a parsed dict, tolerating bad input.
+
+        Args:
+            data: Any parsed JSON value; junk degrades to defaults.
+
+        Returns:
+            The settings record.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        defaults = cls()
+        backend = _as_str(data.get("backend"), defaults.backend).strip().lower()
+        return cls(
+            backend=backend if backend in SANDBOX_BACKENDS else defaults.backend,
+            python=_as_str(data.get("python"), defaults.python).strip(),
+            stage_inputs=_as_bool(data.get("stage_inputs"), defaults.stage_inputs),
+            env_passthrough=_as_tags(data.get("env_passthrough"), defaults.env_passthrough),
+        )
+
+
 @dataclass(frozen=True)
 class AnalysisSettings:
     """The analysis stage's half of the user-level settings file.
@@ -310,6 +378,7 @@ class AnalysisSettings:
             data file to the entry.
         recipes: ``{procedure class name: recipe name}`` — which recipe a
             procedure prefers. A procedure with no row lets discovery choose.
+        sandbox: Where the analysis worker runs (``SandboxSettings``).
     """
 
     enabled: bool = False
@@ -317,6 +386,7 @@ class AnalysisSettings:
     include_fact_tables: bool = False
     attach_data_file: bool = False
     recipes: dict[str, str] = field(default_factory=dict)
+    sandbox: SandboxSettings = field(default_factory=SandboxSettings)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict representation.
@@ -330,6 +400,7 @@ class AnalysisSettings:
             "include_fact_tables": self.include_fact_tables,
             "attach_data_file": self.attach_data_file,
             "recipes": dict(self.recipes),
+            "sandbox": self.sandbox.to_dict(),
         }
 
     @classmethod
@@ -356,6 +427,7 @@ class AnalysisSettings:
                 data.get("attach_data_file"), defaults.attach_data_file
             ),
             recipes=_as_recipes(data.get("recipes")),
+            sandbox=SandboxSettings.from_dict(data.get("sandbox")),
         )
 
 

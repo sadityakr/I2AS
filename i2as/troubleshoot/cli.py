@@ -648,8 +648,8 @@ def _resolve_experiment_dir(explicit: str | None) -> tuple[Path | None, str | No
     directory = session_report.latest_experiment_dir(root)
     if directory is None:
         return None, (
-            f"No experiment found under {root} (looked for "
-            f"sessions/<user_id>/<session_id>/<experiment_id>/experiment.json)."
+            f"No experiment found in the sessions {root / 'sessions.json'} names "
+            f"(looked for <session folder>/<experiment_id>/experiment.json)."
         )
     return directory, None
 

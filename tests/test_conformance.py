@@ -4342,19 +4342,25 @@ def test_run_source_conformance(source_cls: type) -> None:
 
 
 def test_action_class_names_agree_between_the_declaration_and_the_gateway() -> None:
-    """`VALID_ACTION_CLASSES` and `ActionClass` carry the same four values.
+    """`VALID_ACTION_CLASSES` is `ActionClass` minus the session-only classes.
 
     The action-class declaration lives in `core/decorators.py`, which imports
     nothing (contract C1), so the names it validates against are plain
     strings; the gateway's permission matrix is keyed by the `ActionClass`
     enum. One is what a VI declares, the other is what decides who may take
     it — if they ever disagree, a control could declare a class no role can
-    be granted. This is the check that keeps the two in step.
+    be granted. The difference is exactly `SESSION_ONLY_ACTION_CLASSES`
+    (`analysis`): a hardware action declared `analysis` would hand an
+    instrument to a role granted analysis alone, so no VI may declare it.
+    This is the check that keeps the two in step.
     """
     from i2as.core.decorators import VALID_ACTION_CLASSES
-    from i2as.session.gateway import ActionClass
+    from i2as.session.gateway import SESSION_ONLY_ACTION_CLASSES, ActionClass
 
-    assert set(VALID_ACTION_CLASSES) == {member.value for member in ActionClass}
+    assert set(VALID_ACTION_CLASSES) == {
+        member.value for member in ActionClass if member not in SESSION_ONLY_ACTION_CLASSES
+    }
+    assert not set(VALID_ACTION_CLASSES) & {m.value for m in SESSION_ONLY_ACTION_CLASSES}
 
 
 @pytest.mark.parametrize("vi_cls", _all_vi_classes(), ids=lambda c: c.__name__)

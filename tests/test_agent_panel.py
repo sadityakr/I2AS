@@ -354,7 +354,7 @@ def test_an_agent_refused_by_the_kill_switch_shows_as_a_refusal_row(
 ):
     """The exit criterion: revoke the gate, and the refusal lands in the panel."""
     gateway = _gateway(orchestrator, station)
-    strip._radios[ev.AgentGate.REVOKED.value].click()
+    strip._gate_buttons[ev.AgentGate.REVOKED.value].click()
     settled(orchestrator)
 
     gateway.submit(ev.CommandName.START_MONITORING)
@@ -369,7 +369,7 @@ def test_an_agent_refused_by_the_kill_switch_shows_as_a_refusal_row(
 
 def test_the_operator_is_never_gated(window, orchestrator, strip):
     """The kill switch binds agents only — it can never lock the human out."""
-    strip._radios[ev.AgentGate.REVOKED.value].click()
+    strip._gate_buttons[ev.AgentGate.REVOKED.value].click()
     settled(orchestrator)
 
     window._monitoring_btn.click()
@@ -382,13 +382,13 @@ def test_the_operator_is_never_gated(window, orchestrator, strip):
 # ── The takeover strip ────────────────────────────────────────────────────────
 
 
-def test_the_gate_radios_apply_and_reflect_the_engines_setting(
+def test_the_gate_switch_applies_and_reflects_the_engines_setting(
     strip, orchestrator
 ):
     """Applied through the client, reflected from the mirror — both ways."""
-    assert strip._radios[ev.AgentGate.ACTIVE.value].isChecked()
+    assert strip._gate_buttons[ev.AgentGate.ACTIVE.value].isChecked()
 
-    strip._radios[ev.AgentGate.READ_ONLY.value].click()
+    strip._gate_buttons[ev.AgentGate.READ_ONLY.value].click()
     settled(orchestrator)
     assert orchestrator.agent_gate() == ev.AgentGate.READ_ONLY.value
 
@@ -397,8 +397,8 @@ def test_the_gate_radios_apply_and_reflect_the_engines_setting(
     orchestrator.set_agent_gate(ev.AgentGate.REVOKED)
     settled(orchestrator)
     strip.sync_from_mirror()
-    assert strip._radios[ev.AgentGate.REVOKED.value].isChecked()
-    assert not strip._radios[ev.AgentGate.READ_ONLY.value].isChecked()
+    assert strip._gate_buttons[ev.AgentGate.REVOKED.value].isChecked()
+    assert not strip._gate_buttons[ev.AgentGate.READ_ONLY.value].isChecked()
 
 
 def test_attendance_reaches_both_the_record_and_the_engine(
@@ -407,15 +407,15 @@ def test_attendance_reaches_both_the_record_and_the_engine(
     """One fact, two homes: the experiment record and the engine's mirror."""
     session_manager.start_experiment("Hall bar A3", "jdoe", {"sample_name": "A3"})
     settled(orchestrator)
-    assert strip._attended_checkbox.isChecked()
+    assert strip._attended_button.isChecked()
 
-    strip._attended_checkbox.setChecked(False)
+    strip._attended_button.setChecked(False)
     settled(orchestrator)
 
     assert session_manager.current_experiment().attended is False
     assert orchestrator.attended() is False
 
-    strip._attended_checkbox.setChecked(True)
+    strip._attended_button.setChecked(True)
     settled(orchestrator)
     assert session_manager.current_experiment().attended is True
     assert orchestrator.attended() is True
@@ -430,7 +430,7 @@ def test_attendance_without_an_experiment_still_reaches_the_engine(
     strip = TakeoverStrip(orchestrator)
     qtbot.addWidget(strip)
 
-    strip._attended_checkbox.setChecked(False)
+    strip._attended_button.setChecked(False)
     settled(orchestrator)
 
     assert orchestrator.attended() is False
@@ -443,7 +443,7 @@ def test_the_strip_counts_the_agents_that_have_acted(window, panel, strip):
     panel.on_verdict(_verdict(actor_id="runner-7"))
 
     assert panel.active_agent_count() == 2
-    assert strip._agents_active_label.text() == "agents active: 2"
+    assert strip._agents_active_label.text() == "2 agents acting"
 
     # Long enough ago that nothing is acting on the cryostat any more.
     assert panel.active_agent_count(now=time.time() + 10_000) == 0
@@ -747,3 +747,36 @@ def test_the_engines_own_refusal_reaches_the_badge(window, session_manager, orch
         )
     )
     assert "not mine" not in panel._envelope_verdict_label.text()
+
+
+def test_the_header_holds_controls_and_the_status_bar_holds_indicators(window, strip):
+    """What you set is in the header; what the station reports is in the status bar."""
+    from PyQt6.QtWidgets import QPushButton
+
+    status_bar = window.statusBar()
+
+    # Every control is a checkable button in the header strip…
+    for value, button in strip._gate_buttons.items():
+        assert isinstance(button, QPushButton) and button.isCheckable(), value
+        assert button.parent() is not None and strip.isAncestorOf(button)
+    assert strip.isAncestorOf(strip._attended_button)
+    # …and every indicator is a label in the status bar, never in the strip.
+    for label in (
+        strip._gate_status_label,
+        strip._agents_active_label,
+        strip._attendance_label,
+        strip._run_owner_label,
+    ):
+        assert status_bar.isAncestorOf(label), label.objectName()
+        assert not strip.isAncestorOf(label), label.objectName()
+
+
+def test_the_status_line_says_the_gate_in_words(strip, orchestrator):
+    """The gate is reported as words beside a coloured dot, and follows the switch."""
+    assert "Agents active" in strip._gate_status_label.text()
+
+    strip._gate_buttons[ev.AgentGate.REVOKED.value].click()
+    settled(orchestrator)
+    strip.sync_from_mirror()
+    assert "Agents revoked" in strip._gate_status_label.text()
+    assert strip._attendance_label.text() in ("attended", "unattended")

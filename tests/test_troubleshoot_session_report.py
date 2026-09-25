@@ -25,7 +25,7 @@ from i2as.session.models import (
     RunRecord,
     envelope_to_dict,
 )
-from i2as.session.store import ExperimentStore
+from i2as.session.store import ExperimentStore, SessionStore
 from i2as.troubleshoot import cli, session_report
 
 # The autouse transcript-isolation fixture lives in the CLI test module; import
@@ -34,10 +34,18 @@ from tests.test_troubleshoot_cli import isolated_transcript  # noqa: F401
 
 
 def _session_root(root: Path, user_id: str = "jdoe", session_id: str = "20260901_cooldown") -> Path:
-    """Return (and create) one session folder under a measurement root."""
-    folder = root / "sessions" / user_id / session_id
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
+    """Return (and create) one session folder, registered as active in *root*.
+
+    The folder is deliberately NOT under the measurement root: a session is
+    wherever the operator chose, and the report finds it through the
+    registry (``sessions.json``).
+    """
+    store = SessionStore(root)
+    folder = root.parent / f"{root.name}_elsewhere" / session_id
+    if not store.is_session_folder(folder):
+        store.create_session(folder, session_id, user_id)
+    store.set_active(folder)
+    return folder.resolve()
 
 
 def _write_experiment(

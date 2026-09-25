@@ -681,7 +681,7 @@ def test_the_strip_names_the_procedure_and_lists_its_parameters(station, orchest
     )
     win._mirror.on_event(ev.RunStarted(run_id="r-1", manifest=manifest))
 
-    assert strip._run_owner_label.text() == "run owned by agent-A · Field Sweep"
+    assert strip._run_owner_label.text() == "▶ Field Sweep, run owned by agent-A"
     assert "field_start = -0.1" in strip._run_owner_label.toolTip()
 
     win._mirror.on_event(ev.RunFinished(run_id="r-1", status="completed", manifest=manifest))

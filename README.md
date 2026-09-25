@@ -69,18 +69,41 @@ GUI panels, the capability manifest, and the MCP tool schemas are all rendered f
 
 ### Gradual exposure
 
-An agent declares a role, and one permission table says which action classes that role may take. Each rung adds a class; nothing is decided by a branch in code.
+An agent declares a role, and one permission table says which action classes that role may take. Each role is a column of that table; nothing is decided by a branch in code.
 
-| Role | read | recovery | run_control | envelope |
-|---|---|---|---|---|
-| `observer` (default) | yes | no | no | no |
-| `debug` | yes | unattended only | no | no |
-| `session` | yes | yes | yes | no |
-| operator (human) | yes | yes | yes | yes |
+| Role | read | recovery | run_control | envelope | analysis |
+|---|---|---|---|---|---|
+| `observer` (default) | yes | no | no | no | no |
+| `analyst` | yes | no | no | no | yes |
+| `debug` | yes | unattended only | no | no | no |
+| `session` | yes | yes | yes | no | yes |
+| operator (human) | yes | yes | yes | yes | yes |
+
+`analysis` covers writing and running analysis recipes and scripts over finished runs in the analysis worker, and parking their results for a human to approve. The `analyst` role gets that and nothing that touches the station, so an agent, whether embedded or connected over MCP, can be trusted to analyse without being trusted to measure. See [docs/analysis-agent.md](docs/analysis-agent.md) for the agent's analysis loop, the analysis sandbox and the plan for the embedded analyst.
 
 Three mechanisms can only ever subtract from that table. Each door has a ceiling (`gateway_max_role`, `spool_max_role`, both `observer` by default) that caps what a connection may claim. The kill switch, set by the human, narrows every agent to read-only or to nothing at all. And run ownership means an agent may abort only the run it started, unless it declares a takeover with a written reason.
 
 One action is outside the table. Emergency standby is permitted to every role, in every state, at every kill-switch setting. Whoever can see a problem must be able to make the station safe.
+
+### Where data lives: one session folder, one fixed tree
+
+The operator makes exactly one choice about where data goes: the **session folder** (User → Session Folder…, any folder on disk; the Monitor header shows the session's name). Everything below it has one shape, so a person, a script or an analysis agent finds any run of any experiment without being told where to look:
+
+```
+<session folder>/                      the only folder the operator chooses
+  session.json                         name, owner, experiment index
+  001_<experiment label>/              experiments, numbered in the order started
+    experiment.json  agent_actions.jsonl  outbox.jsonl
+    data/
+      run-0001_FieldSweep.h5           runs, numbered; the procedure; the
+      run-0002_FieldSweep_10K.h5       operator's optional label last
+    analysis/
+      recipes/                         this experiment's analysis recipes
+      run-0001/                        report.json, figures, scripts/<id>/
+  002_<experiment label>/
+```
+
+A run needs an open experiment, and the engine places every run, whoever started it, in that experiment's `data/` folder as `run-NNNN`. Numbers are never reused. The machine remembers the active and recent session folders in `<measurement root>/sessions.json`.
 
 ## Setting up your own station
 
@@ -137,7 +160,7 @@ The endpoint is the stdlib and nothing else: one `POST` per JSON-RPC message, a 
 | `i2as/session` | L6 — experiment manager, run queue, agent gateway, agent feed, ELN |
 | `i2as/gui` | the operator's window |
 | `i2as/mcp`, `i2as/ctl` | agent transports: MCP adapter (stdio and HTTP), access keys, and the command-line client |
-| `i2as/analysis` | analysis recipes and the analysis worker |
+| `i2as/analysis` | analysis recipes, analysis scripts and the analysis worker |
 | `i2as/troubleshoot` | `i2as-doctor`, an offline toolbox for drivers and configs |
 
 Eighteen import contracts, checked in CI by `make contracts`, keep each layer blind to the ones above it.

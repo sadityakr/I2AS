@@ -336,8 +336,9 @@ def test_field_sweep_run_record_completes_with_a_data_file_on_disk(
     assert len(stored.runs) == 1
     run = stored.runs[0]
     assert run.status == RUN_STATUS_DONE
-    assert run.data_file
-    assert Path(run.data_file).exists()
+    # Placed in the experiment's own data folder, stored relative to it.
+    assert run.data_file == "data/run-0001_FieldSweep_scenario.h5"
+    assert store.resolve_data_file(record.experiment_id, run.data_file).exists()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -543,7 +544,13 @@ def test_two_runs_back_to_back_produce_two_distinct_files_and_records(
     stored = store.load(record.experiment_id)
     assert len(stored.runs) == 2
     assert {r.status for r in stored.runs} == {RUN_STATUS_DONE}
-    assert {r.data_file for r in stored.runs} == {file1, file2}
+    assert {
+        str(store.resolve_data_file(record.experiment_id, r.data_file)) for r in stored.runs
+    } == {file1, file2}
+    assert {r.data_file for r in stored.runs} == {
+        "data/run-0001_FieldSweep_first.h5",
+        "data/run-0002_FieldSweep_second.h5",
+    }
     assert {r.run_id for r in stored.runs} == {run_id1, run_id2}
 
 

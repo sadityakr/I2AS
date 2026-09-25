@@ -116,13 +116,15 @@ def manager(store, roster, orchestrator, station):
 def indexed_manager(tmp_path, roster, orchestrator, station):
     """A manager wired to a real Session, for testing session-index maintenance.
 
-    Returns a ``(manager, session_store, session)`` tuple — ``session_store``
-    and ``session`` let a test reload ``session.json`` and inspect its
-    ``experiments`` index after a lifecycle call.
+    Returns a ``(manager, session_store, folder)`` tuple — ``session_store``
+    and the session ``folder`` let a test reload ``session.json`` and inspect
+    its ``experiments`` index after a lifecycle call. The experiment store is
+    rooted AT the session folder.
     """
-    session_store = SessionStore(tmp_path / "sessions")
-    session = session_store.create_session("Lab A", "jdoe")
-    exp_store = ExperimentStore(session_store.root / "jdoe" / session.session_id)
+    session_store = SessionStore(tmp_path / "measurement_root")
+    folder = tmp_path / "Lab A"
+    session_store.create_session(folder, "Lab A", "jdoe")
+    exp_store = ExperimentStore(folder)
     exp_manager = ExperimentManager(
         store=exp_store,
         roster=roster,
@@ -130,7 +132,7 @@ def indexed_manager(tmp_path, roster, orchestrator, station):
         config_name="sim_cryostat",
         session_store=session_store,
     )
-    return exp_manager, session_store, session
+    return exp_manager, session_store, folder
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -238,12 +240,21 @@ def test_store_load_tolerates_corrupt_file(store):
     assert "bad" in store.list_experiments()  # listed (folder exists) but unloadable
 
 
-def test_store_make_experiment_id_slug_and_collisions(store):
-    created = "2026-07-17T12:00:00+00:00"
-    first = store.make_experiment_id("Hall bar A3 — SOT!", created)
-    assert first == "20260717_hall_bar_a3_sot"
-    store.save(ExperimentRecord(experiment_id=first))
-    assert store.make_experiment_id("Hall bar A3 — SOT!", created) == f"{first}_2"
+def test_experiment_ids_are_serial_within_the_session(store):
+    """NNN_<slug>, never reused: after a folder goes, the next number still grows."""
+    assert store.make_experiment_id("Hall bar A3 — SOT!") == "001_hall_bar_a3_sot"
+    store.save(ExperimentRecord(experiment_id="001_hall_bar_a3_sot"))
+    store.save(ExperimentRecord(experiment_id="002_other"))
+    assert store.make_experiment_id("Hall bar A3 — SOT!") == "003_hall_bar_a3_sot"
+    shutil.rmtree(store.root / "002_other")
+    store.save(ExperimentRecord(experiment_id="007_jumped"))
+    assert store.next_experiment_number() == 8
+    assert store.make_experiment_id("") == "008_experiment"
+
+
+def test_folders_without_a_serial_prefix_do_not_set_the_number(store):
+    store.save(ExperimentRecord(experiment_id="20260717_x"))
+    assert store.next_experiment_number() == 1
 
 
 def test_store_load_warns_on_future_schema_version(store, caplog):
@@ -340,7 +351,7 @@ def test_resolve_data_file_dangling_absolute_no_match_returns_unchanged(store):
 
 @pytest.fixture
 def session_store(tmp_path):
-    return SessionStore(tmp_path / "sessions")
+    return SessionStore(tmp_path / "measurement_root")
 
 
 def test_session_round_trips_with_content():
@@ -428,86 +439,103 @@ def test_session_schema_version_tolerates_future_value():
 
 def test_session_store_creates_nothing_until_save(tmp_path):
     """Construction and reads must not create directories (lazy creation)."""
-    root = tmp_path / "sessions"
+    root = tmp_path / "measurement_root"
     session_store = SessionStore(root)
-    assert session_store.list_sessions("jdoe") == []
     assert session_store.get_active() is None
-    assert session_store.load("jdoe", "nope") is None
+    assert session_store.recent() == []
+    assert session_store.load(tmp_path / "nope") is None
     assert not root.exists()
 
 
-def test_session_store_save_load_and_active_pointer(session_store):
-    session = Session(session_id="20260717_lab_a", user_id="jdoe", name="Lab A")
-    session_store.save(session)
-    session_store.set_active("jdoe", "20260717_lab_a")
-    assert session_store.list_sessions("jdoe") == ["20260717_lab_a"]
-    assert session_store.load("jdoe", "20260717_lab_a") == session
-    assert session_store.get_active() == ("jdoe", "20260717_lab_a")
-    # No stray .tmp files after atomic writes.
-    assert not list(session_store.root.rglob("*.tmp"))
+def test_a_session_is_any_folder_the_operator_chooses(session_store, tmp_path):
+    """Created where the operator said, named by its folder, and made active."""
+    folder = tmp_path / "anywhere" / "MnSi run"
+    session = session_store.create_session(folder, "MnSi run", "jdoe")
+
+    assert (folder / "session.json").is_file()
+    assert session.session_id == "MnSi run"
+    assert session.user_id == "jdoe" and session.name == "MnSi run"
+    assert session.created_utc == session.last_opened_utc
+    assert session_store.load(folder) == session
+    assert session_store.is_session_folder(folder)
+    session_store.set_active(folder)
+    assert session_store.get_active() == folder.resolve()
+    assert session_store.registry_path == tmp_path / "measurement_root" / "sessions.json"
+    assert not list(tmp_path.rglob("*.tmp"))
 
 
-def test_session_store_get_active_returns_none_for_legacy_flat_shape(session_store):
-    """A pointer written before per-user nesting has neither key — treated as unset."""
-    _write_json_atomic(session_store.root / "active.json", {"active": "20260717_lab_a"})
+def test_a_new_session_needs_an_empty_folder(session_store, tmp_path):
+    taken = tmp_path / "taken"
+    session_store.create_session(taken, "A", "jdoe")
+    with pytest.raises(ValueError, match="already a session"):
+        session_store.create_session(taken, "B", "jdoe")
+    busy = tmp_path / "busy"
+    busy.mkdir()
+    (busy / "notes.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="not empty"):
+        session_store.create_session(busy, "C", "jdoe")
+
+
+def test_a_session_keeps_its_identity_when_moved(session_store, tmp_path):
+    """session_id is the folder's own name, whatever the file inside says."""
+    old = tmp_path / "old_name"
+    session_store.create_session(old, "Lab A", "jdoe")
+    shutil.move(str(old), str(tmp_path / "new_name"))
+
+    moved = session_store.load(tmp_path / "new_name")
+
+    assert moved.session_id == "new_name" and moved.name == "Lab A"
+
+
+def test_recent_sessions_are_newest_first_and_only_existing(session_store, tmp_path):
+    first, second = tmp_path / "one", tmp_path / "two"
+    session_store.create_session(first, "One", "jdoe")
+    session_store.create_session(second, "Two", "jdoe")
+    session_store.set_active(first)
+    session_store.set_active(second)
+    session_store.set_active(first)
+
+    assert session_store.recent() == [first.resolve(), second.resolve()]
+    shutil.rmtree(second)
+    assert session_store.recent() == [first.resolve()]
+    shutil.rmtree(first)
     assert session_store.get_active() is None
 
 
-def test_session_store_save_requires_user_id_and_session_id(session_store):
-    with pytest.raises(ValueError):
-        session_store.save(Session())
-    with pytest.raises(ValueError):
-        session_store.save(Session(session_id="x"))
-    with pytest.raises(ValueError):
-        session_store.save(Session(user_id="jdoe"))
+def test_only_a_session_folder_can_be_made_active(session_store, tmp_path):
+    with pytest.raises(ValueError, match="not a session folder"):
+        session_store.set_active(tmp_path)
 
 
-def test_session_store_save_derives_path_from_record_user_and_session_id(session_store):
-    session = Session(session_id="20260717_lab_a", user_id="jdoe", name="Lab A")
-    session_store.save(session)
-    assert (session_store.root / "jdoe" / "20260717_lab_a" / "session.json").is_file()
+def test_first_launch_creates_a_session_under_the_measurement_root(session_store):
+    folder = session_store.resolve_active("jdoe")
+
+    assert folder.parent == session_store.default_parent().resolve()
+    assert session_store.load(folder).user_id == "jdoe"
+    assert session_store.resolve_active("someone_else") == folder, "an active one is kept"
 
 
-def test_session_store_make_session_id_scoped_per_user(session_store):
+def test_make_session_folder_never_reuses_a_path(session_store, tmp_path):
     created = "2026-07-17T12:00:00+00:00"
-    first = session_store.make_session_id("Lab A — Cryostat 1!", created, "jdoe")
-    assert first == "20260717_lab_a_cryostat_1"
-    session_store.save(Session(session_id=first, user_id="jdoe"))
-    assert (
-        session_store.make_session_id("Lab A — Cryostat 1!", created, "jdoe")
-        == f"{first}_2"
+    first = session_store.make_session_folder(tmp_path, "Lab A — Cryostat 1!", created)
+    assert first == tmp_path / "20260717_lab_a_cryostat_1"
+    first.mkdir()
+    assert session_store.make_session_folder(tmp_path, "Lab A — Cryostat 1!", created) == (
+        tmp_path / "20260717_lab_a_cryostat_1_2"
     )
-    # A different user picking the same name/date does not collide.
-    assert session_store.make_session_id("Lab A — Cryostat 1!", created, "asmith") == first
 
 
-def test_session_store_create_session_builds_saves_and_returns(session_store):
-    session = session_store.create_session("Lab A", "jdoe")
-    assert session.user_id == "jdoe"
-    assert session.name == "Lab A"
-    assert session.session_id
-    assert session.created_utc == session.last_opened_utc
-    assert session_store.load("jdoe", session.session_id) == session
+def test_session_store_save_requires_user_id(session_store, tmp_path):
+    with pytest.raises(ValueError):
+        session_store.save(Session(), tmp_path)
 
 
-def test_session_store_list_sessions_scoped_to_user_directory(session_store):
-    session_store.create_session("Lab A", "jdoe")
-    session_store.create_session("Lab B", "asmith")
-    second_for_jdoe = session_store.create_session("Lab C", "jdoe")
-
-    jdoe_sessions = session_store.list_sessions("jdoe")
-    assert len(jdoe_sessions) == 2
-    assert second_for_jdoe.session_id in jdoe_sessions
-    assert session_store.list_sessions("asmith") != jdoe_sessions
-    assert session_store.list_sessions("nobody") == []
-
-
-def test_session_store_load_tolerates_corrupt_file(session_store):
-    path = session_store.root / "jdoe" / "bad" / "session.json"
-    path.parent.mkdir(parents=True)
-    path.write_text("{not json", encoding="utf-8")
-    assert session_store.load("jdoe", "bad") is None
-    assert "bad" in session_store.list_sessions("jdoe")  # listed but unloadable
+def test_session_store_load_tolerates_corrupt_file(session_store, tmp_path):
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "session.json").write_text("{not json", encoding="utf-8")
+    assert session_store.load(tmp_path / "bad") is None
+    _write_json_atomic(session_store.registry_path, ["junk"])
+    assert session_store.get_active() is None and session_store.recent() == []
 
 
 def test_roster_add_get_replace(tmp_path):
@@ -602,12 +630,16 @@ def test_start_experiment_rejects_unknown_user_and_double_open(manager):
         manager.start_experiment("Y", "jdoe", SAMPLE_INFO)
 
 
-def test_start_experiment_with_custom_dirname_uses_it_as_experiment_id(manager, store):
-    record = manager.start_experiment(
+def test_start_experiment_numbers_every_experiment_in_order(manager, store):
+    """The operator's folder name is the label; the serial number comes first."""
+    first = manager.start_experiment(
         "X", "jdoe", SAMPLE_INFO, experiment_dirname="my_custom_folder"
     )
-    assert record.experiment_id == "my_custom_folder"
-    assert store.load("my_custom_folder") == record
+    assert first.experiment_id == "001_my_custom_folder"
+    assert store.load("001_my_custom_folder") == first
+    manager.close_experiment()
+    second = manager.start_experiment("Hall bar A3", "jdoe", SAMPLE_INFO)
+    assert second.experiment_id == "002_hall_bar_a3"
 
 
 def test_start_experiment_rejects_empty_dirname(manager):
@@ -621,18 +653,18 @@ def test_start_experiment_rejects_separator_or_dot_dirname(manager, bad_dirname)
         manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname=bad_dirname)
 
 
-def test_start_experiment_rejects_dirname_collision(manager):
-    manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+def test_the_same_folder_label_twice_gets_two_numbers(manager):
+    one = manager.start_experiment("X", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
     manager.close_experiment()
-    with pytest.raises(ValueError, match="already exists"):
-        manager.start_experiment("Y", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+    two = manager.start_experiment("Y", "jdoe", SAMPLE_INFO, experiment_dirname="taken")
+    assert (one.experiment_id, two.experiment_id) == ("001_taken", "002_taken")
 
 
 def test_start_experiment_updates_session_index(indexed_manager):
-    exp_manager, session_store, session = indexed_manager
+    exp_manager, session_store, folder = indexed_manager
     record = exp_manager.start_experiment("X", "jdoe", SAMPLE_INFO)
 
-    reloaded = session_store.load("jdoe", session.session_id)
+    reloaded = session_store.load(folder)
     assert len(reloaded.experiments) == 1
     entry = reloaded.experiments[0]
     assert entry.experiment_id == record.experiment_id
@@ -644,11 +676,11 @@ def test_start_experiment_updates_session_index(indexed_manager):
 
 
 def test_close_experiment_updates_session_index_status_and_closed_utc(indexed_manager):
-    exp_manager, session_store, session = indexed_manager
+    exp_manager, session_store, folder = indexed_manager
     record = exp_manager.start_experiment("X", "jdoe", SAMPLE_INFO)
     exp_manager.close_experiment()
 
-    reloaded = session_store.load("jdoe", session.session_id)
+    reloaded = session_store.load(folder)
     assert len(reloaded.experiments) == 1
     entry = reloaded.experiments[0]
     assert entry.experiment_id == record.experiment_id
@@ -663,7 +695,7 @@ def test_switch_experiment_reconciles_session_index(indexed_manager):
     was last touched (exactly what a manual folder move would also cause):
     the reconciled index must reflect that new reality, not the stale one.
     """
-    exp_manager, session_store, session = indexed_manager
+    exp_manager, session_store, folder = indexed_manager
     first = exp_manager.start_experiment("First", "jdoe", SAMPLE_INFO)
     exp_manager.close_experiment()
     exp_manager.start_experiment("Second", "jdoe", SAMPLE_INFO)
@@ -676,14 +708,14 @@ def test_switch_experiment_reconciles_session_index(indexed_manager):
             status=EXPERIMENT_STATUS_OPEN,
         )
     )
-    before = session_store.load("jdoe", session.session_id).experiments
+    before = session_store.load(folder).experiments
     assert next(e for e in before if e.experiment_id == first.experiment_id).status == (
         EXPERIMENT_STATUS_CLOSED
     )
 
     exp_manager.switch_experiment(first.experiment_id)
 
-    after = session_store.load("jdoe", session.session_id).experiments
+    after = session_store.load(folder).experiments
     assert next(e for e in after if e.experiment_id == first.experiment_id).status == (
         EXPERIMENT_STATUS_OPEN
     )
@@ -698,13 +730,12 @@ def test_reconciliation_picks_up_an_experiment_folder_moved_in_and_keeps_its_use
     continue the project: the folder physically moves, but the record's own
     ``user_id`` (who actually ran it) must survive untouched.
     """
-    exp_manager, session_store, session = indexed_manager
+    exp_manager, session_store, folder = indexed_manager
     moved = exp_manager.start_experiment("Moved In", "jdoe", SAMPLE_INFO)
     exp_manager.close_experiment()
 
-    other_session = session_store.create_session("Lab B", "jdoe")
-    other_root = session_store.root / "jdoe" / other_session.session_id
-    other_root.mkdir(parents=True, exist_ok=True)
+    other_root = folder.parent / "Lab B"
+    session_store.create_session(other_root, "Lab B", "jdoe")
     shutil.move(
         str(exp_manager.store.root / moved.experiment_id),
         str(other_root / moved.experiment_id),
@@ -720,22 +751,21 @@ def test_reconciliation_picks_up_an_experiment_folder_moved_in_and_keeps_its_use
     other_manager.start_experiment("Native", "jdoe", SAMPLE_INFO)
     other_manager.close_experiment()
 
-    reloaded = session_store.load("jdoe", other_session.session_id)
+    reloaded = session_store.load(other_root)
     entry = next(e for e in reloaded.experiments if e.experiment_id == moved.experiment_id)
     assert entry.user_id == "jdoe"
     assert entry.title == "Moved In"
 
 
 def test_reconciliation_drops_an_experiment_folder_moved_out_of_a_session(indexed_manager):
-    exp_manager, session_store, session = indexed_manager
+    exp_manager, session_store, folder = indexed_manager
     moved = exp_manager.start_experiment("Moved Out", "jdoe", SAMPLE_INFO)
     exp_manager.close_experiment()
-    reloaded = session_store.load("jdoe", session.session_id)
+    reloaded = session_store.load(folder)
     assert any(e.experiment_id == moved.experiment_id for e in reloaded.experiments)
 
-    other_session = session_store.create_session("Lab B", "jdoe")
-    other_root = session_store.root / "jdoe" / other_session.session_id
-    other_root.mkdir(parents=True, exist_ok=True)
+    other_root = folder.parent / "Lab B"
+    session_store.create_session(other_root, "Lab B", "jdoe")
     shutil.move(
         str(exp_manager.store.root / moved.experiment_id),
         str(other_root / moved.experiment_id),
@@ -744,7 +774,7 @@ def test_reconciliation_drops_an_experiment_folder_moved_out_of_a_session(indexe
     stayed = exp_manager.start_experiment("Still Here", "jdoe", SAMPLE_INFO)
     exp_manager.close_experiment()
 
-    reloaded = session_store.load("jdoe", session.session_id)
+    reloaded = session_store.load(folder)
     ids = {e.experiment_id for e in reloaded.experiments}
     assert moved.experiment_id not in ids
     assert stayed.experiment_id in ids
@@ -1148,8 +1178,12 @@ def test_end_to_end_run_recorded_and_stamped(
     assert run.procedure == "Field Sweep"
     assert run.params["field_steps"] == 3
 
-    # The record's data_file is the real HDF5 file, stamped with the context.
-    with h5py.File(run.data_file, "r") as f:
+    # The record's data_file is the real HDF5 file — placed in the open
+    # experiment's own data folder whatever directory the run asked for, and
+    # stored relative to the experiment — stamped with the context.
+    assert run.run_id == "run-0001"
+    assert run.data_file == "data/run-0001_FieldSweep.h5"
+    with h5py.File(manager.store.resolve_data_file(record.experiment_id, run.data_file), "r") as f:
         info = json.loads(f["metadata"].attrs["experiment_info"])
     assert info["experiment"]["experiment_id"] == record.experiment_id
     assert info["experiment"]["user_id"] == "jdoe"

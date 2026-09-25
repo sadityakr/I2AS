@@ -106,9 +106,9 @@ class ExperimentManager(QObject):
                 ``None`` (e.g. in unit tests that only exercise the
                 Experiment tier) simply skips index maintenance — every
                 other feature works unchanged. When given, the session
-                identity is derived from ``store.root``'s own two path
-                segments (``sessions/<user_id>/<session_id>``), not passed
-                separately, so there is no second source of truth to drift.
+                folder IS ``store.root`` — the experiment store is rooted at
+                the session folder — so there is no second source of truth
+                to drift.
             station: The Station a queued run would drive — needed to build a
                 run headlessly for ``validate_run()`` and to construct the one
                 live object the engine pulls. ``None`` (a unit test that only
@@ -249,18 +249,18 @@ class ExperimentManager(QObject):
         a record live — ``switch_experiment`` and the resume on construction.
 
         Args:
-            title: Human title (also slugged into the experiment id when
-                ``experiment_dirname`` is not given).
+            title: Human title (also slugged into the experiment id's label
+                when ``experiment_dirname`` is not given).
             user_id: Roster key of the person running the experiment.
             sample_info: The sample fields to snapshot onto the record.
             envelope: Optional per-experiment sample bounds, enforced by the
                 Orchestrator for every writer until the experiment closes.
             attended: Initial attendance flag.
-            experiment_dirname: Optional override for the experiment's
-                folder name (and therefore its ``experiment_id``), directly
-                under the session folder — flat only, no nesting. ``None``
-                (the default) falls back to
-                ``self._store.make_experiment_id(title, created)``.
+            experiment_dirname: Optional label for the experiment's folder,
+                directly under the session folder — flat only, no nesting.
+                The folder is always ``NNN_<label>``: the session's next
+                serial number, then this label slugged, or the title's when
+                it is ``None`` (``ExperimentStore.make_experiment_id``).
 
         Returns:
             The persisted, now-active ``ExperimentRecord``.
@@ -268,9 +268,8 @@ class ExperimentManager(QObject):
         Raises:
             ValueError: If ``title`` is empty, another experiment is open,
                 ``user_id`` is not in the roster, or ``experiment_dirname``
-                is given but is empty, contains a path separator, is
-                ``"."``/``".."``, or collides with an existing experiment
-                folder in this session.
+                is given but is empty, contains a path separator, or is
+                ``"."``/``".."``.
             OSError: If the record cannot be written.
         """
         if not title.strip():
@@ -302,6 +301,7 @@ class ExperimentManager(QObject):
         self._experiment = record
         self._orchestrator.set_experiment_envelope(envelope)
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info(
             "Experiment %s started (user=%s, attended=%s)",
             record.experiment_id,
@@ -318,20 +318,20 @@ class ExperimentManager(QObject):
         """Return the experiment id to use — auto-derived or user-chosen.
 
         Args:
-            title: The experiment title (used for the auto-derived id).
-            created_utc: ISO 8601 creation time (used for the auto-derived id).
-            experiment_dirname: The caller's override, or ``None`` for the
-                default auto-derived id.
+            title: The experiment title (the label when no folder name is given).
+            created_utc: ISO 8601 creation time (recorded on the experiment;
+                the id itself is serial).
+            experiment_dirname: The operator's folder label, or ``None``.
 
         Returns:
-            A valid, non-colliding experiment id.
+            A valid, non-colliding ``NNN_<label>`` experiment id.
 
         Raises:
             ValueError: If ``experiment_dirname`` is given but invalid (see
                 ``start_experiment``'s docstring for the exact rules).
         """
         if experiment_dirname is None:
-            return self._store.make_experiment_id(title, created_utc)
+            return self._store.make_experiment_id(title)
         candidate = experiment_dirname.strip()
         if not candidate:
             raise ValueError("Experiment folder name must not be empty")
@@ -349,11 +349,10 @@ class ExperimentManager(QObject):
             )
         if candidate in (".", ".."):
             raise ValueError(f"Experiment folder name {experiment_dirname!r} is not allowed")
-        if candidate in self._store.list_experiments():
-            raise ValueError(
-                f"An experiment folder named {candidate!r} already exists in this session"
-            )
-        return candidate
+        # The operator's name is the label; the serial number always comes
+        # first, so every experiment in a session sorts in the order it was
+        # started and no two can collide.
+        return self._store.make_experiment_id(candidate)
 
     def close_experiment(self) -> None:
         """Close the open experiment and clear the envelope. No-op when none."""
@@ -364,6 +363,7 @@ class ExperimentManager(QObject):
         self._save_current()
         self._store.set_active(None)
         self._orchestrator.set_experiment_envelope(None)
+        self._install_run_folder(None)
         logger.info("Experiment %s closed", self._experiment.experiment_id)
         self._reconcile_session_index()
         self._experiment = None
@@ -508,6 +508,7 @@ class ExperimentManager(QObject):
         self._store.set_active(record.experiment_id)
         self._orchestrator.set_experiment_envelope(envelope_from_dict(record.envelope))
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info("Switched to experiment %s", record.experiment_id)
         self._reconcile_session_index()
         self.experiment_changed.emit(record.to_dict())
@@ -1087,18 +1088,35 @@ class ExperimentManager(QObject):
     # Internals
     # ------------------------------------------------------------------
 
-    def _current_session_identity(self) -> tuple[str, str] | None:
-        """Return the ``(user_id, session_id)`` owning ``self._store``, or ``None``.
+    def _install_run_folder(self, experiment_id: str | None) -> None:
+        """Tell the engine where every run writes: this experiment's data folder.
+
+        The third policy value pushed down beside the envelope and attendance
+        (``Orchestrator.set_run_folder``). ``None`` — no experiment open —
+        installs ``""``, which refuses every run. An engine that predates the
+        command (a test double) is skipped rather than failed.
+
+        Args:
+            experiment_id: The open experiment, or ``None``.
+        """
+        setter = getattr(self._orchestrator, "set_run_folder", None)
+        if not callable(setter):
+            return
+        folder = "" if experiment_id is None else str(self._store.data_dir(experiment_id))
+        setter(folder)
+
+    def _current_session_folder(self) -> Path | None:
+        """Return the session folder owning ``self._store``, or ``None``.
 
         ``None`` when no ``session_store`` was given at construction — the
-        caller then knows to skip index maintenance entirely. Otherwise
-        derived from ``self._store.root``'s own two path segments
-        (``sessions/<user_id>/<session_id>``), never passed or cached
-        separately, so this can never disagree with the store it describes.
+        caller then knows to skip index maintenance entirely. Otherwise it is
+        ``self._store.root`` itself: the experiment store is rooted AT the
+        session folder, so this can never disagree with the store it
+        describes.
         """
         if self._session_store is None:
             return None
-        return self._store.root.parent.name, self._store.root.name
+        return self._store.root
 
     def _reconcile_session_index(self) -> None:
         """Rebuild the active session's ``experiments`` index from its folder.
@@ -1126,16 +1144,13 @@ class ExperimentManager(QObject):
         lifecycle, it must never be allowed to block it. No-op when this
         manager was built without a ``session_store``.
         """
-        identity = self._current_session_identity()
-        if identity is None:
+        folder = self._current_session_folder()
+        if folder is None:
             return
-        user_id, session_id = identity
-        session = self._session_store.load(user_id, session_id)
+        session = self._session_store.load(folder)
         if session is None:
             logger.warning(
-                "Could not load session %s/%s to reconcile its experiment index",
-                user_id,
-                session_id,
+                "Could not load session %s to reconcile its experiment index", folder
             )
             return
         entries: list[ExperimentIndexEntry] = []
@@ -1144,10 +1159,9 @@ class ExperimentManager(QObject):
             if record is None:
                 logger.warning(
                     "Skipping unreadable experiment %r while reconciling "
-                    "session %s/%s's index",
+                    "session %s's index",
                     experiment_id,
-                    user_id,
-                    session_id,
+                    folder,
                 )
                 continue
             entries.append(
@@ -1162,12 +1176,10 @@ class ExperimentManager(QObject):
             )
         session.experiments = entries
         try:
-            self._session_store.save(session)
+            self._session_store.save(session, folder)
         except OSError:
             logger.exception(
-                "Could not save session %s/%s's reconciled experiment index",
-                user_id,
-                session_id,
+                "Could not save session %s's reconciled experiment index", folder
             )
 
     def _save_current(self) -> None:
@@ -1216,6 +1228,9 @@ class ExperimentManager(QObject):
         look like live work. The envelope stored on the record is re-installed
         on the Orchestrator.
         """
+        # No experiment until one is resumed below: until then every run is
+        # refused, because a run's data always belongs to an experiment.
+        self._install_run_folder(None)
         active_id = self._store.get_active()
         if active_id is None:
             return
@@ -1242,5 +1257,6 @@ class ExperimentManager(QObject):
             envelope_from_dict(record.envelope)
         )
         self._orchestrator.set_attendance(record.attended)
+        self._install_run_folder(record.experiment_id)
         logger.info("Resumed experiment %s (%d runs)", record.experiment_id, len(record.runs))
         self.experiment_changed.emit(record.to_dict())
