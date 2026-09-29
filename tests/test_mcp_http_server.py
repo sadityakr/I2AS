@@ -519,7 +519,7 @@ def test_revoke_key_drops_the_live_connection(qtbot, controller):
 
 
 def test_client_configs_carry_the_url_and_key_in_each_clients_shape():
-    from i2as.gui.connections_dialog import CLIENT_CHOICES, render_client_config
+    from i2as.gui.connections_page import CLIENT_CHOICES, render_client_config
 
     url = "https://lab.example.ngrok.app/mcp"
     claude = json.loads(render_client_config(CLIENT_CHOICES[0], url, "i2as_abc"))
@@ -541,7 +541,7 @@ def test_client_configs_carry_the_url_and_key_in_each_clients_shape():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# The dialog applies and persists the remote-access settings
+# The Connections page applies and persists the remote-access settings
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -561,14 +561,15 @@ def isolated_settings(tmp_path, monkeypatch):
     return ini_path
 
 
-def test_the_dialog_switches_remote_access_on_and_persists_it(qtbot, controller, isolated_settings):
+def test_the_page_switches_remote_access_on_and_persists_it(qtbot, controller, isolated_settings):
     from PyQt6.QtWidgets import QCheckBox, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox
 
     from i2as.gui import app_settings
-    from i2as.gui.connections_dialog import ConnectionsDialog
+    from i2as.gui.connections_page import ConnectionsPage
+    from i2as.session.app_config import load_app_config
 
     controller.create_key("web", Role.OBSERVER)
-    dialog = ConnectionsDialog(controller)
+    dialog = ConnectionsPage(controller)
     qtbot.addWidget(dialog)
 
     dialog.findChild(QCheckBox, "connections_enabled_checkbox").setChecked(True)
@@ -584,6 +585,9 @@ def test_the_dialog_switches_remote_access_on_and_persists_it(qtbot, controller,
     assert app_settings.remote_access_enabled() is True
     assert app_settings.remote_access_port() == 18765
     assert app_settings.remote_access_public_url() == "https://lab.example.ngrok.app"
+    on_disk = load_app_config(app_settings.config_store().path).connections
+    assert on_disk.remote_enabled and on_disk.remote_port == 18765, "in the settings file"
+    assert on_disk.gateway_enabled is True
 
     config = dialog.findChild(QPlainTextEdit, "connections_client_config").toPlainText()
     assert "https://lab.example.ngrok.app/mcp" in config

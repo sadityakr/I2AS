@@ -1,19 +1,35 @@
-"""app_settings — QSettings factory used as a test seam.
+"""app_settings — QSettings factory used as a test seam, and the settings-file store.
 
 Dependency seam: a single indirection point (this factory) that tests
 monkeypatch so GUI tests never touch the real registry. Windows import the
 *module* and call ``app_settings.get_settings()`` rather than importing the
 function directly, so that ``monkeypatch.setattr(app_settings, "get_settings",
 ...)`` is seen at every call site.
+
+QSettings keeps machine chrome (window geometry, the active config, who is
+logged in). What a person CHOOSES about the installation — connections,
+analysis — lives in the general settings file, reached through
+``config_store()``; see ``i2as.session.app_config``.
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QStandardPaths
 
 from i2as.core.paths import user_state_dir
+from i2as.session.app_config import (
+    AppConfigStore,
+    ConnectionSettings,
+    app_config_path,
+    legacy_analysis_block,
+    read_app_config_file,
+)
+
+logger = logging.getLogger(__name__)
 
 _ORGANISATION = "I2AS"
 _APPLICATION = "I2AS"
@@ -23,6 +39,7 @@ _SESSIONS_SUBDIR = "sessions"
 _ACTIVE_CONFIG_NAME_KEY = "ActiveConfig/name"
 _ACTIVE_CONFIG_SOURCE_KEY = "ActiveConfig/source"
 _CURRENT_USER_KEY = "CurrentUser/user_id"
+# Legacy QSettings keys: read once, to migrate them into the settings file.
 _GATEWAY_ENABLED_KEY = "Gateway/enabled"
 _GATEWAY_MAX_ROLE_KEY = "Gateway/max_role"
 _REMOTE_ENABLED_KEY = "RemoteAccess/enabled"
@@ -164,57 +181,138 @@ def set_current_user_id(user_id: str | None) -> None:
         settings.remove(_CURRENT_USER_KEY)
 
 
-def gateway_enabled() -> bool | None:
-    """Return whether the Connections menu last left the Gateway server on.
+# ── The general settings file ────────────────────────────────────────────
+#
+# Connections (and analysis) live in the general settings file
+# (``i2as.session.app_config``), not in QSettings. The functions below keep
+# their old names so every caller is unchanged; they now read and write the
+# one shared ``AppConfigStore``.
 
-    Machine-level like the active config: this is what lets an operator
-    turn the Agent gateway on or off from the GUI and have that choice
-    survive a restart, independent of ``monitor.yaml``'s ``gateway_server``
-    flag, which only seeds the very first launch.
+#: The process-wide store, created on first use. Tests reset it to ``None``.
+_CONFIG_STORE: AppConfigStore | None = None
+
+
+def config_store() -> AppConfigStore:
+    """Return the process-wide general settings store, creating it once.
+
+    On creation, a file with no ``connections`` section takes the values the
+    Connections dialog used to keep in QSettings, and a file with no
+    ``analysis`` section the block ``eln-settings.json`` used to keep; when
+    either was migrated the file is written at once, so the copy is
+    permanent and the old places are never read again.
 
     Returns:
-        ``True``/``False`` once the Connections dialog has been used to set
-        it; ``None`` when it never has, so the caller falls back to the
-        active config's own default.
+        The store every GUI page, the ELN publisher and the analysis runner
+        share.
     """
+    global _CONFIG_STORE
+    if _CONFIG_STORE is None:
+        path = app_config_path()
+        raw = read_app_config_file(path) or {}
+        store = AppConfigStore(path)
+        config = store.current
+        migrated = "analysis" not in raw and legacy_analysis_block() is not None
+        if "connections" not in raw:
+            legacy = _legacy_connections()
+            if legacy is not None:
+                config = replace(config, connections=legacy)
+                migrated = True
+        if migrated:
+            try:
+                store.save(config)
+            except OSError:
+                logger.exception("Could not write the migrated settings to %s", path)
+        _CONFIG_STORE = store
+    return _CONFIG_STORE
+
+
+def _legacy_connections() -> ConnectionSettings | None:
+    """Return the connection values QSettings held before the settings file, or ``None``."""
     settings = get_settings()
-    if not settings.contains(_GATEWAY_ENABLED_KEY):
+    keys = (
+        _GATEWAY_ENABLED_KEY,
+        _GATEWAY_MAX_ROLE_KEY,
+        _REMOTE_ENABLED_KEY,
+        _REMOTE_HOST_KEY,
+        _REMOTE_PORT_KEY,
+        _REMOTE_PUBLIC_URL_KEY,
+    )
+    if not any(settings.contains(key) for key in keys):
         return None
-    # type=bool is what makes this correct on every backend: the Windows
-    # registry store round-trips a bool as the strings "true"/"false", not
-    # "1"/"0", and QSettings.value()'s own coercion is what already knows
-    # that — reimplementing it here previously broke on exactly this case.
-    return bool(settings.value(_GATEWAY_ENABLED_KEY, False, type=bool))
+    defaults = ConnectionSettings()
+    enabled = (
+        bool(settings.value(_GATEWAY_ENABLED_KEY, False, type=bool))
+        if settings.contains(_GATEWAY_ENABLED_KEY)
+        else None
+    )
+    try:
+        port = int(settings.value(_REMOTE_PORT_KEY, defaults.remote_port))
+    except (TypeError, ValueError):
+        port = defaults.remote_port
+    return ConnectionSettings(
+        gateway_enabled=enabled,
+        gateway_max_role=str(settings.value(_GATEWAY_MAX_ROLE_KEY) or ""),
+        remote_enabled=bool(settings.value(_REMOTE_ENABLED_KEY, False, type=bool)),
+        remote_host=str(settings.value(_REMOTE_HOST_KEY) or defaults.remote_host),
+        remote_port=port if 1 <= port <= 65535 else defaults.remote_port,
+        remote_public_url=str(settings.value(_REMOTE_PUBLIC_URL_KEY) or ""),
+    )
+
+
+def _update_connections(**changes: object) -> None:
+    """Write some connection fields to the settings file.
+
+    Args:
+        **changes: ``ConnectionSettings`` field names and their new values.
+    """
+    store = config_store()
+    config = store.current
+    store.save(replace(config, connections=replace(config.connections, **changes)))
+
+
+def gateway_enabled() -> bool | None:
+    """Return whether the Settings dialog last left the Gateway server on.
+
+    This is what lets an operator turn the Agent gateway on or off from the
+    GUI and have that choice survive a restart, independent of
+    ``monitor.yaml``'s ``gateway_server`` flag, which only seeds the very
+    first launch.
+
+    Returns:
+        ``True``/``False`` once the Settings dialog has set it; ``None`` when
+        it never has, so the caller falls back to the active config's own
+        default.
+    """
+    return config_store().connections().gateway_enabled
 
 
 def set_gateway_enabled(enabled: bool) -> None:
     """Persist whether the Gateway server should listen on next launch.
 
     Args:
-        enabled: The Connections dialog's on/off toggle.
+        enabled: The Connections page's on/off toggle.
     """
-    get_settings().setValue(_GATEWAY_ENABLED_KEY, bool(enabled))
+    _update_connections(gateway_enabled=bool(enabled))
 
 
 def gateway_max_role() -> str | None:
-    """Return the Gateway role ceiling the Connections dialog last set.
+    """Return the Gateway role ceiling the Settings dialog last set.
 
     Returns:
         The ``Role`` value string (e.g. ``"session"``), or ``None`` when the
-        Connections dialog has never set one — the caller falls back to the
-        active config's ``gateway_max_role``.
+        dialog has never set one — the caller falls back to the active
+        config's ``gateway_max_role``.
     """
-    value = get_settings().value(_GATEWAY_MAX_ROLE_KEY)
-    return str(value) if value else None
+    return config_store().connections().gateway_max_role or None
 
 
 def set_gateway_max_role(role: str) -> None:
     """Persist the Gateway role ceiling for next launch.
 
     Args:
-        role: A ``Role`` value string, as chosen in the Connections dialog.
+        role: A ``Role`` value string, as chosen on the Connections page.
     """
-    get_settings().setValue(_GATEWAY_MAX_ROLE_KEY, str(role))
+    _update_connections(gateway_max_role=str(role))
 
 
 # ── Remote access: the HTTP MCP endpoint ─────────────────────────────────
@@ -235,31 +333,27 @@ def access_keys_path() -> Path:
 
 
 def remote_access_enabled() -> bool:
-    """Return whether the Connections dialog last left the HTTP endpoint on.
+    """Return whether the Settings dialog last left the HTTP endpoint on.
 
     Returns:
         ``True`` once the dialog has switched it on; ``False`` otherwise —
         remote access is never on by default.
     """
-    value = get_settings().value(_REMOTE_ENABLED_KEY)
-    if isinstance(value, bool):
-        return value
-    return str(value).lower() in {"true", "1"} if value is not None else False
+    return config_store().connections().remote_enabled
 
 
 def set_remote_access_enabled(enabled: bool) -> None:
     """Persist whether the HTTP endpoint should listen on next launch.
 
     Args:
-        enabled: The Connections dialog's toggle.
+        enabled: The Connections page's toggle.
     """
-    get_settings().setValue(_REMOTE_ENABLED_KEY, bool(enabled))
+    _update_connections(remote_enabled=bool(enabled))
 
 
 def remote_access_host() -> str:
     """Return the address the HTTP endpoint binds; the loopback address by default."""
-    value = get_settings().value(_REMOTE_HOST_KEY)
-    return str(value) if value else "127.0.0.1"
+    return config_store().connections().remote_host
 
 
 def set_remote_access_host(host: str) -> None:
@@ -268,17 +362,12 @@ def set_remote_access_host(host: str) -> None:
     Args:
         host: ``"127.0.0.1"`` or ``"0.0.0.0"``.
     """
-    get_settings().setValue(_REMOTE_HOST_KEY, str(host))
+    _update_connections(remote_host=str(host))
 
 
 def remote_access_port() -> int:
     """Return the HTTP endpoint's port; ``8765`` until the dialog sets one."""
-    value = get_settings().value(_REMOTE_PORT_KEY)
-    try:
-        port = int(value) if value is not None else 8765
-    except (TypeError, ValueError):
-        port = 8765
-    return port if 1 <= port <= 65535 else 8765
+    return config_store().connections().remote_port
 
 
 def set_remote_access_port(port: int) -> None:
@@ -287,14 +376,12 @@ def set_remote_access_port(port: int) -> None:
     Args:
         port: The TCP port.
     """
-    get_settings().setValue(_REMOTE_PORT_KEY, int(port))
+    _update_connections(remote_port=int(port))
 
 
 def remote_access_public_url() -> str | None:
     """Return the public URL the operator published for the endpoint, if any."""
-    value = get_settings().value(_REMOTE_PUBLIC_URL_KEY)
-    text = str(value).strip() if value else ""
-    return text or None
+    return config_store().connections().remote_public_url or None
 
 
 def set_remote_access_public_url(url: str | None) -> None:
@@ -303,4 +390,4 @@ def set_remote_access_public_url(url: str | None) -> None:
     Args:
         url: The externally reachable ``https://…`` address, or ``None``.
     """
-    get_settings().setValue(_REMOTE_PUBLIC_URL_KEY, (url or "").strip())
+    _update_connections(remote_public_url=(url or "").strip())

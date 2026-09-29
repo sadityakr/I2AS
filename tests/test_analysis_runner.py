@@ -4,8 +4,9 @@ The runner is exercised against a STAND-IN worker: a tiny executable script
 written into ``tmp_path`` that reads the spec the runner wrote and produces
 whatever this test needs (a good report, a failed one, no report at all, or
 nothing ever). Nothing here depends on the real ``i2as.analysis`` worker,
-so the two halves of the analysis stage are testable independently — the same
-split the ELN track uses between an adapter and its transport.
+so the two halves of the analysis stage are testable independently. What the
+runner leaves is asserted on the sealed **analysis bundle** it announces on
+``bundle_ready`` and on the run's selection — the runner knows no notebook.
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ from pathlib import Path
 
 import pytest
 
+from i2as.analysis.bundle import BUNDLE_FILENAME, read_bundle
 from i2as.analysis.report import REPORT_FILENAME, SPEC_FILENAME
-from i2as.session.eln.settings import AnalysisSettings, ElnSettings
+from i2as.session.analysis_sandbox import LaunchPlan, SandboxError, SubprocessSandbox
+from i2as.session.app_config import AnalysisSettings, SandboxSettings
 
 _OK_REPORT = """
 report = {
@@ -70,7 +73,7 @@ def _worker(tmp_path: Path, body: str, name: str = "worker.py") -> str:
         name: The script's file name, so one test can write two workers.
 
     Returns:
-        The script path, to hand to ``AnalysisRunner(python=...)``.
+        The script path, to hand to ``make_runner()``.
     """
     script = tmp_path / name
     script.write_text(
@@ -87,33 +90,59 @@ def _worker(tmp_path: Path, body: str, name: str = "worker.py") -> str:
     return str(script)
 
 
-class FakePublisher:
-    """The publisher seam, recording what the runner handed it."""
+class StandInSandbox(SubprocessSandbox):
+    """Runs a stand-in worker SCRIPT with this interpreter, in place of the container.
+
+    ``sys.executable <script> --spec <path>`` rather than executing the script
+    through its shebang, so it starts on Windows as well as on POSIX.
+
+    Args:
+        script: The stand-in worker ``_worker()`` wrote.
+        stop_command: What the plan names as its stop command.
+    """
+
+    def __init__(self, script: str, stop_command: tuple[str, ...] = ()) -> None:
+        super().__init__(sys.executable)
+        self.script = script
+        self.stop_command = stop_command
+
+    def launch(self, spec_path: Path) -> LaunchPlan:
+        """Plan ``python <script> --spec <spec_path>``."""
+        return LaunchPlan(
+            program=sys.executable,
+            arguments=(self.script, "--spec", str(spec_path)),
+            backend="stand-in",
+            stop_command=self.stop_command,
+        )
+
+
+class BundleLog:
+    """Every ``bundle_ready`` the runner announced, in order."""
 
     def __init__(self) -> None:
-        """Start with nothing recorded."""
-        self.reports: list[tuple[str, dict, str]] = []
-        self.parked: list[tuple[str, str]] = []
+        self.ready: list[tuple[str, str, dict]] = []
 
-    def export_report(self, run_id, report, report_dir):
-        """Record one analysed entry hand-off."""
-        self.reports.append((run_id, dict(report.to_dict()), str(report_dir)))
-        return True
+    def record(self, run_id: str, bundle_id: str, bundle: dict) -> None:
+        self.ready.append((run_id, bundle_id, bundle))
 
-    def park_facts_entry(self, run_id, warning=""):
-        """Record one facts-only fallback."""
-        self.parked.append((run_id, warning))
-        return True
+    @property
+    def ok(self) -> list[tuple[str, str, dict]]:
+        return [item for item in self.ready if item[2]["status"] == "ok"]
+
+    @property
+    def failed(self) -> list[tuple[str, str]]:
+        return [(item[0], item[2]["error"].splitlines()[0]) for item in self.ready if item[2]["status"] == "failed"]
 
 
 @pytest.fixture
 def runner_setup(tmp_path, qtbot):
-    """A real ExperimentManager with two recorded runs, plus a fake publisher.
+    """A real ExperimentManager with two recorded runs, plus a bundle log.
 
-    Yields ``(manager, publisher, settings_box, make_runner)``, where
+    Yields ``(manager, bundles, settings_box, make_runner)``, where
     ``settings_box`` is a one-element list the tests mutate to change the
-    settings the runner reads, and ``make_runner(python)`` builds the runner
-    against a stand-in worker.
+    ``AnalysisSettings`` the runner reads, and ``make_runner(script)`` builds
+    the runner against a stand-in worker (or ``make_runner(sandbox=...)``
+    against any sandbox factory).
     """
     from i2as.core.orchestrator import Orchestrator
     from i2as.core.station import build_station
@@ -148,59 +177,69 @@ def runner_setup(tmp_path, qtbot):
             dict(started, finished_utc="2026-01-01T11:00:00+00:00", status="done", reason="")
         )
 
-    settings_box = [
-        ElnSettings(enabled=True, analysis=AnalysisSettings(enabled=True, timeout_s=30.0))
-    ]
-    publisher = FakePublisher()
+    settings_box = [AnalysisSettings(enabled=True, timeout_s=30.0)]
+    bundles = BundleLog()
     runners: list[AnalysisRunner] = []
 
-    def make_runner(python: str) -> AnalysisRunner:
-        runner = AnalysisRunner(manager, publisher, lambda: settings_box[0], python=python)
+    def make_runner(script: str = "", sandbox=None) -> AnalysisRunner:
+        factory = sandbox or (lambda _settings: StandInSandbox(script))
+        runner = AnalysisRunner(manager, lambda: settings_box[0], sandbox_factory=factory)
+        runner.bundle_ready.connect(bundles.record)
         runners.append(runner)
         return runner
 
-    yield manager, publisher, settings_box, make_runner
+    yield manager, bundles, settings_box, make_runner
     for runner in runners:
         runner.cancel()
 
 
-def test_a_finished_analysis_parks_an_analysed_entry(runner_setup, tmp_path, qtbot):
-    """The exit criterion: one run, one worker, one report, one parked entry."""
-    manager, publisher, _settings, make_runner = runner_setup
+def test_a_finished_analysis_is_sealed_as_a_bundle_and_selected(runner_setup, tmp_path, qtbot):
+    """The exit criterion: one run, one worker, one sealed bundle, and it represents the run."""
+    manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
 
-    with qtbot.waitSignal(runner.analysis_finished, timeout=20000) as blocker:
-        report_dir = runner.start("run-0001")
+    with qtbot.waitSignal(runner.bundle_ready, timeout=20000):
+        bundle_dir = runner.start("run-0001")
 
-    assert report_dir.endswith(f"analysis{os.sep}run-0001")
-    run_id, payload = blocker.args
-    assert run_id == "run-0001"
+    folder = Path(bundle_dir)
+    assert folder.parent.name == "run-0001" and folder.parent.parent.name == "analysis"
+    assert (folder / REPORT_FILENAME).is_file() and (folder / BUNDLE_FILENAME).is_file()
+    run_id, bundle_id, payload = bundles.ready[0]
+    assert (run_id, bundle_id) == ("run-0001", folder.name)
     assert payload["status"] == "ok" and payload["results"][0]["name"] == "Bc"
-
-    assert publisher.parked == [], "a report that ran needs no fallback"
-    (parked_run, parked_report, parked_dir) = publisher.reports[0]
-    assert parked_run == "run-0001"
-    assert parked_report["figures"][0]["file"] == "overview.png"
-    assert parked_dir == report_dir
-    assert (Path(report_dir) / REPORT_FILENAME).is_file()
+    assert payload["producer"]["kind"] == "recipe" and payload["producer"]["digest"] == "abc123"
+    assert payload["inputs"][0]["run_id"] == "run-0001"
+    [figure] = payload["artifacts"]
+    assert figure["path"] == "overview.png" and figure["caption"] == "Overview" and len(figure["sha256"]) == 64
+    assert read_bundle(folder).sealed is True
+    assert manager.current_experiment().find_run("run-0001").selected_bundle == bundle_id
     assert not runner.is_running()
+
+
+def test_every_analysis_is_a_new_bundle(runner_setup, tmp_path, qtbot):
+    """A second analysis of a run never overwrites the first."""
+    manager, bundles, _settings, make_runner = runner_setup
+    runner = make_runner(_worker(tmp_path, _OK_REPORT))
+    with qtbot.waitSignals([runner.bundle_ready, runner.bundle_ready], timeout=30000):
+        first = runner.start("run-0001")
+        second = runner.start("run-0001", recipe="other")
+    assert first != second and Path(first).is_dir() and Path(second).is_dir()
+    assert manager.current_experiment().find_run("run-0001").selected_bundle == Path(second).name
+    assert len(manager.store.list_bundles(manager.current_experiment().experiment_id, "run-0001")) == 2
 
 
 def test_the_spec_names_the_run_the_experiment_and_the_preferred_recipe(
     runner_setup, tmp_path, qtbot
 ):
     """What the worker is asked is built from the record and the settings."""
-    manager, _publisher, settings_box, make_runner = runner_setup
+    manager, _bundles, settings_box, make_runner = runner_setup
     from dataclasses import replace
 
     settings_box[0] = replace(
         settings_box[0],
-        analysis=replace(
-            settings_box[0].analysis,
-            recipes={"FieldSweep": "my_sweep"},
-            include_fact_tables=True,
-            attach_data_file=True,
-        ),
+        recipes={"FieldSweep": "my_sweep"},
+        include_fact_tables=True,
+        attach_data_file=True,
     )
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
 
@@ -224,7 +263,7 @@ def test_the_spec_names_the_run_the_experiment_and_the_preferred_recipe(
 
 def test_an_explicit_recipe_wins_over_the_settings(runner_setup, tmp_path, qtbot):
     """A caller naming a recipe overrides the per-procedure preference."""
-    _manager, _publisher, _settings, make_runner = runner_setup
+    _manager, _bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
 
     with qtbot.waitSignal(runner.analysis_finished, timeout=20000):
@@ -234,9 +273,9 @@ def test_an_explicit_recipe_wins_over_the_settings(runner_setup, tmp_path, qtbot
     assert spec["recipe"] == "explicit"
 
 
-def test_a_failed_report_parks_the_facts_entry(runner_setup, tmp_path, qtbot):
-    """A recipe that raised loses nothing: the facts entry waits instead."""
-    _manager, publisher, _settings, make_runner = runner_setup
+def test_a_failed_report_is_a_failed_bundle(runner_setup, tmp_path, qtbot):
+    """A recipe that raised is a failed bundle, and selects nothing."""
+    manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _FAILED_REPORT))
 
     with qtbot.waitSignal(runner.analysis_failed, timeout=20000) as blocker:
@@ -244,13 +283,14 @@ def test_a_failed_report_parks_the_facts_entry(runner_setup, tmp_path, qtbot):
 
     run_id, error = blocker.args
     assert run_id == "run-0001" and "ZeroDivisionError" in error
-    assert publisher.reports == [], "a failed report is never an analysed entry"
-    assert publisher.parked == [("run-0001", "ZeroDivisionError: division by zero")]
+    assert bundles.ok == [], "a failed report is never a completed bundle"
+    assert bundles.failed == [("run-0001", "ZeroDivisionError: division by zero")]
+    assert manager.current_experiment().find_run("run-0001").selected_bundle == ""
 
 
-def test_a_worker_that_writes_no_report_is_still_an_entry(runner_setup, tmp_path, qtbot):
+def test_a_worker_that_writes_no_report_is_still_a_bundle(runner_setup, tmp_path, qtbot):
     """No report is a failure like any other — never a silently lost run."""
-    _manager, publisher, _settings, make_runner = runner_setup
+    _manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _NO_REPORT))
 
     with qtbot.waitSignal(runner.analysis_failed, timeout=20000) as blocker:
@@ -259,17 +299,15 @@ def test_a_worker_that_writes_no_report_is_still_an_entry(runner_setup, tmp_path
     _run_id, error = blocker.args
     assert "wrote no report" in error
     assert "exploded" in error, "the worker's own stderr says why"
-    assert publisher.parked[0][0] == "run-0001"
+    assert bundles.failed[0][0] == "run-0001"
 
 
 def test_a_runaway_worker_is_killed_and_reported(runner_setup, tmp_path, qtbot):
     """The timeout bounds a recipe that never returns; the entry still lands."""
     from dataclasses import replace
 
-    _manager, publisher, settings_box, make_runner = runner_setup
-    settings_box[0] = replace(
-        settings_box[0], analysis=replace(settings_box[0].analysis, timeout_s=1.0)
-    )
+    _manager, bundles, settings_box, make_runner = runner_setup
+    settings_box[0] = replace(settings_box[0], timeout_s=1.0)
     runner = make_runner(_worker(tmp_path, _NEVER_ENDS))
 
     with qtbot.waitSignal(runner.analysis_failed, timeout=30000) as blocker:
@@ -277,13 +315,13 @@ def test_a_runaway_worker_is_killed_and_reported(runner_setup, tmp_path, qtbot):
 
     _run_id, error = blocker.args
     assert "timed out after 1 s" in error
-    assert publisher.parked == [("run-0001", "analysis timed out after 1 s")]
+    assert bundles.failed == [("run-0001", "analysis timed out after 1 s")]
     assert not runner.is_running()
 
 
 def test_one_worker_at_a_time_and_the_queue_is_fifo(runner_setup, tmp_path, qtbot):
     """Two requests, one process: the second waits for the first, in order."""
-    _manager, publisher, _settings, make_runner = runner_setup
+    _manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
 
     with qtbot.waitSignals(
@@ -294,13 +332,13 @@ def test_one_worker_at_a_time_and_the_queue_is_fifo(runner_setup, tmp_path, qtbo
         assert first and second
         assert runner.is_running("run-0001") and runner.is_running("run-0002")
 
-    assert [entry[0] for entry in publisher.reports] == ["run-0001", "run-0002"]
+    assert [entry[0] for entry in bundles.ok] == ["run-0001", "run-0002"]
     assert not runner.is_running()
 
 
-def test_cancelling_leaves_the_facts_entry_behind(runner_setup, tmp_path, qtbot):
-    """A cancelled analysis still ends in an entry waiting for its human."""
-    _manager, publisher, _settings, make_runner = runner_setup
+def test_cancelling_leaves_a_failed_bundle_behind(runner_setup, tmp_path, qtbot):
+    """A cancelled analysis still says what happened to it."""
+    _manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _NEVER_ENDS))
 
     with qtbot.waitSignal(runner.analysis_started, timeout=20000):
@@ -310,13 +348,13 @@ def test_cancelling_leaves_the_facts_entry_behind(runner_setup, tmp_path, qtbot)
         runner.cancel("run-0001")
 
     assert "cancelled" in blocker.args[1]
-    assert publisher.parked == [("run-0001", "analysis cancelled")]
+    assert bundles.failed == [("run-0001", "analysis cancelled")]
     assert not runner.is_running()
 
 
 def test_start_refuses_what_it_cannot_analyse(runner_setup, tmp_path, qtbot):
     """No run, no data file, or no open experiment: "" and a log line, never a raise."""
-    manager, publisher, _settings, make_runner = runner_setup
+    manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
 
     assert runner.start("no-such-run") == ""
@@ -328,7 +366,7 @@ def test_start_refuses_what_it_cannot_analyse(runner_setup, tmp_path, qtbot):
     manager.close_experiment()
     assert runner.start("run-0001") == ""
     assert runner.recipe_dirs() == []
-    assert publisher.reports == [] and publisher.parked == []
+    assert bundles.ready == []
 
 
 # ── Analysis scripts and the sandbox ──────────────────────────────────────
@@ -340,11 +378,11 @@ _ENV_REPORT = (
 )
 
 
-def test_a_script_is_announced_on_its_own_signal_and_never_parked(
+def test_a_script_is_announced_on_its_own_signal_and_selects_nothing(
     runner_setup, tmp_path, qtbot
 ):
-    """Exploring a run leaves the run's pending entry exactly as it was."""
-    manager, publisher, _settings, make_runner = runner_setup
+    """Exploring a run leaves what represents the run exactly as it was."""
+    manager, bundles, _settings, make_runner = runner_setup
     runner = make_runner(_worker(tmp_path, _OK_REPORT))
     experiment = manager.current_experiment()
     folder = manager.store.script_dir(experiment.experiment_id, "run-0001", "probe_1")
@@ -363,7 +401,9 @@ def test_a_script_is_announced_on_its_own_signal_and_never_parked(
     run_id, script_id, payload = blocker.args
     assert (run_id, script_id) == ("run-0001", "probe_1")
     assert payload["status"] == "ok"
-    assert publisher.reports == [] and publisher.parked == []
+    assert [(r, b) for r, b, _ in bundles.ready] == [("run-0001", "script-probe_1")]
+    assert bundles.ready[0][2]["producer"]["kind"] == "script"
+    assert manager.current_experiment().find_run("run-0001").selected_bundle == ""
     assert finished_recipes == []
     spec = json.loads((folder / SPEC_FILENAME).read_text(encoding="utf-8"))
     assert spec["script_path"] == str(script)
@@ -371,61 +411,124 @@ def test_a_script_is_announced_on_its_own_signal_and_never_parked(
     assert spec["options"] == {"k": 1}
 
 
-def test_the_venv_sandbox_scrubs_the_environment_and_stages_the_run(
-    runner_setup, tmp_path, qtbot, monkeypatch
-):
-    """A credential in this process never reaches analysis code, nor does the original file."""
+
+
+def test_a_runaway_worker_runs_its_sandbox_stop_command(runner_setup, tmp_path, qtbot):
+    """A container outlives a killed ``docker run``; the runner stops it by name."""
     from dataclasses import replace
 
-    from i2as.session.eln.settings import SandboxSettings
+    _manager, _bundles, settings_box, make_runner = runner_setup
+    settings_box[0] = replace(settings_box[0], timeout_s=1.0)
+    marker = tmp_path / "stopped.txt"
+    stop = (sys.executable, "-c", f"open({str(marker)!r}, 'w').write('killed')")
+    worker = _worker(tmp_path, _NEVER_ENDS)
+    runner = make_runner(sandbox=lambda _settings: StandInSandbox(worker, stop_command=stop))
 
-    _manager, _publisher, settings_box, make_runner = runner_setup
-    monkeypatch.setenv("I2AS_ASSISTANT_APIKEY", "sk-secret")
-    monkeypatch.setenv("SOME_API_TOKEN", "t0ken")
-    worker = _worker(tmp_path, _ENV_REPORT)
-    settings_box[0] = replace(
-        settings_box[0],
-        analysis=replace(
-            settings_box[0].analysis,
-            sandbox=SandboxSettings(backend="venv", python=worker),
-        ),
-    )
-    # The runner's own interpreter is NOT what the venv backend starts.
-    runner = make_runner(sys.executable)
+    with qtbot.waitSignal(runner.analysis_failed, timeout=30000):
+        runner.start("run-0001")
 
+    qtbot.waitUntil(marker.exists, timeout=10000)
+    assert marker.read_text(encoding="utf-8") == "killed"
+
+
+def test_the_runner_builds_each_sandbox_from_the_settings(runner_setup, tmp_path, qtbot):
+    """The analysis.sandbox block is what the sandbox is built from, per analysis."""
+    from dataclasses import replace
+
+    _manager, _bundles, settings_box, make_runner = runner_setup
+    settings_box[0] = replace(settings_box[0], sandbox=SandboxSettings(image="lab/a:9"))
+    seen: list[SandboxSettings] = []
+    worker = _worker(tmp_path, _OK_REPORT)
+
+    def factory(settings: SandboxSettings) -> StandInSandbox:
+        seen.append(settings)
+        return StandInSandbox(worker)
+
+    runner = make_runner(sandbox=factory)
     with qtbot.waitSignal(runner.analysis_finished, timeout=20000):
-        report_dir = runner.start("run-0001")
+        runner.start("run-0001")
 
-    seen = json.loads((Path(report_dir) / "env.json").read_text(encoding="utf-8"))
-    assert "I2AS_ASSISTANT_APIKEY" not in seen["env"]
-    assert "SOME_API_TOKEN" not in seen["env"]
-    assert seen["env"]["MPLBACKEND"] == "Agg"
-    assert Path(seen["cwd"]).resolve() == Path(report_dir).resolve()
-    spec = json.loads((Path(report_dir) / SPEC_FILENAME).read_text(encoding="utf-8"))
-    staged = Path(spec["data_path"])
-    assert staged.parent == Path(report_dir) / "input"
-    assert staged.read_bytes() == b"\x89HDF\r\n\x1a\n"
+    assert [settings.image for settings in seen] == ["lab/a:9"]
 
 
-def test_a_sandbox_with_no_interpreter_is_a_failed_analysis_not_a_silent_one(
+def test_no_container_engine_is_a_failed_analysis_not_a_silent_one(
     runner_setup, tmp_path, qtbot
 ):
-    """A misconfigured sandbox still leaves an entry waiting, naming why."""
+    """With the real container sandbox and no engine, a failed bundle names why."""
     from dataclasses import replace
 
-    from i2as.session.eln.settings import SandboxSettings
+    from i2as.session.analysis_sandbox import build_sandbox
 
-    _manager, publisher, settings_box, make_runner = runner_setup
+    _manager, bundles, settings_box, make_runner = runner_setup
     settings_box[0] = replace(
-        settings_box[0],
-        analysis=replace(settings_box[0].analysis, sandbox=SandboxSettings(backend="venv")),
+        settings_box[0], sandbox=SandboxSettings(engine="no-such-engine-xyz")
     )
-    runner = make_runner(sys.executable)
+    runner = make_runner(sandbox=build_sandbox)
 
     with qtbot.waitSignal(runner.analysis_failed, timeout=5000) as blocker:
         runner.start("run-0001")
 
     assert blocker.args[0] == "run-0001"
-    assert "no interpreter is configured" in blocker.args[1]
-    assert publisher.parked and publisher.parked[0][0] == "run-0001"
+    assert "not installed" in blocker.args[1]
+    assert bundles.failed and bundles.failed[0][0] == "run-0001"
     assert not runner.is_running()
+
+
+class _PreparedOnlySandbox:
+    """A real ContainerSandbox's ``prepare()``, with a launch that refuses."""
+
+    def __init__(self, settings: SandboxSettings) -> None:
+        from i2as.session.analysis_sandbox import ContainerSandbox
+
+        self._inner = ContainerSandbox(settings, engine_path="unused")
+
+    def prepare(self, spec):
+        return self._inner.prepare(spec)
+
+    def launch(self, spec_path):
+        raise SandboxError("no engine on a test box")
+
+
+def test_the_container_spec_names_container_paths(runner_setup, tmp_path, qtbot):
+    """The spec written for a container names /work and /input, not host paths."""
+    _manager, _bundles, _settings, make_runner = runner_setup
+    runner = make_runner(sandbox=_PreparedOnlySandbox)
+
+    with qtbot.waitSignal(runner.analysis_failed, timeout=5000):
+        report_dir = runner.start("run-0001")
+
+    spec = json.loads((Path(report_dir) / SPEC_FILENAME).read_text(encoding="utf-8"))
+    assert spec["output_dir"] == "/work"
+    assert spec["data_path"] == "/input/run-0001.h5"
+
+
+# ── The analysis trigger: analysis decides, by itself, what is analysed ────
+
+
+def test_the_trigger_analyses_a_finished_run_only_when_switched_on(runner_setup, tmp_path, qtbot):
+    """A finished run is analysed when the analysis settings say so, and only then."""
+    import gc
+    from dataclasses import replace
+
+    from i2as.session.analysis_trigger import AnalysisTrigger
+
+    manager, bundles, settings_box, make_runner = runner_setup
+    runner = make_runner(_worker(tmp_path, _OK_REPORT))
+    manifest = {"run_id": "run-0001", "data_file": manager.current_experiment().find_run("run-0001").data_file}
+
+    trigger = AnalysisTrigger(manager, runner, lambda: settings_box[0])
+    assert trigger.parent() is runner, "owned by the runner, so it outlives its builder"
+    del trigger
+    gc.collect()
+    [child] = [c for c in runner.children() if isinstance(c, AnalysisTrigger)]
+
+    settings_box[0] = replace(settings_box[0], enabled=False)
+    assert child.on_run_finished(manifest) == "", "analysis off: the run is not analysed"
+    settings_box[0] = replace(settings_box[0], enabled=True)
+    with qtbot.waitSignal(runner.bundle_ready, timeout=20000):
+        assert child.on_run_finished(manifest)
+    assert bundles.ok[0][0] == "run-0001"
+
+    manager.close_experiment()
+    assert child.on_run_finished(manifest) == "", "no experiment: nowhere to keep a bundle"
+    assert child.on_run_finished("junk") == ""

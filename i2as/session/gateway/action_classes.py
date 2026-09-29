@@ -48,12 +48,12 @@ logger = logging.getLogger(__name__)
 class ActionClass(str, Enum):
     """How much authority an action needs, independent of who is asking.
 
-    The five classes of the gateway's permission matrix (``roles.py``). A
+    The six classes of the gateway's permission matrix (``roles.py``). A
     ``str`` enum so the value is JSON-safe as it stands and travels in a
     refusal's ``detail`` unchanged. The four HARDWARE classes are
     ``core.decorators.VALID_ACTION_CLASSES``, which is what a VI declares
-    against; the fifth, ``ANALYSIS``, is in ``SESSION_ONLY_ACTION_CLASSES``
-    and no instrument may declare it. ``tests/test_conformance.py`` asserts
+    against; ``ANALYSIS`` and ``ELN`` are in ``SESSION_ONLY_ACTION_CLASSES``
+    and no instrument may declare them. ``tests/test_conformance.py`` asserts
     the split, so the declaration side and the permission side can never
     drift apart.
 
@@ -73,6 +73,12 @@ class ActionClass(str, Enum):
             no measurement and publishes nothing, which is why it is its own
             class rather than ``run_control``: an agent may be trusted to
             analyse without being trusted to measure.
+        ELN: Reads from or writes to the experiment's electronic lab
+            notebook — searching it, linking a page, reading fields back,
+            publishing. Refused to EVERY agent role today: the notebook is
+            the operator's, done in the GUI. The class exists so notebook
+            tools can be opened to a role later by changing one row of the
+            matrix, not the design.
     """
 
     READ = "read"
@@ -80,6 +86,7 @@ class ActionClass(str, Enum):
     RUN_CONTROL = "run_control"
     ENVELOPE = "envelope"
     ANALYSIS = "analysis"
+    ELN = "eln"
 
 
 #: The classes only a session tool can carry. A ``@control`` is hardware, and
@@ -87,7 +94,7 @@ class ActionClass(str, Enum):
 #: role granted analysis alone — so ``core.decorators.VALID_ACTION_CLASSES``
 #: omits these, and ``classify_control()`` refuses one arriving on a snapshot
 #: anyway rather than trusting where the snapshot came from.
-SESSION_ONLY_ACTION_CLASSES: frozenset[ActionClass] = frozenset({ActionClass.ANALYSIS})
+SESSION_ONLY_ACTION_CLASSES: frozenset[ActionClass] = frozenset({ActionClass.ANALYSIS, ActionClass.ELN})
 
 
 @dataclass(frozen=True)

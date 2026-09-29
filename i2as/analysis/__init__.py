@@ -14,63 +14,57 @@ vocabulary and the exceptions from ``i2as.core`` (plus numpy, h5py, stdlib
 and — lazily, optionally — matplotlib). It never imports the Station, the
 Orchestrator, a driver, a VI, a procedure, the session layer or the GUI, and
 nothing below the session layer imports it. See ``README.md`` here.
+
+The public names below are resolved lazily, on first use, so that importing
+``i2as.analysis.bundle`` alone — as the publisher and the block host do —
+does not import numpy, h5py or the recipe machinery.
 """
 
-from i2as.analysis.base import (
-    AnalysisContext,
-    AnalysisError,
-    AnalysisRecipe,
-)
-from i2as.analysis.discovery import (
-    RECIPE_TEMPLATE,
-    RecipeInfo,
-    discover_recipes,
-    load_recipe,
-    procedure_key,
-    recipe_for,
-    scaffold_recipe,
-)
-from i2as.analysis.report import (
-    ANY_PROCEDURE,
-    REPORT_FAILED,
-    REPORT_FILENAME,
-    REPORT_OK,
-    RECIPES_DIRNAME,
-    SCRIPTS_DIRNAME,
-    SPEC_FILENAME,
-    AnalysisReport,
-    AnalysisSpec,
-    FigureRef,
-    ResultValue,
-    TableSpec,
-)
+from __future__ import annotations
 
-from i2as.analysis.runner import read_report, run_spec, write_report
+import importlib
+from typing import Any
 
-__all__ = [
-    "ANY_PROCEDURE",
-    "RECIPE_TEMPLATE",
-    "REPORT_FAILED",
-    "REPORT_FILENAME",
-    "REPORT_OK",
-    "RECIPES_DIRNAME",
-    "SCRIPTS_DIRNAME",
-    "SPEC_FILENAME",
-    "AnalysisContext",
-    "AnalysisError",
-    "AnalysisRecipe",
-    "AnalysisReport",
-    "AnalysisSpec",
-    "FigureRef",
-    "RecipeInfo",
-    "ResultValue",
-    "TableSpec",
-    "discover_recipes",
-    "load_recipe",
-    "read_report",
-    "procedure_key",
-    "recipe_for",
-    "run_spec",
-    "scaffold_recipe",
-    "write_report",
-]
+#: Public name -> the submodule that defines it.
+_EXPORTS: dict[str, str] = {
+    "AnalysisContext": "base",
+    "AnalysisError": "base",
+    "AnalysisRecipe": "base",
+    "RECIPE_TEMPLATE": "discovery",
+    "RecipeInfo": "discovery",
+    "discover_recipes": "discovery",
+    "load_recipe": "discovery",
+    "procedure_key": "discovery",
+    "recipe_for": "discovery",
+    "scaffold_recipe": "discovery",
+    "ANY_PROCEDURE": "report",
+    "REPORT_FAILED": "report",
+    "REPORT_FILENAME": "report",
+    "REPORT_OK": "report",
+    "RECIPES_DIRNAME": "report",
+    "SCRIPTS_DIRNAME": "report",
+    "SPEC_FILENAME": "report",
+    "AnalysisReport": "report",
+    "AnalysisSpec": "report",
+    "FigureRef": "report",
+    "ResultValue": "report",
+    "TableSpec": "report",
+    "read_report": "runner",
+    "run_spec": "runner",
+    "write_report": "runner",
+    "Bundle": "bundle",
+    "read_bundle": "bundle",
+    "seal_bundle": "bundle",
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve one public name from its submodule, on first use."""
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f"{__name__}.{module}"), name)
+    globals()[name] = value
+    return value

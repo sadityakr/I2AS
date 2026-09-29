@@ -1,26 +1,19 @@
 # ---
 # description: |
-#   Behaviour tests for the eLab tab (gui/analysis_panel.py) and its home in
-#   the procedure window: the panel lists an experiment's finished runs, picks
-#   the recipe that serves the selected run, starts the runner, previews the
-#   pending entry with the recipe's figures above the body, and approves or
-#   discards it through the manager — and degrades to one line when nothing
-#   is wired.
-# last_updated: 2026-09-05
+#   Behaviour tests for the Analysis tab (gui/analysis_panel.py): the panel
+#   lists an experiment's finished runs, picks the recipe that serves the
+#   selected run, starts the runner, lists every analysis bundle of a run and
+#   lets the operator choose the one that represents it, previews it from its
+#   sealed files, and drives the experiment's notebook strip (link, read
+#   fields, approve once, publish, retry) — and degrades to one line when
+#   nothing is wired.
+# last_updated: 2026-09-27
 # ---
 
-"""The eLab tab, built over stub collaborators.
-
-The panel talks to three optional collaborators — the experiment manager, the
-ELN publisher and the analysis runner — through a handful of duck-typed
-methods and Qt signals. These tests supply exactly those, so the suite needs
-no notebook, no subprocess and no session layer at all: what is asserted is
-the panel's own behaviour, not its collaborators'.
-"""
+"""The Analysis tab, built over stub collaborators and a real experiment store."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -28,172 +21,124 @@ from typing import Any
 import pytest
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from i2as.analysis.report import REPORT_FILENAME
+from i2as.analysis.bundle import Producer, seal_bundle
+from i2as.gui import app_settings
 from i2as.gui.analysis_panel import (
     ANALYSING_TEXT,
     EXPERIMENT_SUFFIX,
+    NO_BUNDLES_TEXT,
     NO_SESSION_TEXT,
-    NOTHING_PENDING_TEXT,
-    READY_TEXT,
+    SELECTED_MARK,
     AnalysisPanel,
 )
-from i2as.session.eln.settings import AnalysisSettings, ElnSettings
-
+from i2as.session.analysis_sandbox import EngineStatus
+from i2as.session.eln.publishing import PublishError
+from i2as.session.models import ElnBinding, ElnLink
+from i2as.session.store import ExperimentStore
 
 # ── Stub collaborators ────────────────────────────────────────────────────────
 
 
-#: The real analysis block — the stand-in from the parallel build is gone.
-StubAnalysisSettings = AnalysisSettings
-
-
-#: ``ElnSettings`` carries the analysis block itself now.
-SettingsWithAnalysis = ElnSettings
-
-
 @dataclass
 class StubRun:
-    """One run record, with only the fields the panel reads."""
-
     run_id: str
     procedure: str = "FieldSweep"
     status: str = "done"
     data_file: str = ""
-    pending_eln_draft: dict[str, Any] = field(default_factory=dict)
+    selected_bundle: str = ""
+    published: bool = False
 
 
 @dataclass
 class StubExperiment:
-    """One experiment record: an id and its runs, oldest first."""
-
     experiment_id: str = "exp_1"
+    user_id: str = "jdoe"
     runs: list[StubRun] = field(default_factory=list)
-
-
-class StubStore:
-    """The two analysis paths the panel asks the store for."""
-
-    def __init__(self, root: Path) -> None:
-        """Root every path under one throwaway directory.
-
-        Args:
-            root: The directory experiment folders are made under.
-        """
-        self.root = root
-
-    def recipes_dir(self, experiment_id: str) -> Path:
-        """Return the experiment's recipes directory (never created here)."""
-        return self.root / experiment_id / "analysis" / "recipes"
-
-    def report_dir(self, experiment_id: str, run_id: str) -> Path:
-        """Return one run's report directory (never created here)."""
-        return self.root / experiment_id / "analysis" / run_id
+    eln: ElnBinding | None = None
 
 
 class StubManager(QObject):
-    """The slice of ``ExperimentManager`` the eLab tab uses."""
+    """The slice of ``ExperimentManager`` the Analysis tab uses."""
 
     experiment_changed = pyqtSignal(dict)
     run_recorded = pyqtSignal(dict)
 
-    def __init__(self, experiment: StubExperiment | None, store: StubStore) -> None:
-        """Hold one open experiment and its store.
-
-        Args:
-            experiment: The open experiment, or ``None`` for "none open".
-            store: The store the panel resolves analysis paths through.
-        """
+    def __init__(self, experiment: StubExperiment | None, store: ExperimentStore) -> None:
         super().__init__()
         self.experiment = experiment
         self.store = store
+        self.selected: list[tuple[str, str]] = []
         self.approved: list[str] = []
-        self.discarded: list[str] = []
 
     def current_experiment(self) -> StubExperiment | None:
-        """Return the open experiment, or ``None``."""
         return self.experiment
 
-    def pending_eln_draft(self, run_id: str) -> dict[str, Any]:
-        """Return the entry parked on one run, or ``{}``."""
-        for run in getattr(self.experiment, "runs", ()):
+    def select_bundle(self, run_id: str, bundle_id: str) -> bool:
+        self.selected.append((run_id, bundle_id))
+        for run in self.experiment.runs:
             if run.run_id == run_id:
-                return dict(run.pending_eln_draft)
-        return {}
+                run.selected_bundle = bundle_id
+        return True
 
-    def approve_eln_draft(self, run_id: str) -> str:
-        """Record an approval and clear the pending entry."""
-        self.approved.append(run_id)
-        for run in getattr(self.experiment, "runs", ()):
-            if run.run_id == run_id:
-                run.pending_eln_draft = {}
-        return "job-1"
-
-    def discard_pending_eln_draft(self, run_id: str) -> bool:
-        """Record a discard and clear the pending entry."""
-        self.discarded.append(run_id)
-        for run in getattr(self.experiment, "runs", ()):
-            if run.run_id == run_id:
-                run.pending_eln_draft = {}
+    def approve_eln_publishing(self, user_id: str) -> bool:
+        self.approved.append(user_id)
+        self.experiment.eln = replace(self.experiment.eln, publish_approved=True)
         return True
 
 
-class StubPublisher(QObject):
-    """The slice of ``ElnPublisher`` the eLab tab uses."""
+class StubService(QObject):
+    """The slice of ``ElnService`` the Analysis tab uses."""
 
-    publish_state_changed = pyqtSignal(dict)
+    status_changed = pyqtSignal(dict)
+    publish_finished = pyqtSignal(dict)
+    publish_failed = pyqtSignal(dict)
+    page_ready = pyqtSignal(dict)
 
-    def __init__(self, settings: Any) -> None:
-        """Hold the settings the chip and the toggle read.
-
-        Args:
-            settings: The ``ElnSettings``-shaped record.
-        """
+    def __init__(self) -> None:
         super().__init__()
-        self._settings = settings
-        self.reloaded: list[Any] = []
+        self.published: list[Any] = []
+        self.retried: list[str] = []
+        self.refuse = ""
+        self.current_status: dict[str, Any] = {"state": "synced", "pending": 0, "attention": []}
 
-    @property
-    def settings(self) -> Any:
-        """The settings this publisher was built with."""
-        return self._settings
+    def enabled(self, _user: str = "") -> bool:
+        return True
 
-    def status(self) -> dict[str, Any]:
-        """Return a disabled publish status."""
-        return {"state": "disabled", "pending": 0, "detail": ""}
+    def status(self, _experiment_id: str = "") -> dict[str, Any]:
+        return dict(self.current_status)
 
-    def reload_settings(self, settings: Any) -> None:
-        """Record a settings reload."""
-        self.reloaded.append(settings)
-        self._settings = settings
+    def publish(self, run_ids=None) -> str:
+        if self.refuse:
+            raise PublishError(self.refuse)
+        self.published.append(run_ids)
+        return "P-1"
+
+    def retry(self, experiment_id: str = "") -> int:
+        self.retried.append(experiment_id)
+        return 1
 
 
 class StubRunner(QObject):
-    """The slice of ``AnalysisRunner`` the eLab tab uses."""
-
     analysis_started = pyqtSignal(str)
     analysis_finished = pyqtSignal(str, dict)
     analysis_failed = pyqtSignal(str, str)
+    bundle_ready = pyqtSignal(str, str, dict)
 
     def __init__(self) -> None:
-        """Start idle, recording every call."""
         super().__init__()
         self.calls: list[tuple[str, str]] = []
         self.running: set[str] = set()
 
     def start(self, run_id: str, recipe: str = "", **_kwargs: Any) -> str:
-        """Record one start request and answer with a report directory."""
         self.calls.append((run_id, recipe))
-        return f"/reports/{run_id}"
+        return f"/bundles/{run_id}"
 
     def is_running(self, run_id: str = "") -> bool:
-        """Return whether one run is being analysed."""
         return run_id in self.running
 
 
 @dataclass(frozen=True)
 class StubRecipeInfo:
-    """One recipe as ``discover_recipes`` describes it."""
-
     name: str
     description: str = ""
     procedures: tuple[str, ...] = ("*",)
@@ -205,66 +150,52 @@ class StubRecipeInfo:
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 
+def _seal(store: ExperimentStore, run_id: str, bundle_id: str, *, status: str = "ok", created: str = "2026-09-27T10:00:00+00:00", figure: bool = True):
+    folder = store.bundle_dir("exp_1", run_id, bundle_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    if figure:
+        (folder / "overview.png").write_bytes(b"\x89PNG")
+    return seal_bundle(
+        folder,
+        {
+            "status": status,
+            "error": "ValueError: bad\ntraceback" if status == "failed" else "",
+            "summary": ["Two branches, no hysteresis."],
+            "results": [{"name": "Bc", "value": 1.25, "unit": "T"}],
+            "figures": [{"file": "overview.png", "caption": "Overview"}] if figure else [],
+            "warnings": ["a column was missing"],
+        },
+        bundle_id=bundle_id,
+        experiment_id="exp_1",
+        run_ids=(run_id,),
+        producer=Producer(kind="recipe", name="generic_sweep"),
+        created_utc=created,
+    )
+
+
 @pytest.fixture
 def wired(tmp_path, qtbot):
-    """A panel over stub collaborators, with two finished runs and one pending.
-
-    Returns:
-        ``(panel, manager, publisher, runner)``.
-    """
-    experiment = StubExperiment(
-        runs=[
-            StubRun(run_id="run_001", procedure="FieldSweep"),
-            StubRun(
-                run_id="run_002",
-                procedure="FieldSweep",
-                pending_eln_draft={
-                    "title": "FieldSweep — run_002",
-                    "body_html": "<p>Two branches, no hysteresis.</p>",
-                    "source": "analysis",
-                },
-            ),
-        ]
-    )
-    manager = StubManager(experiment, StubStore(tmp_path))
-    publisher = StubPublisher(SettingsWithAnalysis())
+    """A panel over stubs: two finished runs, run_002 with two bundles (one selected)."""
+    store = ExperimentStore(tmp_path)
+    experiment = StubExperiment(runs=[StubRun("run_001"), StubRun("run_002", selected_bundle="b-old")])
+    _seal(store, "run_002", "b-old", created="2026-09-27T09:00:00+00:00")
+    _seal(store, "run_002", "b-new", created="2026-09-27T10:00:00+00:00")
+    manager = StubManager(experiment, store)
+    service = StubService()
     runner = StubRunner()
+    opened: list[str] = []
     panel = AnalysisPanel(
         session_manager=manager,
-        eln_publisher=publisher,
+        eln_service=service,
         analysis_runner=runner,
+        dialog_factory=lambda kind, *_args: opened.append(kind),
     )
     qtbot.addWidget(panel)
-    return panel, manager, publisher, runner
-
-
-def _write_report(store: StubStore, run_id: str, payload: dict[str, Any]) -> Path:
-    """Write one report.json into a run's report directory.
-
-    Args:
-        store: The stub store resolving the directory.
-        run_id: The run the report belongs to.
-        payload: The report as its JSON dict.
-
-    Returns:
-        The directory the report was written into.
-    """
-    directory = store.report_dir("exp_1", run_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / REPORT_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
-    return directory
+    panel.opened = opened
+    return panel, manager, service, runner
 
 
 def _fake_discovery(monkeypatch, recipes: tuple[StubRecipeInfo, ...]) -> None:
-    """Install a stub ``i2as.analysis.discovery`` module.
-
-    The real one is built in parallel; the panel imports it lazily by name,
-    so a module object in ``sys.modules`` is exactly what it would find.
-
-    Args:
-        monkeypatch: pytest's monkeypatch fixture.
-        recipes: What ``discover_recipes`` should return.
-    """
     import sys
     import types
 
@@ -301,13 +232,11 @@ def _fake_discovery(monkeypatch, recipes: tuple[StubRecipeInfo, ...]) -> None:
 
 
 def test_panel_builds_with_no_collaborators(qtbot):
-    """With nothing wired the panel builds and says so in one line."""
     panel = AnalysisPanel()
     qtbot.addWidget(panel)
     assert panel._status_label.text() == NO_SESSION_TEXT
-    assert not panel._publish_btn.isEnabled()
-    assert not panel._discard_btn.isEnabled()
-    assert not panel._run_btn.isEnabled()
+    assert not panel._publish_btn.isEnabled() and not panel._link_btn.isEnabled()
+    assert not panel._run_btn.isEnabled() and not panel._select_btn.isEnabled()
     assert panel.current_run_id() == ""
 
 
@@ -315,107 +244,53 @@ def test_panel_builds_with_no_collaborators(qtbot):
 
 
 def test_runs_are_listed_newest_first(wired):
-    """The run combo lists the experiment's finished runs, newest on top."""
-    panel, _manager, _publisher, _runner = wired
+    panel, *_ = wired
     labels = [panel._run_combo.itemText(i) for i in range(panel._run_combo.count())]
-    assert labels == [
-        "run_002 · FieldSweep · done",
-        "run_001 · FieldSweep · done",
-    ]
+    assert labels == ["run_002 · FieldSweep · done", "run_001 · FieldSweep · done"]
     assert panel.current_run_id() == "run_002"
 
 
 def test_a_running_run_is_not_offered(tmp_path, qtbot):
-    """A run still in flight is not something to analyse."""
-    experiment = StubExperiment(
-        runs=[StubRun(run_id="run_001", status="running")]
-    )
-    panel = AnalysisPanel(
-        session_manager=StubManager(experiment, StubStore(tmp_path))
-    )
+    experiment = StubExperiment(runs=[StubRun(run_id="run_001", status="running")])
+    panel = AnalysisPanel(session_manager=StubManager(experiment, ExperimentStore(tmp_path)))
     qtbot.addWidget(panel)
     assert panel._run_combo.count() == 0
 
 
 def test_recipes_are_filtered_and_the_default_is_preselected(wired, monkeypatch):
-    """Only recipes serving the run's procedure are offered, marked by origin."""
-    panel, _manager, _publisher, _runner = wired
+    panel, *_ = wired
     _fake_discovery(
         monkeypatch,
         (
             StubRecipeInfo(name="generic_sweep", procedures=("*",)),
             StubRecipeInfo(name="other_only", procedures=("SomethingElse",)),
-            StubRecipeInfo(
-                name="hall_bar", procedures=("FieldSweep",), origin="experiment"
-            ),
+            StubRecipeInfo(name="hall_bar", procedures=("FieldSweep",), origin="experiment"),
         ),
     )
     panel.reload()
-    labels = [
-        panel._recipe_combo.itemText(i) for i in range(panel._recipe_combo.count())
-    ]
+    labels = [panel._recipe_combo.itemText(i) for i in range(panel._recipe_combo.count())]
     assert labels == ["generic_sweep", "hall_bar" + EXPERIMENT_SUFFIX]
-    # recipe_for prefers the one naming the procedure over the any-procedure one.
     assert panel.selected_recipe() == "hall_bar"
 
 
 def test_the_pinned_recipe_wins(wired, monkeypatch):
-    """A recipe pinned in the settings is the one preselected."""
-    panel, _manager, publisher, _runner = wired
-    publisher.reload_settings(
-        replace(
-            publisher.settings,
-            analysis=replace(
-                publisher.settings.analysis, recipes={"FieldSweep": "generic_sweep"}
-            ),
-        )
-    )
-    _fake_discovery(
-        monkeypatch,
-        (
-            StubRecipeInfo(name="generic_sweep", procedures=("*",)),
-            StubRecipeInfo(name="hall_bar", procedures=("FieldSweep",)),
-        ),
-    )
+    panel, *_ = wired
+    store = app_settings.config_store()
+    store.save(replace(store.current, analysis=replace(store.current.analysis, recipes={"FieldSweep": "generic_sweep"})))
+    _fake_discovery(monkeypatch, (StubRecipeInfo(name="generic_sweep"), StubRecipeInfo(name="hall_bar", procedures=("FieldSweep",))))
     panel.reload()
     assert panel.selected_recipe() == "generic_sweep"
 
 
-def test_missing_analysis_package_leaves_an_empty_recipe_list(wired, monkeypatch):
-    """No analysis package means no recipes and a status line, not a crash."""
-    import builtins
-
-    real_import = builtins.__import__
-
-    def _refuse(name, *args, **kwargs):  # noqa: ANN001, ANN202 - an import stub
-        if name == "i2as.analysis.discovery":
-            raise ImportError(name)
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _refuse)
-    panel, _manager, _publisher, _runner = wired
-    panel.reload()
-    assert panel._recipe_combo.count() == 0
-    assert not panel._new_recipe_btn.isEnabled()
-
-
 def test_new_recipe_scaffolds_and_offers_it(wired, monkeypatch):
-    """"New recipe…" writes the file, opens it, and selects it in the combo."""
-    panel, manager, _publisher, _runner = wired
+    panel, manager, *_ = wired
     _fake_discovery(monkeypatch, ())
     opened: list[str] = []
-    monkeypatch.setattr(
-        "i2as.gui.analysis_panel.QInputDialog.getText",
-        staticmethod(lambda *a, **k: ("hall_bar", True)),
-    )
-    monkeypatch.setattr(
-        "i2as.gui.analysis_panel.QDesktopServices.openUrl",
-        staticmethod(lambda url: opened.append(url.toString())),
-    )
+    monkeypatch.setattr("i2as.gui.analysis_panel.QInputDialog.getText", staticmethod(lambda *a, **k: ("hall_bar", True)))
+    monkeypatch.setattr("i2as.gui.analysis_panel.QDesktopServices.openUrl", staticmethod(lambda url: opened.append(url.toString())))
     panel.reload()
     panel._on_new_recipe_clicked()
-    written = manager.store.recipes_dir("exp_1") / "hall_bar.py"
-    assert written.exists()
+    assert (manager.store.recipes_dir("exp_1") / "hall_bar.py").exists()
     assert opened and opened[0].endswith("hall_bar.py")
 
 
@@ -423,8 +298,7 @@ def test_new_recipe_scaffolds_and_offers_it(wired, monkeypatch):
 
 
 def test_run_analysis_starts_the_selected_recipe(wired, monkeypatch):
-    """"Run analysis" hands the runner the run and the selected recipe."""
-    panel, _manager, _publisher, runner = wired
+    panel, _manager, _service, runner = wired
     _fake_discovery(monkeypatch, (StubRecipeInfo(name="generic_sweep"),))
     panel.reload()
     panel._run_btn.click()
@@ -433,120 +307,146 @@ def test_run_analysis_starts_the_selected_recipe(wired, monkeypatch):
 
 
 def test_run_analysis_is_disabled_while_that_run_is_analysed(wired):
-    """A run already being analysed cannot be started a second time."""
-    panel, _manager, _publisher, runner = wired
+    panel, _manager, _service, runner = wired
     runner.running.add("run_002")
     panel.reload()
     assert not panel._run_btn.isEnabled()
 
 
 def test_runner_failure_is_shown(wired):
-    """A failed analysis names the failure on the status line."""
-    panel, _manager, _publisher, runner = wired
-    runner.analysis_failed.emit("run_002", "ValueError: no sweep column\ntraceback…")
+    panel, _manager, _service, runner = wired
+    panel.set_run("run_001")
+    runner.analysis_failed.emit("run_001", "ValueError: no sweep column\ntraceback…")
     assert panel._status_label.text() == "Analysis failed: ValueError: no sweep column"
 
 
-def test_runner_start_shows_analysing(wired):
-    """The runner's started signal puts the panel into its analysing state."""
-    panel, _manager, _publisher, runner = wired
-    runner.analysis_started.emit("run_002")
-    assert panel._status_label.text() == ANALYSING_TEXT
+# ── Bundles: which result represents the run ──────────────────────────────────
 
 
-# ── The preview, and approving what it shows ──────────────────────────────────
+def test_every_bundle_of_the_run_is_listed_and_the_selected_one_is_marked(wired):
+    panel, *_ = wired
+    labels = [panel._bundle_combo.itemText(i) for i in range(panel._bundle_combo.count())]
+    assert len(labels) == 2
+    assert labels[1].startswith(SELECTED_MARK), "the selected (older) bundle carries the mark"
+    assert panel.shown_bundle_id() == "b-old", "the preview opens on what represents the run"
+    assert "This result represents the run." in panel._status_label.text()
+    assert not panel._select_btn.isEnabled()
 
 
-def test_pending_entry_preview_shows_title_and_every_figure(wired, monkeypatch):
-    """The preview carries the entry's title and one <img per saved figure."""
-    panel, manager, _publisher, _runner = wired
-    directory = _write_report(
-        manager.store,
-        "run_002",
-        {
-            "run_id": "run_002",
-            "status": "ok",
-            "figures": [
-                {"file": "overview.png", "caption": "Overview"},
-                {"file": "detail.png", "caption": "Detail"},
-            ],
-            "warnings": ["one column was empty"],
-        },
-    )
-    (directory / "overview.png").write_bytes(b"")
-    (directory / "detail.png").write_bytes(b"")
-    panel.reload()
-
+def test_the_preview_shows_the_bundle_from_its_sealed_files(wired):
+    panel, *_ = wired
     html = panel._preview.toHtml()
-    assert "FieldSweep — run_002" in html
-    assert html.count("<img") == 2
-    assert "overview.png" in html and "detail.png" in html
-    assert panel._status_label.text() == READY_TEXT
-    # The recipe's warnings are shown, and only when there are any.
-    assert not panel._warnings.isHidden()
-    assert "one column was empty" in panel._warnings.toPlainText()
+    assert "Two branches, no hysteresis." in panel._preview.toPlainText()
+    assert "Bc" in panel._preview.toPlainText() and "overview.png" in html
+    assert panel._warnings.isVisibleTo(panel) and "a column was missing" in panel._warnings.toPlainText()
 
 
-def test_no_pending_entry_leaves_an_empty_preview(wired, monkeypatch):
-    """A run with nothing waiting says so and offers neither approval."""
-    panel, _manager, _publisher, _runner = wired
-    _fake_discovery(monkeypatch, (StubRecipeInfo(name="generic_sweep"),))
+def test_choosing_another_bundle_goes_through_the_manager(wired):
+    panel, manager, *_ = wired
+    panel._bundle_combo.setCurrentIndex(panel._bundle_combo.findData("b-new"))
+    assert panel._select_btn.isEnabled()
+    panel._select_btn.click()
+    assert manager.selected == [("run_002", "b-new")]
+    assert panel._bundle_combo.itemText(panel._bundle_combo.findData("b-new")).startswith(SELECTED_MARK)
+
+
+def test_a_failed_bundle_cannot_represent_the_run(wired):
+    panel, manager, *_ = wired
+    _seal(manager.store, "run_002", "b-bad", status="failed", created="2026-09-27T11:00:00+00:00", figure=False)
     panel.reload()
+    panel._bundle_combo.setCurrentIndex(panel._bundle_combo.findData("b-bad"))
+    assert not panel._select_btn.isEnabled()
+    assert "ValueError: bad" in panel._warnings.toPlainText()
+
+
+def test_a_run_with_no_bundle_says_so(wired):
+    panel, *_ = wired
     panel.set_run("run_001")
-    assert panel._preview.toPlainText().strip() == ""
-    assert panel._status_label.text() == NOTHING_PENDING_TEXT
-    assert not panel._publish_btn.isEnabled()
-    assert not panel._discard_btn.isEnabled()
-    assert panel._warnings.isHidden()
+    assert panel._bundle_combo.count() == 0
+    assert panel._status_label.text() == NO_BUNDLES_TEXT
 
 
-def test_publish_approves_through_the_manager(wired):
-    """Publish calls ``approve_eln_draft`` and the entry stops being pending."""
-    panel, manager, _publisher, _runner = wired
+def test_a_new_bundle_for_the_shown_run_appears(wired):
+    panel, manager, _service, runner = wired
+    _seal(manager.store, "run_002", "b-third", created="2026-09-27T12:00:00+00:00")
+    runner.bundle_ready.emit("run_002", "b-third", {})
+    assert panel._bundle_combo.findData("b-third") >= 0
+
+
+# ── The notebook strip ────────────────────────────────────────────────────────
+
+
+def test_an_unlinked_experiment_offers_to_link_and_nothing_else(wired):
+    panel, *_ = wired
+    assert "Not linked" in panel._notebook_label.text()
+    assert panel._link_btn.isEnabled() and not panel._fields_btn.isEnabled()
+    assert not panel._publish_btn.isEnabled() and not panel._approve_btn.isVisibleTo(panel)
+    panel._link_btn.click()
+    assert panel.opened == ["link"]
+
+
+def test_approval_is_asked_once_then_publishing_is_open(wired):
+    panel, manager, service, _runner = wired
+    manager.experiment.eln = ElnBinding(account_id="lab", entry=ElnLink(entry_id="7", url="https://e/7"))
+    panel.reload()
+    assert "https://e/7" in panel._notebook_label.text() and "not approved" in panel._notebook_label.text()
+    assert panel._approve_btn.isVisibleTo(panel) and not panel._publish_btn.isEnabled()
+    panel._approve_btn.click()
+    assert manager.approved and not panel._approve_btn.isVisibleTo(panel)
     assert panel._publish_btn.isEnabled()
+    assert "2 run(s) not on the page yet" in panel._notebook_label.text()
     panel._publish_btn.click()
-    assert manager.approved == ["run_002"]
-    assert not panel._publish_btn.isEnabled()
+    assert service.published == [None]
+    assert "P-1" in panel._status_label.text()
 
 
-def test_discard_drops_the_entry_through_the_manager(wired):
-    """Discard calls ``discard_pending_eln_draft`` and clears the preview."""
-    panel, manager, _publisher, _runner = wired
-    panel._discard_btn.click()
-    assert manager.discarded == ["run_002"]
-    assert panel._preview.toPlainText().strip() == ""
+def test_a_refused_publish_says_why(wired):
+    panel, manager, service, _runner = wired
+    manager.experiment.eln = ElnBinding(account_id="lab", entry=ElnLink(entry_id="7"), publish_approved=True)
+    service.refuse = "there is nothing new to publish"
+    panel.reload()
+    panel._publish_btn.click()
+    assert panel._status_label.text() == "there is nothing new to publish"
 
 
-def test_run_finished_selects_that_run(wired):
-    """The Orchestrator's run boundary points the panel at the finished run."""
-    panel, _manager, _publisher, _runner = wired
-    panel.on_run_finished({"run_id": "run_001"})
-    assert panel.current_run_id() == "run_001"
+def test_work_needing_attention_offers_retry_and_says_why(wired):
+    panel, _manager, service, _runner = wired
+    service.status_changed.emit({"state": "attention", "pending": 0, "attention": [{"error": "the key was rejected"}]})
+    assert panel._chip.property("state") == "attention"
+    assert "the key was rejected" in panel._chip.toolTip()
+    assert panel._retry_btn.isVisibleTo(panel)
+    panel._retry_btn.click()
+    assert service.retried == ["exp_1"]
 
 
-# ── The chip and the analysis toggle ──────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "state", ["synced", "pending", "offline", "disabled"]
-)
-def test_publish_state_chip_carries_the_state_property(wired, state):
-    """Every publish state reaches the chip as text and as its property."""
-    panel, _manager, publisher, _runner = wired
-    publisher.publish_state_changed.emit({"state": state, "pending": 2, "detail": ""})
+@pytest.mark.parametrize("state", ["synced", "pending", "offline", "attention", "disabled"])
+def test_the_chip_carries_the_notebook_state(wired, state):
+    panel, _manager, service, _runner = wired
+    service.status_changed.emit({"state": state, "pending": 2, "attention": []})
     assert panel._chip.property("state") == state
-    assert state[:4] in panel._chip.text() or state == "disabled"
 
 
-def test_analysis_toggle_saves_through_the_publisher(wired, monkeypatch):
-    """Ticking "Analysis on" writes the setting and reloads the publisher."""
-    panel, _manager, publisher, _runner = wired
-    saved: list[Any] = []
-    monkeypatch.setattr(
-        "i2as.gui.analysis_panel.persist_eln_settings",
-        lambda settings, pub=None: saved.append((settings, pub)) or True,
-    )
+def test_a_published_run_is_marked_in_the_run_list(wired):
+    panel, manager, service, _runner = wired
+    manager.experiment.runs[0].published = True
+    service.publish_finished.emit({"run_bundles": {"run_001": ""}})
+    assert any("on page" in panel._run_combo.itemText(i) for i in range(panel._run_combo.count()))
+    assert "Published run_001" in panel._status_label.text()
+
+
+# ── The analysis toggle ───────────────────────────────────────────────────────
+
+
+def test_analysis_toggle_saves_to_the_settings_file(wired):
+    panel, *_ = wired
+    panel._engine_checker = lambda _sandbox: EngineStatus(True, True, True, "Ready")
     panel._enabled_checkbox.setChecked(True)
-    assert saved and saved[0][0].analysis.enabled is True
-    assert saved[0][1] is publisher
+    assert app_settings.config_store().analysis().enabled is True
 
+
+def test_analysis_toggle_refuses_without_a_container_engine(wired):
+    panel, *_ = wired
+    panel._engine_checker = lambda _sandbox: EngineStatus(detail="docker is not installed")
+    panel._enabled_checkbox.setChecked(True)
+    assert app_settings.config_store().analysis().enabled is False
+    assert "docker is not installed" in panel._status_label.text()

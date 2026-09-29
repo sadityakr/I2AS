@@ -35,56 +35,52 @@ on.
 * **Session tools** — hand-declared, because they are NOT commands: they read
   the experiment store, the run files, the operational log and the agent
   feed, they answer "may I run this, and how long will it take?" without
-  dispatching anything, they draft and publish this experiment's notebook
-  entries, and they read, write and run the **analysis recipes** and
-  **analysis scripts** a finished run is analysed with. Every one of them is
+  dispatching anything, and they read, write and run the **analysis
+  recipes** and **analysis scripts** a finished run is analysed with and
+  choose which **analysis bundle** represents a run. Every one of them is
   ``ActionClass.READ`` except ``probe_run``, which really is a
   ``run_procedure`` with a ``ProbeSpec`` and is classified (and refused) as
-  one; ``publish_eln_entry``, which puts a permanent record of this
-  experiment into the outside world on the experiment's behalf and is
-  ``run_control``; and the five that put analysis code on the measurement
-  machine, run it, or park what it produced, which are ``analysis``.
+  one, and the six that put analysis code on the measurement machine, run it,
+  draft about a run or choose its bundle, which are ``analysis``.
 
-**Nine tools reach the analysis stage**, and the trust boundary they sit on is
-written down in ``docs/analysis-agent.md``. Analysis code is trusted like a
-procedure, and it only ever runs in the analysis worker — a separate process,
+**Eleven tools reach the analysis stage**, and the trust boundary they sit on
+is written down in ``docs/analysis-agent.md``. Analysis code is agent code
+(tier 3): it only ever runs in the analysis worker — a separate process,
 started in the configured **analysis sandbox**, that holds the run's data
-file and reaches no instrument:
+file and reaches no instrument, no notebook and no secret. Everything it
+leaves is sealed by the application into an **analysis bundle**
+(``i2as.analysis.bundle``):
 
 * ``write_analysis_recipe`` compiles a recipe, stamps it with a header naming
   the actor and the UTC time, and writes it into the experiment's own
   ``analysis/recipes`` folder — it executes nothing; ``run_analysis`` starts
-  the worker on a run with a recipe, and its report becomes the run's
-  pending entry.
-* ``run_analysis_script`` is the exploring step before that: it writes one
-  script into the run's own ``scripts/<script_id>`` folder and starts the
-  worker on it. Its report parks NOTHING;
-  ``read_analysis_script_result`` reads it, with what the script printed.
-* ``stage_analysis_result`` is the deciding step: it parks one script's
-  report as the run's pending entry — where a human approves it in the eLab
-  tab exactly as a recipe's — and ``save_analysis_script_as_recipe`` keeps a
-  script that proved its worth as an ordinary recipe
+  the worker on a run with a recipe, and its completed bundle becomes the
+  run's selected bundle.
+* ``run_analysis_script`` is the exploring step: it writes one script into
+  the run's own ``scripts/<script_id>`` folder and starts the worker on it.
+  Its bundle selects NOTHING; ``read_analysis_script_result`` reads it, with
+  what the script printed.
+* ``draft_analysis_summary`` asks the drafting model for a summary of one run
+  and keeps it as a bundle of kind ``draft`` (it spends model tokens, so its
+  cost line lands in the **Agent feed**).
+* ``select_analysis_bundle`` is the deciding step: which of a run's bundles
+  represents it — and ``save_analysis_script_as_recipe`` keeps a script that
+  proved its worth as an ordinary recipe
   (``i2as.analysis.scripts.ScriptRecipe``).
 
-Those five are the ``analysis`` **Action class**: an ``analyst`` role is
+Those six are the ``analysis`` **Action class**: an ``analyst`` role is
 granted them and nothing that touches the station, so an agent can be
 trusted to analyse without being trusted to measure. Every one declares
 ``recorded``, so the **Agent feed** carries the call, the digest of the code
-written and the run analysed. The other four — listing recipes, reading one,
-reading a report and reading a script's result — change nothing and are
-``read``.
+written and the run analysed. The other five — listing recipes, reading one,
+listing a run's bundles, reading a bundle and reading a script's result —
+change nothing and are ``read``.
 
-**Two tools reach the ELN track**, and they divide exactly where the money
-and the authority divide. ``draft_eln_entry`` renders one finished run's
-facts into the draft prompt, asks one model, and returns the **draft entry**
-AS DATA: it writes nothing, queues nothing, and is ``read`` because it
-changes no state — but it spends model tokens, so it declares ``recorded``
-and its cost line lands in the **Agent feed**. ``publish_eln_entry`` is the
-only one that reaches the **Outbox**, and in an ATTENDED experiment it
-refuses every agent by rule and parks the draft on the run record for a
-human instead. Neither renders an entry itself and neither touches a
-backend: the rendering is ``session/eln/``'s and the network is the
-publisher's drain, off the tick.
+**No tool reaches the notebook.** Linking an experiment to its ELN page,
+reading fields back and publishing are the operator's, in the GUI; an agent
+reads only an experiment's own local analysis. The permission matrix keeps an
+``eln`` **Action class**, refused for every agent role, so notebook tools can
+be added later without restructuring (``action_classes.py``).
 
 **Arguments the engine translates.** ``Orchestrator.submit()`` documents four
 commands whose JSON ``args`` are not simply the method's parameters — a
@@ -134,13 +130,15 @@ from i2as.core.events import CommandName, StationInfo
 from i2as.core.orchestrator import Orchestrator
 from i2as.core.paths import log_directory
 from i2as.core.plan import blocks_from_json, resolve_form
-from i2as.session.eln.adapter import ElnError
-from i2as.session.eln.drafting import (
+from i2as.analysis.bundle import new_bundle_id
+from i2as.session.drafting import (
+    AssistantSettings,
+    DraftError,
     DraftRequest,
-    draft_entry,
-    manifest_from_run,
+    draft_summary,
+    write_draft_bundle,
 )
-from i2as.session.eln.settings import AssistantSettings
+from i2as.session.run_facts import manifest_from_run
 from i2as.session.gateway.action_classes import (
     COMMAND_ACTION_CLASSES,
     ActionClass,
@@ -1022,15 +1020,13 @@ _ANALYSIS_EXPERIMENT: dict[str, Any] = {
 }
 
 #: The session tools, in the order a client meets them: the live picture, the
-#: stored runs, the "may I run this?" question, the two audit trails, the two
-#: that reach the notebook, a probe run, the five that read, write and run the
-#: **Analysis recipe**s an experiment is analysed with, and the four that
-#: explore a run with **analysis scripts** and keep what they found. Every one
-#: is ``read`` except ``probe_run``, which dispatches a real (if cheap) run and
-#: is classified as the run control it is; ``publish_eln_entry``, which puts a
-#: permanent record into the outside world (``run_control``); and the five
-#: that put analysis code on the measurement machine, run it or park its
-#: result (``analysis``).
+#: stored runs, the "may I run this?" question, the two audit trails, the
+#: settings, a probe run, the recipes an experiment is analysed with, the
+#: bundles a run's analyses left, the scripts that explore a run, and the
+#: drafting model. Every one is ``read`` except ``probe_run``, which
+#: dispatches a real (if cheap) run and is classified as the run control it
+#: is, and the six that put analysis code on the measurement machine, run it,
+#: draft about a run or choose its bundle (``analysis``).
 SESSION_TOOLS: tuple[ToolSpec, ...] = (
     _read_tool(
         "read_status",
@@ -1193,65 +1189,13 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             },
         },
     ),
-    ToolSpec(
-        name="draft_eln_entry",
-        description=(
-            "Draft one finished run into an electronic-lab-notebook entry. "
-            "The run's own facts — procedure, parameters, per-column "
-            "statistics, the station it ran on and the engine's state at run "
-            "end — are rendered into a fixed prompt, one model is asked for "
-            "prose, and the entry comes back as data: a title, a body with "
-            "that prose above the same fact tables, tags, and what the draft "
-            "cost. Writes nothing and publishes nothing; publish_eln_entry "
-            "does that, and in an attended experiment a human approves it."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                **_RUN_SELECTOR,
-                "note": {
-                    "type": "string",
-                    "description": (
-                        "A note to the drafter, carried into the prompt "
-                        "verbatim — what to look at, or what is already known."
-                    ),
-                },
-            },
-            "required": ["run_id"],
-            "additionalProperties": False,
-        },
-        action_class=ActionClass.READ,
-        session_function="draft_eln_entry",
-        recorded=True,
-    ),
-    ToolSpec(
-        name="publish_eln_entry",
-        description=(
-            "Queue an approved draft entry for this experiment's electronic "
-            "lab notebook. The run must belong to the OPEN experiment. While "
-            "the experiment is attended this is refused for every agent and "
-            "the draft is parked on the run record instead, for the human to "
-            "approve; while it is unattended the entry is queued to the "
-            "outbox and uploaded by the application's own drain."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "run_id": {
-                    "type": "string",
-                    "description": "The run to publish, in the open experiment.",
-                },
-                "draft": {
-                    "type": "object",
-                    "description": "The draft entry, as draft_eln_entry returned it.",
-                },
-            },
-            "required": ["run_id", "draft"],
-            "additionalProperties": False,
-        },
-        action_class=ActionClass.RUN_CONTROL,
-        session_function="publish_eln_entry",
-        recorded=True,
+    _read_tool(
+        "read_settings",
+        "The machine's general settings, one section per concern: connections "
+        "(whether the gateway is on, its role ceiling, remote access), analysis "
+        "(automatic analysis, the worker's timeout and container) and "
+        "publishing (retry timings, upload limit). The settings the Settings "
+        "dialog shows; they hold no secret.",
     ),
     ToolSpec(
         name="probe_run",
@@ -1360,9 +1304,11 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "Analyse one recorded run: start the analysis worker on it, in a "
             "separate process that reads the run's data file and reaches no "
             "instrument. This returns as soon as the worker has been STARTED, "
-            "not when it has finished — the result arrives later, so read it "
-            "with read_analysis_report, which answers {'status': 'running'} "
-            "until it is there. Refused while that run is already being "
+            "not when it has finished — the result arrives later as a sealed "
+            "analysis bundle (its id is in the answer), so read it with "
+            "read_analysis_bundle, which answers {'status': 'running'} until "
+            "it is there. A completed recipe bundle becomes the bundle that "
+            "represents the run. Refused while that run is already being "
             "analysed (rule 'already_running'), when nothing could be started "
             "('not_started': no experiment open, an unknown run, or a run with "
             "no data file), and when this connection was wired without an "
@@ -1401,17 +1347,37 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
         recorded=True,
     ),
     _read_tool(
-        "read_analysis_report",
-        "The analysis report of one recorded run: the recipe that ran, its "
-        "summary paragraphs, derived values, figures and small tables, its "
-        "warnings and — when the recipe failed — its error, plus the path of "
-        "the report file. Answers {'status': 'running'} while the worker is "
-        "still on that run and {'status': 'none'} when the run has not been "
-        "analysed yet.",
+        "list_analysis_bundles",
+        "Every analysis bundle one recorded run has — one per recipe run, "
+        "analysis script or draft — oldest first: its id, what produced it "
+        "(kind, name, code digest, who asked), whether it completed, when it "
+        "was sealed, its summary's first paragraph and its figures; and which "
+        "bundle currently represents the run ('selected').",
         {
             "run_id": {
                 "type": "string",
-                "description": "The recorded run whose report to read.",
+                "description": "The recorded run.",
+            },
+            **_ANALYSIS_EXPERIMENT,
+        },
+        ("run_id",),
+    ),
+    _read_tool(
+        "read_analysis_bundle",
+        "One analysis bundle of one recorded run, whole: what produced it, "
+        "its summary paragraphs, derived values, figures (with absolute "
+        "paths), small tables, warnings and — when it failed — the error. "
+        "Without bundle_id, the bundle that represents the run. Answers "
+        "{'status': 'running'} while the worker is still on that run and "
+        "{'status': 'none'} when there is no such bundle.",
+        {
+            "run_id": {
+                "type": "string",
+                "description": "The recorded run.",
+            },
+            "bundle_id": {
+                "type": "string",
+                "description": "The bundle; omit for the run's selected bundle.",
             },
             **_ANALYSIS_EXPERIMENT,
         },
@@ -1434,9 +1400,10 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "captured. The script is written into the run's own "
             "scripts/<script_id> folder, stamped with who wrote it, and the "
             "worker is STARTED — this returns before it finishes, so read the "
-            "answer with read_analysis_script_result. Nothing reaches the "
-            "notebook: stage_analysis_result does that, for a human to "
-            "approve. Refused for a name that is not a plain identifier "
+            "answer with read_analysis_script_result. Its result is sealed as "
+            "the bundle 'script-<script_id>' and represents the run only once "
+            "select_analysis_bundle chooses it. Refused for a name that is not "
+            "a plain identifier "
             "('invalid_name'), a source that does not compile "
             "('syntax_error'), one over 200 kB ('too_large'), and when "
             "nothing could be started ('not_started')."
@@ -1496,32 +1463,62 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
         ("run_id", "script_id"),
     ),
     ToolSpec(
-        name="stage_analysis_result",
+        name="select_analysis_bundle",
         description=(
-            "Decide what goes to the notebook: park one analysis script's "
-            "report as the run's PENDING notebook entry — its prose, values, "
-            "tables, and its figures as attachments. It publishes nothing: a "
-            "human approves or discards it in the eLab tab, exactly as a "
-            "recipe's entry, and it replaces whatever entry was pending on "
-            "that run. The run must belong to the OPEN experiment. Refused "
-            "for a script with no result ('no_result'), a failed one "
-            "('failed_report'), and when nothing could be parked "
-            "('not_parked')."
+            "Choose which analysis bundle represents one run of the OPEN "
+            "experiment — a recipe's, a script's ('script-<script_id>') or a "
+            "draft's — wherever the run is presented, the operator's notebook "
+            "included. Only a completed bundle can be chosen; an empty "
+            "bundle_id clears the choice, so the run is presented from its "
+            "facts. It publishes nothing. Refused for an unknown or failed "
+            "bundle ('not_selected')."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "run_id": {"type": "string", "description": "The run, in the open experiment."},
-                "script_id": {
+                "bundle_id": {
                     "type": "string",
-                    "description": "The script whose report to park.",
+                    "description": "The bundle (list_analysis_bundles names them), or '' to clear.",
                 },
             },
-            "required": ["run_id", "script_id"],
+            "required": ["run_id", "bundle_id"],
             "additionalProperties": False,
         },
         action_class=ActionClass.ANALYSIS,
-        session_function="stage_analysis_result",
+        session_function="select_analysis_bundle",
+        recorded=True,
+    ),
+    ToolSpec(
+        name="draft_analysis_summary",
+        description=(
+            "Ask the drafting model for a short summary of one finished run of "
+            "the OPEN experiment — written only from the facts the run "
+            "recorded (procedure, parameters, per-column statistics, the "
+            "station, the state at run end) — and keep it as an analysis "
+            "bundle of kind 'draft'. Returns the bundle id, the drafted title "
+            "and text, and what it cost. It selects nothing and publishes "
+            "nothing. Refused when this connection has no drafting model "
+            "('missing_collaborator') and when the model could not answer "
+            "('draft_failed')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The run, in the open experiment."},
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "A note to the drafter, carried into the prompt "
+                        "verbatim — what to look at, or what is already known."
+                    ),
+                },
+            },
+            "required": ["run_id"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.ANALYSIS,
+        session_function="draft_analysis_summary",
         recorded=True,
     ),
     ToolSpec(
@@ -1530,8 +1527,8 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
             "Keep an analysis script that proved its worth: write it into "
             "this experiment's analysis/recipes folder as an ordinary recipe "
             "(a ScriptRecipe whose SCRIPT is the script's text, unchanged), "
-            "so it is listed by list_analysis_recipes, reviewed in the eLab "
-            "tab, and run by run_analysis — or automatically on every run of "
+            "so it is listed by list_analysis_recipes, reviewed in the "
+            "Analysis tab, and run by run_analysis — or automatically on every run of "
             "the procedures it declares, when analysis is on. Stamped with "
             "who saved it and when. Refused for a name that is not a plain "
             "identifier ('invalid_name'), an existing recipe unless overwrite "
@@ -1704,7 +1701,7 @@ class ToolContext:
             ``Readings`` event, or ``None`` before the first polled tick;
             the ``Gateway`` supplies its own mirror. What ``read_readings``
             answers from.
-        draft_client: The **Draft client** ``draft_eln_entry`` asks
+        draft_client: The **Draft client** ``draft_analysis_summary`` asks
             (``complete(system, user, max_tokens)``), duck-typed so a test
             passes ``FakeDraftClient`` and no test reaches a network.
             ``None`` — the default — means this client cannot draft, and the
@@ -1713,10 +1710,10 @@ class ToolContext:
             loop at all.
         assistant_settings: The token cap and price table a draft is bounded
             and costed by. ``None`` uses ``AssistantSettings()``'s defaults.
-        publisher: The ``ElnPublisher`` ``publish_eln_entry`` queues through
-            (``export_draft(run_id, draft)``), duck-typed so this package
-            imports neither it nor the Qt object that owns its drain timer.
-            ``None`` means nothing can be published from here.
+        analysis_settings: Returns the current ``AnalysisSettings`` (the
+            per-procedure recipe preference). ``None``: no preference.
+        settings_source: Returns the current ``AppConfig`` for
+            ``read_settings``. ``None``: that tool is refused by name.
         analysis_runner: The **Analysis runner** ``run_analysis`` and
             ``run_analysis_script`` start and the read tools ask whether an
             analysis is still in flight — duck-typed on
@@ -1743,7 +1740,8 @@ class ToolContext:
     readings_source: Callable[[], Any] | None = None
     draft_client: Any | None = None
     assistant_settings: AssistantSettings | None = None
-    publisher: Any | None = None
+    analysis_settings: Callable[[], Any] | None = None
+    settings_source: Callable[[], Any] | None = None
     analysis_runner: Any | None = None
     actor: Any | None = None
 
@@ -1786,26 +1784,6 @@ class ToolContext:
                 {"rule": "missing_collaborator", "collaborator": "draft_client"},
             )
         return self.draft_client
-
-    def require_publisher(self, tool_name: str) -> Any:
-        """Return the ELN publisher, or refuse by name.
-
-        Args:
-            tool_name: The tool asking, for the message.
-
-        Returns:
-            The publisher.
-
-        Raises:
-            ToolError: If this gateway was built without one.
-        """
-        if self.publisher is None:
-            raise ToolError(
-                f"{tool_name} needs the ELN publisher, and this gateway was "
-                f"built without one",
-                {"rule": "missing_collaborator", "collaborator": "publisher"},
-            )
-        return self.publisher
 
     def require_analysis_runner(self, tool_name: str) -> Any:
         """Return the **Analysis runner**, or refuse by name.
@@ -2455,7 +2433,14 @@ def _tool_read_experiment(args: Mapping[str, Any], context: ToolContext) -> Any:
             f"no experiment {experiment_id!r} in this store",
             {"rule": "unknown_experiment", "experiment_id": experiment_id},
         )
-    return record.to_dict()
+    answer = record.to_dict()
+    # The notebook binding is the operator's: an agent learns only whether
+    # the experiment has a page, never where it is or what was read from it.
+    answer["eln"] = {"linked": record.eln is not None and record.eln.entry is not None}
+    for run in answer.get("runs") or []:
+        run.pop("eln_link", None)
+        run.pop("eln_publish", None)
+    return answer
 
 
 def _tool_read_operational_log(args: Mapping[str, Any], context: ToolContext) -> Any:
@@ -2535,7 +2520,7 @@ def _draft_stats(
         return {}
     stats: dict[str, dict[str, Any]] = {}
     try:
-        with _open_run_file(context, "draft_eln_entry", args) as handle:
+        with _open_run_file(context, "draft_analysis_summary", args) as handle:
             for info in data_reader.list_columns(handle):
                 if info.dtype == "str":
                     continue
@@ -2562,138 +2547,102 @@ def _draft_stats(
     return stats
 
 
-def _tool_draft_eln_entry(args: Mapping[str, Any], context: ToolContext) -> Any:
-    """Answer ``draft_eln_entry`` through the ELN track's drafting module.
+def _tool_draft_analysis_summary(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``draft_analysis_summary``: one model summary of one run, kept as a bundle.
 
     Assembles the facts (the recorded run, its column statistics, the station
-    and status mirrors, the experiment and its setup) and hands them to
-    ``draft_entry()``. This function contains no prompt text and no rendering
-    of its own: the prompt is the draft prompt standard's, the body is
-    ``templates.py``'s, and what comes back is returned unchanged as data.
+    and status mirrors, the experiment and its setup), asks the model once
+    through ``drafting.draft_summary()``, and writes the answer as an analysis
+    bundle of kind ``draft`` in the run's analysis folder. It selects nothing.
 
     Args:
-        args: The call's arguments — the run, optionally its experiment, and
-            an optional note carried into the prompt.
+        args: The call's arguments — the run and an optional note.
         context: The tool context.
 
     Returns:
-        The **draft entry** as its JSON dict, cost line included.
+        ``{"run_id", "bundle_id", "title", "summary", "model",
+        "input_tokens", "output_tokens", "cost_usd", "prompt_digest"}`` — the
+        cost line at the top level, where the **Agent feed** takes it from.
 
     Raises:
-        ToolError: If the run cannot be found, no draft client was wired in,
-            or the model could not be reached.
+        ToolError: No open experiment or run, no draft client, the model
+            could not answer, or the bundle could not be written.
     """
-    experiment_id, record, run = _run_record(context, "draft_eln_entry", args)
-    client = context.require_draft_client("draft_eln_entry")
-    experiments = context.require_experiments("draft_eln_entry")
-
+    tool_name = "draft_analysis_summary"
+    experiment_id = context.experiment_id(tool_name)
+    _experiment_id, record, run = _run_record(context, tool_name, {"run_id": args["run_id"], "experiment_id": experiment_id})
+    client = context.require_draft_client(tool_name)
+    experiments = context.require_experiments(tool_name)
     station = context.station_source() if context.station_source else None
     snapshot = context.status_source() if context.status_source else None
     setup = experiments.experiment_context().get("setup") or {}
     data_path = ""
     if run.data_file:
-        data_path = str(
-            context.store("draft_eln_entry").resolve_data_file(
-                experiment_id, run.data_file
-            )
-        )
+        data_path = str(context.store(tool_name).resolve_data_file(experiment_id, run.data_file))
     request = DraftRequest(
         run_id=run.run_id,
         experiment_id=experiment_id,
         manifest=manifest_from_run(run),
-        stats=_draft_stats(context, args, run),
+        stats=_draft_stats(context, {**args, "experiment_id": experiment_id}, run),
         station=station.to_json() if station is not None else {},
         status=snapshot.to_json() if snapshot is not None else {},
         experiment_title=getattr(record, "title", ""),
         setup=dict(setup),
         data_path=data_path,
-        template_id=_template_id(context),
         operator_note=str(args.get("note", "")),
     )
     try:
-        return draft_entry(request, client, context.assistant_settings).to_dict()
-    except ElnError as error:
+        draft = draft_summary(request, client, context.assistant_settings)
+    except DraftError as error:
         raise ToolError(
-            f"the draft for run {run.run_id!r} could not be written: {error}",
+            f"the summary of run {run.run_id!r} could not be drafted: {error}",
             {"rule": "draft_failed", "run_id": run.run_id},
         ) from error
-
-
-def _template_id(context: ToolContext) -> str:
-    """Return the notebook template a published entry would be created from.
-
-    Args:
-        context: The tool context.
-
-    Returns:
-        The publisher's configured ``template_id``, or ``""`` when no
-        publisher is wired in — a fact about the entry, never a reason to
-        refuse a draft.
-    """
-    settings = getattr(context.publisher, "settings", None)
-    return str(getattr(settings, "template_id", "") or "")
-
-
-def _tool_publish_eln_entry(args: Mapping[str, Any], context: ToolContext) -> Any:
-    """Answer ``publish_eln_entry``, or refuse it because a human must approve.
-
-    The approval rule, and the one place it is enforced: while the open
-    experiment is ATTENDED an agent may draft but never publish, so the draft
-    is parked on the run record (through the manager, the single writer of
-    experiment state) and the call is refused with ``approval_required`` — a
-    refusal that leaves the work where the human will find it, rather than
-    discarding it. Unattended, the draft goes to the publisher's outbox,
-    which is the same journal a manual export uses.
-
-    Args:
-        args: The call's arguments — the run and the approved draft.
-        context: The tool context.
-
-    Returns:
-        ``{"run_id", "experiment_id", "job_id", "queued"}`` on success.
-
-    Raises:
-        ToolError: If the run is unknown, the experiment is attended, no
-            publisher was wired in, or nothing was queued.
-    """
-    experiment_id, record, run = _run_record(context, "publish_eln_entry", args)
-    experiments = context.require_experiments("publish_eln_entry")
-    draft = dict(args.get("draft") or {})
-
-    if getattr(record, "attended", False):
-        stored = bool(experiments.set_pending_eln_draft(run.run_id, draft))
-        whereabouts = (
-            "It is waiting on the run record for approval."
-            if stored
-            else "It could NOT be parked on the run record, and is lost."
+    bundle_id = new_bundle_id("draft")
+    folder = context.store(tool_name).bundle_dir(experiment_id, run.run_id, bundle_id)
+    try:
+        write_draft_bundle(
+            folder,
+            draft,
+            bundle_id=bundle_id,
+            experiment_id=experiment_id,
+            run=run,
+            actor=str(getattr(context.actor, "id", "") or ""),
         )
+    except OSError as error:
         raise ToolError(
-            f"experiment {experiment_id!r} is attended: a human approves an "
-            f"ELN entry before it is published, so the draft for run "
-            f"{run.run_id!r} was not queued. {whereabouts}",
-            {
-                "rule": "approval_required",
-                "attended": True,
-                "experiment_id": experiment_id,
-                "run_id": run.run_id,
-                "pending": stored,
-            },
-        )
-
-    publisher = context.require_publisher("publish_eln_entry")
-    job_id = str(publisher.export_draft(run.run_id, draft) or "")
-    if not job_id:
-        raise ToolError(
-            f"nothing was queued for run {run.run_id!r}: ELN publishing is "
-            f"switched off, or the run is already queued",
-            {"rule": "not_queued", "run_id": run.run_id},
-        )
+            f"the draft could not be kept in {folder}: {error}",
+            {"rule": "unwritable_bundle", "path": str(folder)},
+        ) from error
     return {
         "run_id": run.run_id,
-        "experiment_id": experiment_id,
-        "job_id": job_id,
-        "queued": True,
+        "bundle_id": bundle_id,
+        "title": draft.title,
+        "summary": draft.summary,
+        "prompt_digest": draft.prompt_digest,
+        **draft.cost_line(),
     }
+
+
+def _tool_read_settings(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``read_settings``: the machine's general settings, no secret in them.
+
+    Args:
+        args: The call's (empty) arguments.
+        context: The tool context.
+
+    Returns:
+        ``{section: {...}}`` as the Settings dialog shows it.
+
+    Raises:
+        ToolError: If this gateway was built without a settings source.
+    """
+    if context.settings_source is None:
+        raise ToolError(
+            "read_settings needs the settings, and this gateway was built without them",
+            {"rule": "missing_collaborator", "collaborator": "settings"},
+        )
+    return context.settings_source().to_dict()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2785,12 +2734,11 @@ def _discovered_recipes(
 
 
 def _recipe_preferences(context: ToolContext) -> dict[str, str]:
-    """Return the notebook settings' per-procedure recipe preference.
+    """Return the analysis settings' per-procedure recipe preference.
 
-    Read through ``getattr`` at every step: a gateway wired without a
-    publisher, or one whose publisher predates the analysis settings, has no
-    preference rather than a failure — the preference decides which of
-    several recipes runs, never whether the question can be answered.
+    A gateway wired without analysis settings has no preference rather than
+    a failure — the preference decides which of several recipes runs, never
+    whether the question can be answered.
 
     Args:
         context: The tool context.
@@ -2798,8 +2746,8 @@ def _recipe_preferences(context: ToolContext) -> dict[str, str]:
     Returns:
         ``{procedure: recipe name}``, empty when nothing declares one.
     """
-    settings = getattr(context.publisher, "settings", None)
-    preferences = getattr(getattr(settings, "analysis", None), "recipes", None)
+    analysis = context.analysis_settings() if context.analysis_settings is not None else None
+    preferences = getattr(analysis, "recipes", None)
     if not isinstance(preferences, Mapping):
         return {}
     return {str(key): str(value) for key, value in preferences.items() if value}
@@ -3094,9 +3042,9 @@ def _tool_run_analysis(args: Mapping[str, Any], context: ToolContext) -> Any:
     """Answer ``run_analysis``: start the analysis worker on one recorded run.
 
     Starting is all this does. The worker is a separate process with the data
-    file and no instrument, and its report arrives on disk later — which is
-    why the answer carries the path the report WILL be at and why
-    ``read_analysis_report`` is the tool that reads it.
+    file and no instrument, and its bundle is sealed on disk later — which is
+    why the answer carries the bundle id it WILL have and why
+    ``read_analysis_bundle`` is the tool that reads it.
 
     Args:
         args: The call's arguments — the run, optionally its experiment, the
@@ -3104,7 +3052,7 @@ def _tool_run_analysis(args: Mapping[str, Any], context: ToolContext) -> Any:
         context: The tool context.
 
     Returns:
-        ``{"run_id", "started", "report_path", "recipe"}``.
+        ``{"run_id", "started", "bundle_id", "report_path", "recipe"}``.
 
     Raises:
         ToolError: If the run is unknown, no runner was wired in, that run is
@@ -3118,11 +3066,16 @@ def _tool_run_analysis(args: Mapping[str, Any], context: ToolContext) -> Any:
 
     if runner.is_running(run.run_id):
         raise ToolError(
-            f"run {run.run_id!r} is being analysed already; read its report "
-            f"with read_analysis_report rather than starting a second worker",
+            f"run {run.run_id!r} is being analysed already; read the result "
+            f"with read_analysis_bundle rather than starting a second worker",
             {"rule": "already_running", "run_id": run.run_id},
         )
-    report_dir = str(runner.start(run.run_id, recipe=recipe, options=options) or "")
+    report_dir = str(
+        runner.start(
+            run.run_id, recipe=recipe, options=options, actor=str(getattr(context.actor, "id", "") or "")
+        )
+        or ""
+    )
     if not report_dir:
         raise ToolError(
             f"nothing was started for run {run.run_id!r}: no experiment is "
@@ -3133,56 +3086,96 @@ def _tool_run_analysis(args: Mapping[str, Any], context: ToolContext) -> Any:
     return {
         "run_id": run.run_id,
         "started": True,
+        "bundle_id": Path(report_dir).name,
         "report_path": str(Path(report_dir) / REPORT_FILENAME),
         "recipe": recipe,
     }
 
 
-def _tool_read_analysis_report(args: Mapping[str, Any], context: ToolContext) -> Any:
-    """Answer ``read_analysis_report``: the report of one run, or why there is none.
+def _bundle_summary(bundle: Any) -> dict[str, Any]:
+    """Return the short description ``list_analysis_bundles`` gives one bundle."""
+    return {
+        "bundle_id": bundle.bundle_id,
+        "status": bundle.status,
+        "producer": bundle.producer.to_dict(),
+        "created_utc": bundle.created_utc,
+        "sealed": bundle.sealed,
+        "summary": bundle.summary[0] if bundle.summary else "",
+        "figures": [a.path for a in bundle.artifacts if a.kind == "figure"],
+        "results": [r.get("name") for r in bundle.results],
+    }
+
+
+def _tool_list_analysis_bundles(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``list_analysis_bundles``: every bundle of one run, and the selected one.
 
     Args:
         args: The call's arguments — the run and optionally its experiment.
         context: The tool context.
 
     Returns:
-        The **analysis report** as its dict, plus ``report_path``; or
-        ``{"status": "running"}`` while the worker is still on that run, or
-        ``{"status": "none"}`` when nothing has been analysed yet.
-
-    Raises:
-        ToolError: If the run is unknown or the report file cannot be read.
+        ``{"run_id", "selected", "running", "bundles": [...]}``.
     """
-    tool_name = "read_analysis_report"
+    tool_name = "list_analysis_bundles"
     experiment_id, _record, run = _run_record(context, tool_name, args)
     runner = context.analysis_runner
-    if runner is not None and runner.is_running(run.run_id):
-        return {"status": "running", "run_id": run.run_id}
+    bundles = context.store(tool_name).list_bundles(experiment_id, run.run_id)
+    return {
+        "run_id": run.run_id,
+        "selected": run.selected_bundle,
+        "running": bool(runner is not None and runner.is_running(run.run_id)),
+        "bundles": [_bundle_summary(bundle) for bundle in bundles],
+    }
 
-    path = (
-        _store_directory(context, tool_name, "report_dir", experiment_id, run.run_id)
-        / REPORT_FILENAME
-    )
-    if not path.is_file():
-        return {"status": "none", "run_id": run.run_id}
+
+def _tool_read_analysis_bundle(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``read_analysis_bundle``: one bundle whole, or why there is none.
+
+    Args:
+        args: The call's arguments — the run, optionally the bundle and the
+            experiment.
+        context: The tool context.
+
+    Returns:
+        The bundle's manifest plus ``bundle_dir`` and ``figure_paths``; or
+        ``{"status": "running"}`` while the worker is still on the run, or
+        ``{"status": "none"}``.
+    """
+    tool_name = "read_analysis_bundle"
+    experiment_id, _record, run = _run_record(context, tool_name, args)
+    store = context.store(tool_name)
+    bundle_id = str(args.get("bundle_id") or run.selected_bundle or "")
+    if not bundle_id:
+        runner = context.analysis_runner
+        if runner is not None and runner.is_running(run.run_id):
+            return {"status": "running", "run_id": run.run_id}
+        bundles = [b for b in store.list_bundles(experiment_id, run.run_id) if b.producer.kind != "script"]
+        if not bundles:
+            return {"status": "none", "run_id": run.run_id}
+        bundle_id = bundles[-1].bundle_id
     try:
-        _check_report_size(path)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+        folder = store.bundle_dir(experiment_id, run.run_id, bundle_id)
+    except ValueError as error:
         raise ToolError(
-            f"the analysis report for run {run.run_id!r} at {path} cannot be "
-            f"read: {error}",
-            {"rule": "unreadable_report", "run_id": run.run_id, "path": str(path)},
+            f"{bundle_id!r} is not a bundle id",
+            {"rule": "unknown_bundle", "bundle_id": bundle_id},
         ) from error
-    if not isinstance(payload, Mapping):
-        raise ToolError(
-            f"the analysis report for run {run.run_id!r} at {path} is not an "
-            f"object",
-            {"rule": "unreadable_report", "run_id": run.run_id, "path": str(path)},
-        )
-    report = AnalysisReport.from_dict(payload).to_dict()
-    report["report_path"] = str(path)
-    return report
+    bundle = store.read_bundle(experiment_id, run.run_id, bundle_id)
+    if bundle is None:
+        runner = context.analysis_runner
+        if runner is not None and runner.is_running(run.run_id):
+            return {"status": "running", "run_id": run.run_id, "bundle_id": bundle_id}
+        return {"status": "none", "run_id": run.run_id, "bundle_id": bundle_id}
+    answer = bundle.to_dict()
+    answer["run_id"] = run.run_id
+    answer["selected"] = run.selected_bundle == bundle.bundle_id
+    answer["bundle_dir"] = str(folder)
+    answer["figure_paths"] = [
+        str(path)
+        for path in (output_file(folder, a.path) for a in bundle.artifacts if a.kind == "figure")
+        if path is not None
+    ]
+    return answer
 
 
 def _script_folder(
@@ -3365,56 +3358,33 @@ def _tool_read_analysis_script_result(args: Mapping[str, Any], context: ToolCont
     return answer
 
 
-def _tool_stage_analysis_result(args: Mapping[str, Any], context: ToolContext) -> Any:
-    """Answer ``stage_analysis_result``: park one script's report for approval.
+def _tool_select_analysis_bundle(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``select_analysis_bundle``: choose the bundle that represents a run.
 
     Args:
-        args: The call's arguments — the run and the script.
+        args: The call's arguments — the run and the bundle (``""`` clears).
         context: The tool context.
 
     Returns:
-        ``{"run_id", "script_id", "parked", "recipe"}``.
+        ``{"run_id", "selected"}``.
 
     Raises:
-        ToolError: If there is no open experiment, no such run or script
-            result, the result failed, or the publisher parked nothing.
+        ToolError: No open experiment, no such run, or the bundle does not
+            exist or did not complete.
     """
-    tool_name = "stage_analysis_result"
+    tool_name = "select_analysis_bundle"
     experiment_id = context.experiment_id(tool_name)
-    _experiment_id, _record, run = _run_record(
-        context, tool_name, {"run_id": args["run_id"], "experiment_id": experiment_id}
-    )
-    script_id = str(args["script_id"])
-    publisher = context.require_publisher(tool_name)
-    folder = _script_folder(context, tool_name, experiment_id, run.run_id, script_id)
-    report = _read_script_report(folder / REPORT_FILENAME, run.run_id, script_id)
-    if report is None:
+    _experiment_id, _record, run = _run_record(context, tool_name, {"run_id": args["run_id"], "experiment_id": experiment_id})
+    bundle_id = str(args.get("bundle_id") or "")
+    experiments = context.require_experiments(tool_name)
+    if not experiments.select_bundle(run.run_id, bundle_id):
         raise ToolError(
-            f"script {script_id!r} on run {run.run_id!r} has no result to stage; "
-            f"read_analysis_script_result says whether it is still running",
-            {"rule": "no_result", "run_id": run.run_id, "script_id": script_id},
+            f"bundle {bundle_id!r} of run {run.run_id!r} cannot represent it: it "
+            f"does not exist or did not complete (list_analysis_bundles names them)",
+            {"rule": "not_selected", "run_id": run.run_id, "bundle_id": bundle_id},
         )
-    if not report.ok:
-        raise ToolError(
-            f"script {script_id!r} failed, and a failed result is not a "
-            f"notebook entry: {report.error.strip().splitlines()[0] if report.error.strip() else ''}",
-            {"rule": "failed_report", "run_id": run.run_id, "script_id": script_id},
-        )
-    if not publisher.export_report(run.run_id, report, str(folder)):
-        raise ToolError(
-            f"nothing was parked for run {run.run_id!r}: it is not a run of the "
-            f"open experiment",
-            {"rule": "not_parked", "run_id": run.run_id, "script_id": script_id},
-        )
-    logger.info(
-        "analysis script %s staged for run %s by %s", script_id, run.run_id, _actor_stamp(context)
-    )
-    return {
-        "run_id": run.run_id,
-        "script_id": script_id,
-        "parked": True,
-        "recipe": report.recipe,
-    }
+    logger.info("bundle %s selected for run %s by %s", bundle_id or "(none)", run.run_id, _actor_stamp(context))
+    return {"run_id": run.run_id, "selected": bundle_id}
 
 
 def _tool_save_analysis_script_as_recipe(args: Mapping[str, Any], context: ToolContext) -> Any:
@@ -3528,16 +3498,17 @@ SESSION_TOOL_FUNCTIONS: dict[str, Callable[[Mapping[str, Any], ToolContext], Any
     "read_experiment": _tool_read_experiment,
     "read_operational_log": _tool_read_operational_log,
     "read_agent_feed": _tool_read_agent_feed,
-    "draft_eln_entry": _tool_draft_eln_entry,
-    "publish_eln_entry": _tool_publish_eln_entry,
+    "read_settings": _tool_read_settings,
     "list_analysis_recipes": _tool_list_analysis_recipes,
     "read_analysis_recipe": _tool_read_analysis_recipe,
     "write_analysis_recipe": _tool_write_analysis_recipe,
     "run_analysis": _tool_run_analysis,
-    "read_analysis_report": _tool_read_analysis_report,
+    "list_analysis_bundles": _tool_list_analysis_bundles,
+    "read_analysis_bundle": _tool_read_analysis_bundle,
     "run_analysis_script": _tool_run_analysis_script,
     "read_analysis_script_result": _tool_read_analysis_script_result,
-    "stage_analysis_result": _tool_stage_analysis_result,
+    "select_analysis_bundle": _tool_select_analysis_bundle,
+    "draft_analysis_summary": _tool_draft_analysis_summary,
     "save_analysis_script_as_recipe": _tool_save_analysis_script_as_recipe,
 }
 

@@ -17,7 +17,9 @@ from i2as.session.models import (
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
     SCHEMA_VERSION,
+    ElnBinding,
     ElnLink,
+    LinkedItem,
     ExperimentIndexEntry,
     ExperimentRecord,
     RunRecord,
@@ -150,7 +152,12 @@ def test_experiment_record_round_trips_with_content():
         envelope={"magnet_z": {"min_value": -2.0, "max_value": 2.0, "state_key": ""}},
         runs=[RunRecord(run_id="r1", procedure="Field Sweep", status=RUN_STATUS_DONE)],
         findings="looks superconducting",
-        eln_link=ElnLink(backend="elabftw", entry_id="42", url="https://eln/42"),
+        eln=ElnBinding(
+            account_id="lab",
+            entry=ElnLink(backend="elabftw", entry_id="42", url="https://eln/42"),
+            linked_items=[LinkedItem(backend="elabftw", item_id="7", title="S-001")],
+            publish_approved=True,
+        ),
         queue=[{"procedure": "Field Sweep", "params": {"field_end": 1.0}}],
     )
     assert record.schema_version == SCHEMA_VERSION
@@ -1191,40 +1198,94 @@ def test_end_to_end_run_recorded_and_stamped(
     assert info["setup"]["config_name"] == "sim_cryostat"
 
 
-# ── set_run_eln_link (the publishing track's one write path) ─────────────────
+# ── The notebook binding and bundle selection (the manager is the one writer) ──
 
-def test_set_run_eln_link_stamps_the_open_experiment(manager, qtbot):
-    """A confirmed entry lands on the run, is persisted, and is announced."""
+def test_a_schema_2_experiment_link_becomes_the_binding_page():
+    """An older record's bare experiment-level link is kept as the binding's page."""
+    record = ExperimentRecord.from_dict(
+        {"experiment_id": "x", "eln_link": {"backend": "elabftw", "entry_id": "9", "url": "u"}}
+    )
+    assert record.eln is not None and record.eln.entry.entry_id == "9"
+    assert record.eln.account_id == ""
+
+
+def test_link_eln_installs_the_binding_and_announces_it(manager, qtbot):
+    record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
+    binding = ElnBinding(account_id="lab", create_pending=True)
+    with qtbot.waitSignal(manager.experiment_changed):
+        assert manager.link_eln(binding) is True
+    assert manager.store.load(record.experiment_id).eln == binding
+    assert manager.unlink_eln() is True
+    assert manager.current_experiment().eln is None
+
+
+def test_link_eln_refuses_without_an_open_experiment(manager):
+    assert manager.link_eln(ElnBinding(account_id="lab")) is False
+
+
+def test_set_eln_entry_reaches_a_closed_experiment(manager):
+    """A page queued while the notebook was down may be confirmed after the experiment closed."""
+    record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
+    manager.link_eln(ElnBinding(account_id="lab", create_pending=True))
+    manager.close_experiment()
+    link = ElnLink(backend="sim", entry_id="100", url="sim://experiments/100")
+    assert manager.set_eln_entry(record.experiment_id, link) is True
+    assert manager.current_experiment() is None, "the closed record must not become live"
+    stored = manager.store.load(record.experiment_id).eln
+    assert stored.entry == link and stored.create_pending is False
+    assert manager.set_eln_entry("no-such-experiment", link) is False
+
+
+def test_approval_is_once_per_experiment(manager):
+    manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
+    assert manager.approve_eln_publishing("jdoe") is False, "nothing linked yet"
+    manager.link_eln(ElnBinding(account_id="lab"))
+    assert manager.approve_eln_publishing("jdoe") is True
+    binding = manager.current_experiment().eln
+    assert binding.publish_approved and binding.approved_by == "jdoe" and binding.approved_utc
+
+
+def test_apply_eln_fields_updates_the_sample_metadata_the_next_run_stamps(manager):
+    manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
+    manager.link_eln(ElnBinding(account_id="lab"))
+    snapshot = {"thickness": {"value": 4.2, "unit": "nm", "source": "sample:Thickness"}}
+    assert manager.apply_eln_fields({"thickness": 4.2}, snapshot) is True
+    record = manager.current_experiment()
+    assert record.sample_info["thickness"] == 4.2
+    assert record.sample_info["sample_name"] == SAMPLE_INFO["sample_name"]
+    assert record.eln.field_snapshot == snapshot
+
+
+def test_record_eln_publish_marks_the_runs_on_a_closed_experiment(manager):
     record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
     manager._on_run_started({"run_id": "r1", "procedure": "Field Sweep"})
-    link = ElnLink(backend="sim_eln", entry_id="7", url="https://eln/7")
+    manager._on_run_started({"run_id": "r2", "procedure": "Field Sweep"})
+    manager.close_experiment()
+    assert manager.record_eln_publish(record.experiment_id, "P-1", {"r1": "b1"}, "2026-09-27T00:00:00+00:00")
+    stored = manager.store.load(record.experiment_id)
+    assert stored.find_run("r1").published is True
+    assert stored.find_run("r1").eln_publish == {"publish_id": "P-1", "published_utc": "2026-09-27T00:00:00+00:00", "bundle_id": "b1"}
+    assert stored.find_run("r2").published is False
+
+
+def test_select_bundle_accepts_only_a_completed_bundle_of_the_run(manager, qtbot):
+    from i2as.analysis.bundle import Producer, seal_bundle
+
+    record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
+    manager._on_run_started({"run_id": "r1", "procedure": "Field Sweep"})
+    good = manager.store.bundle_dir(record.experiment_id, "r1", "b-good")
+    bad = manager.store.bundle_dir(record.experiment_id, "r1", "b-bad")
+    for folder, status in ((good, "ok"), (bad, "failed")):
+        folder.mkdir(parents=True)
+        seal_bundle(folder, {"status": status}, bundle_id=folder.name, experiment_id=record.experiment_id, run_ids=("r1",), producer=Producer())
 
     with qtbot.waitSignal(manager.run_recorded):
-        assert manager.set_run_eln_link(record.experiment_id, "r1", link) is True
-
-    run = manager.current_experiment().find_run("r1")
-    assert run.eln_link == link and run.published is True
-    assert manager.store.load(record.experiment_id).find_run("r1").eln_link == link
-
-
-def test_set_run_eln_link_reaches_a_closed_experiment(manager):
-    """A job that drains after the experiment closed still stamps its own record."""
-    record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
-    manager._on_run_started({"run_id": "r1", "procedure": "Field Sweep"})
-    manager.close_experiment()
-    link = ElnLink(backend="sim_eln", entry_id="7", url="https://eln/7")
-
-    assert manager.set_run_eln_link(record.experiment_id, "r1", link) is True
-    assert manager.current_experiment() is None, "the closed record must not become live"
-    assert manager.store.load(record.experiment_id).find_run("r1").eln_link == link
-
-
-def test_set_run_eln_link_refuses_unknown_targets_without_raising(manager):
-    """Bookkeeping failures are reported, never propagated into a GUI timer."""
-    record = manager.start_experiment("ELN", "jdoe", dict(SAMPLE_INFO))
-    link = ElnLink(backend="sim_eln", entry_id="7")
-    assert manager.set_run_eln_link(record.experiment_id, "no-such-run", link) is False
-    assert manager.set_run_eln_link("no-such-experiment", "r1", link) is False
+        assert manager.select_bundle("r1", "b-good") is True
+    assert manager.current_experiment().find_run("r1").selected_bundle == "b-good"
+    assert manager.select_bundle("r1", "b-bad") is False
+    assert manager.select_bundle("r1", "no-such") is False
+    assert manager.select_bundle("r1", "") is True
+    assert manager.store.load(record.experiment_id).find_run("r1").selected_bundle == ""
 
 
 # ── The run queue (validated on add, pulled by the engine) ──────────────────

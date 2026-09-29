@@ -20,6 +20,7 @@ from i2as.session.models import (
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
     SCHEMA_VERSION,
+    ElnBinding,
     ElnLink,
     ExperimentIndexEntry,
     ExperimentRecord,
@@ -37,7 +38,7 @@ from i2as.session.run_queue import (
 from i2as.session.store import ExperimentStore, SessionStore, UserRoster
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,6 @@ class ExperimentManager(QObject):
             envelope=self._current_envelope,
         )
         self._store_save_ok = True
-        self._eln_publisher: Any | None = None
 
         orchestrator.run_started.connect(self._on_run_started)
         orchestrator.run_finished.connect(self._on_run_finished)
@@ -204,8 +204,8 @@ class ExperimentManager(QObject):
             ``{"setup": {"config_name": ..., "instruments": {vi_name: {...}}},
             "experiment": {...} or {}}``. The experiment sub-dict, when
             present, has ``experiment_id``, ``experiment_title``, ``user_id``,
-            ``user_name``, ``attended``, and ``eln_link`` (``{}`` until
-            published).
+            ``user_name``, ``attended``, and ``eln_link`` (the experiment's
+            notebook page, ``{}`` while it has none).
         """
         setup = {
             "config_name": self._config_name,
@@ -221,8 +221,8 @@ class ExperimentManager(QObject):
             "user_name": user.name if user else "",
             "attended": self._experiment.attended,
             "eln_link": (
-                self._experiment.eln_link.to_dict()
-                if self._experiment.eln_link is not None
+                self._experiment.eln.entry.to_dict()
+                if self._experiment.eln is not None and self._experiment.eln.entry is not None
                 else {}
             ),
         }
@@ -850,218 +850,253 @@ class ExperimentManager(QObject):
         self._save_current()
         self.run_recorded.emit(run.to_dict())
 
-    def set_run_eln_link(self, experiment_id: str, run_id: str, link: ElnLink) -> bool:
-        """Record the ELN entry one run was published to.
+    # ------------------------------------------------------------------
+    # Analysis bundle selection (no notebook involved)
+    # ------------------------------------------------------------------
 
-        The single-writer rule applied to the publishing track: the publisher
-        never edits a record or touches the store itself, it hands the
-        confirmed entry reference here. Called only after the backend has
-        confirmed the entry, so a run that carries a link really is in the
-        notebook.
+    def select_bundle(self, run_id: str, bundle_id: str) -> bool:
+        """Choose the **analysis bundle** that represents one run.
 
-        Works on any experiment in this store, not just the open one: an
-        outbox job queued today may only reach the notebook next week, by
-        which time its experiment is closed and something else is open. When
-        the target IS the open experiment the in-memory record is updated and
-        ``run_recorded`` is emitted; otherwise the record is loaded, amended,
-        and saved without disturbing the live one.
+        The analysis stage's own decision, and nothing else's: which of the
+        run's bundles (a recipe's, a script's, a draft) stands for it wherever
+        the run is presented, the notebook included. Only a completed bundle
+        can be selected; ``""`` clears the selection, so the run is presented
+        from its facts.
 
         Args:
-            experiment_id: The store key of the experiment owning the run.
-            run_id: The run to stamp.
-            link: The confirmed ELN entry reference.
+            run_id: The run, in the open experiment.
+            bundle_id: One of the run's bundles, or ``""``.
 
         Returns:
-            ``True`` when the link was recorded, ``False`` when the
-            experiment or the run is unknown, or the record could not be
-            written (all logged, never raised — a bookkeeping failure must
-            not propagate into a GUI timer).
+            ``True`` when the selection changed or was already that; ``False``
+            when no experiment is open, the run is unknown, or the bundle does
+            not exist or did not complete (all logged, never raised).
         """
-        if self._experiment is not None and self._experiment.experiment_id == experiment_id:
-            run = self._experiment.find_run(run_id)
-            if run is None:
-                logger.warning("No run %r in the open experiment to stamp an ELN link on", run_id)
+        run = self._open_run(run_id, "select a bundle of")
+        if run is None or self._experiment is None:
+            return False
+        if bundle_id:
+            bundle = self._store.read_bundle(self._experiment.experiment_id, run_id, bundle_id)
+            if bundle is None or not bundle.ok or not bundle.sealed:
+                logger.warning("Run %s has no completed, sealed bundle %r to select", run_id, bundle_id)
                 return False
-            run.eln_link = link
-            run.published = True
-            self._save_current()
-            self.run_recorded.emit(run.to_dict())
-            logger.info("Run %s published to %s", run_id, link.url or link.entry_id)
+        if run.selected_bundle == bundle_id:
+            return True
+        run.selected_bundle = bundle_id
+        self._save_current()
+        self.run_recorded.emit(run.to_dict())
+        logger.info("Run %s is now represented by bundle %s", run_id, bundle_id or "(facts)")
+        return True
+
+    # ------------------------------------------------------------------
+    # The notebook binding (one page per experiment)
+    # ------------------------------------------------------------------
+
+    def eln_binding(self) -> ElnBinding | None:
+        """Return the open experiment's notebook binding, or ``None``."""
+        return None if self._experiment is None else self._experiment.eln
+
+    def link_eln(self, binding: ElnBinding) -> bool:
+        """Link the open experiment to its notebook page.
+
+        Replaces any earlier binding: re-linking the experiment to another
+        page is a deliberate act, and the runs already published stay
+        published where they went.
+
+        Args:
+            binding: The binding to install (the page, or ``create_pending``
+                while a new page is being created).
+
+        Returns:
+            ``True`` when installed; ``False`` when no experiment is open.
+        """
+        if self._experiment is None:
+            logger.warning("No experiment is open — nothing to link to a notebook page")
+            return False
+        self._experiment.eln = binding
+        self._save_current()
+        self.experiment_changed.emit(self._experiment.to_dict())
+        logger.info(
+            "Experiment %s linked to its notebook page (%s)",
+            self._experiment.experiment_id,
+            binding.entry.url if binding.entry else "page being created",
+        )
+        return True
+
+    def unlink_eln(self) -> bool:
+        """Remove the open experiment's notebook binding.
+
+        Returns:
+            ``True`` when a binding was removed.
+        """
+        if self._experiment is None or self._experiment.eln is None:
+            return False
+        self._experiment.eln = None
+        self._save_current()
+        self.experiment_changed.emit(self._experiment.to_dict())
+        return True
+
+    def set_eln_entry(self, experiment_id: str, link: ElnLink) -> bool:
+        """Record the page the backend confirmed for one experiment.
+
+        Works on a closed experiment too: a page queued for creation while the
+        notebook was down may be confirmed after the experiment closed.
+
+        Args:
+            experiment_id: The experiment.
+            link: The confirmed page.
+
+        Returns:
+            ``True`` when recorded.
+        """
+
+        def _apply(record: ExperimentRecord) -> bool:
+            binding = record.eln or ElnBinding()
+            binding.entry = link
+            binding.create_pending = False
+            record.eln = binding
             return True
 
+        return self._mutate_experiment(experiment_id, _apply, "record the notebook page of")
+
+    def approve_eln_publishing(self, user_id: str) -> bool:
+        """Approve publishing for the open experiment, from now on.
+
+        The human's gate, taken once per experiment: after it, each publish
+        appends its section without asking again.
+
+        Args:
+            user_id: Who approved.
+
+        Returns:
+            ``True`` when approved; ``False`` when nothing is linked.
+        """
+        if self._experiment is None or self._experiment.eln is None:
+            logger.warning("No linked experiment to approve publishing for")
+            return False
+        binding = self._experiment.eln
+        binding.publish_approved = True
+        binding.approved_by = user_id
+        binding.approved_utc = _utc_now_iso()
+        self._save_current()
+        self.experiment_changed.emit(self._experiment.to_dict())
+        logger.info("Publishing approved for experiment %s by %s", self._experiment.experiment_id, user_id)
+        return True
+
+    def apply_eln_fields(
+        self, values: Mapping[str, Any], snapshot: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Apply fields read back from the notebook to the sample metadata.
+
+        The read direction's single write: the values a person accepted (after
+        seeing the difference) become the open experiment's ``sample_info``,
+        which every LATER run stamps into its data file. Runs already written
+        are facts and are never changed.
+
+        Args:
+            values: ``{sample_info key: value}`` to set.
+            snapshot: What was read, with its sources, kept on the binding
+                for provenance; ``None`` keeps the old snapshot.
+
+        Returns:
+            ``True`` when applied; ``False`` when no experiment is open.
+        """
+        if self._experiment is None:
+            return False
+        self._experiment.sample_info.update({str(k): v for k, v in values.items()})
+        if snapshot is not None and self._experiment.eln is not None:
+            self._experiment.eln.field_snapshot = dict(snapshot)
+        self._save_current()
+        self.experiment_changed.emit(self._experiment.to_dict())
+        logger.info("Applied %d notebook field(s) to the sample metadata", len(values))
+        return True
+
+    def record_eln_publish(
+        self,
+        experiment_id: str,
+        publish_id: str,
+        run_bundles: Mapping[str, str],
+        published_utc: str = "",
+    ) -> bool:
+        """Record that one publish reached the notebook.
+
+        Called by the publishing service only after the backend confirmed the
+        appended section, so a run marked published really is on the page.
+
+        Args:
+            experiment_id: The experiment.
+            publish_id: The publish.
+            run_bundles: ``{run_id: bundle_id}`` it covered (``""`` for a run
+                published from its facts).
+            published_utc: When; ``""`` for now.
+
+        Returns:
+            ``True`` when recorded.
+        """
+        stamp = published_utc or _utc_now_iso()
+
+        def _apply(record: ExperimentRecord) -> bool:
+            for run_id, bundle_id in run_bundles.items():
+                run = record.find_run(run_id)
+                if run is None:
+                    continue
+                run.published = True
+                run.eln_publish = {
+                    "publish_id": publish_id,
+                    "published_utc": stamp,
+                    "bundle_id": bundle_id,
+                }
+            return True
+
+        return self._mutate_experiment(experiment_id, _apply, "record a publish of")
+
+    def _mutate_experiment(
+        self,
+        experiment_id: str,
+        apply: Callable[[ExperimentRecord], bool],
+        action: str,
+    ) -> bool:
+        """Apply one change to an experiment record, open or closed.
+
+        The open experiment is changed in memory, saved and announced; a
+        closed one is loaded, changed and saved without disturbing the open
+        one. A record written by a newer application is never changed.
+
+        Args:
+            experiment_id: The experiment.
+            apply: Mutates the record; returns ``False`` to abandon.
+            action: What is being done, for the log line.
+
+        Returns:
+            ``True`` when applied and saved.
+        """
+        if self._experiment is not None and self._experiment.experiment_id == experiment_id:
+            if not apply(self._experiment):
+                return False
+            self._save_current()
+            self.experiment_changed.emit(self._experiment.to_dict())
+            return True
         record = self._store.load(experiment_id)
         if record is None:
-            logger.warning("Unknown experiment %r — cannot record its ELN link", experiment_id)
-            return False
-        run = record.find_run(run_id)
-        if run is None:
-            logger.warning("No run %r in experiment %r to stamp an ELN link on", run_id, experiment_id)
+            logger.warning("Unknown experiment %r — cannot %s it", experiment_id, action)
             return False
         if record.schema_version > SCHEMA_VERSION:
             logger.warning(
-                "Refusing to stamp an ELN link on experiment %s: its schema_version=%d > %d",
+                "Refusing to %s experiment %s: its schema_version=%d > %d",
+                action,
                 experiment_id,
                 record.schema_version,
                 SCHEMA_VERSION,
             )
             return False
-        run.eln_link = link
-        run.published = True
+        if not apply(record):
+            return False
         try:
             self._store.save(record)
         except OSError as exc:
-            logger.error("Could not record the ELN link for run %s: %s", run_id, exc)
+            logger.error("Could not %s experiment %s: %s", action, experiment_id, exc)
             return False
-        logger.info(
-            "Run %s of closed experiment %s published to %s",
-            run_id,
-            experiment_id,
-            link.url or link.entry_id,
-        )
         return True
-
-    # ------------------------------------------------------------------
-    # The drafting approval gate
-    # ------------------------------------------------------------------
-
-    def attach_eln_publisher(self, publisher: Any | None) -> None:
-        """Hold the ELN publisher an approved **draft entry** is enqueued through.
-
-        The one seam between the manager and the publishing track, and it
-        points the way the publisher does not: the publisher already holds
-        this manager (it hands confirmed links to ``set_run_eln_link()``), so
-        approval — a decision about a *record* — is taken here and the
-        enqueue is delegated back. Duck-typed on ``export_draft(run_id,
-        draft)`` rather than imported, so this module stays free of the ELN
-        package and of the Qt object that owns its drain timer.
-
-        Args:
-            publisher: The ``ElnPublisher``, or ``None`` to detach. With none
-                attached, ``approve_eln_draft()`` refuses by saying so.
-        """
-        self._eln_publisher = publisher
-        logger.info(
-            "ELN publisher %s for draft approval",
-            "attached" if publisher is not None else "detached",
-        )
-
-    def set_pending_eln_draft(self, run_id: str, draft: Mapping[str, Any]) -> bool:
-        """Park a **draft entry** on one run of the open experiment, unapproved.
-
-        The single-writer rule applied to the drafting track: an agent that
-        drafts an entry for an ATTENDED experiment may not publish it, so the
-        draft is stored here — as JSON on the run record — until a human
-        approves it with ``approve_eln_draft()``. Storing one replaces
-        whatever was pending, because a draft is a proposal that can be
-        redrawn at any time and only the newest is of interest.
-
-        Args:
-            run_id: The run the draft describes, in the open experiment.
-            draft: The draft as its JSON dict (``DraftEntry.to_dict()``).
-
-        Returns:
-            ``True`` when it was stored, ``False`` when no experiment is open
-            or the run is unknown (logged, never raised).
-        """
-        run = self._open_run(run_id, "park a draft on")
-        if run is None:
-            return False
-        run.pending_eln_draft = dict(draft)
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
-        logger.info("An ELN draft for run %s is waiting for approval", run_id)
-        return True
-
-    def pending_eln_draft(self, run_id: str) -> dict[str, Any]:
-        """Return the **draft entry** waiting on one run, or ``{}``.
-
-        Args:
-            run_id: The run to read, in the open experiment.
-
-        Returns:
-            The pending draft's JSON dict, or ``{}`` when none is waiting (or
-            no experiment is open, or the run is unknown).
-        """
-        run = self._open_run(run_id, "read a pending draft of")
-        return {} if run is None else dict(run.pending_eln_draft)
-
-    def discard_pending_eln_draft(self, run_id: str) -> bool:
-        """Drop the **Pending entry** waiting on one run, publishing nothing.
-
-        The other half of the approval gate: a proposal a human read and did
-        not want. The run keeps its data and its record — only the proposed
-        entry goes — so the run can be analysed or drafted again afterwards.
-
-        Args:
-            run_id: The run whose pending entry is discarded, in the open
-                experiment.
-
-        Returns:
-            ``True`` when something was discarded; ``False`` when no
-            experiment is open, the run is unknown, or nothing was pending
-            (all logged, never raised: discarding is a GUI action).
-        """
-        run = self._open_run(run_id, "discard a pending entry of")
-        if run is None:
-            return False
-        if not run.pending_eln_draft:
-            logger.info("Run %s has no pending ELN entry to discard", run_id)
-            return False
-        run.pending_eln_draft = {}
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
-        logger.info("Discarded the pending ELN entry for run %s", run_id)
-        return True
-
-    def approve_eln_draft(self, run_id: str) -> str:
-        """Approve the **draft entry** waiting on one run and queue it.
-
-        The human's half of the approval gate. The draft goes to the
-        publisher's ``export_draft()``, which queues it as one ordinary
-        outbox job; only once it is queued is the pending draft cleared, so a
-        publisher that refused (publishing off, no experiment open) leaves the
-        proposal exactly where it was, still approvable later.
-
-        Args:
-            run_id: The run whose pending draft is approved.
-
-        Returns:
-            The queued job's id, or ``""`` when nothing was queued — no
-            experiment open, no such run, no draft pending, no publisher
-            attached, or the publisher queued nothing (all logged, never
-            raised: approval is a GUI action, and a bookkeeping failure must
-            not propagate into it).
-        """
-        run = self._open_run(run_id, "approve a draft of")
-        if run is None:
-            return ""
-        if not run.pending_eln_draft:
-            logger.warning("Run %s has no pending ELN draft to approve", run_id)
-            return ""
-        if self._eln_publisher is None:
-            logger.warning(
-                "No ELN publisher is attached — the approved draft for run %s "
-                "stays pending",
-                run_id,
-            )
-            return ""
-        draft = dict(run.pending_eln_draft)
-        try:
-            job_id = str(self._eln_publisher.export_draft(run_id, draft) or "")
-        except Exception:  # noqa: BLE001 - approval must not raise into the GUI
-            logger.exception("Queuing the approved draft for run %s failed", run_id)
-            return ""
-        if not job_id:
-            logger.warning(
-                "The publisher queued nothing for run %s — its draft stays pending",
-                run_id,
-            )
-            return ""
-        run.pending_eln_draft = {}
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
-        logger.info("Approved the ELN draft for run %s: queued as %s", run_id, job_id)
-        return job_id
 
     def _open_run(self, run_id: str, action: str) -> RunRecord | None:
         """Return one run of the OPEN experiment, or ``None`` with a warning.

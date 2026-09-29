@@ -1,36 +1,36 @@
-"""End-to-end: a finished run → the real analysis worker → an analysed entry
-→ human approval → the (sim) notebook.
+"""End-to-end: a finished run → the real analysis worker → a sealed bundle
+→ one approved publish → the experiment's (sim) notebook page.
 
-The layer suites test each half against a stand-in (the runner against a fake
-worker, the worker against a spec file, the publisher against a fake report).
-This test wires the REAL pieces together the way ``i2as.main`` does —
-``ElnPublisher.analysis_requested`` → ``AnalysisRunner.start`` →
-``python -m i2as.analysis run`` → ``export_report`` → the pending entry →
-``approve_eln_draft`` → the outbox drain — over a real HDF5 run file written
-by the data manager, and asserts that only the analysed, concise entry with
-its figure reaches the notebook.
+The layer suites test each half against a stand-in. This test wires the REAL
+pieces together the way ``i2as.main`` does — ``AnalysisTrigger`` →
+``AnalysisRunner.start`` → ``python -m i2as.analysis run`` → the sealed,
+selected bundle — and then the notebook layer, which knows only the bundle:
+link the experiment to its page, approve once, publish — over a real HDF5 run
+file written by the data manager, and asserts that the analysed, concise
+section with its figures reaches the page.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from i2as.analysis.report import REPORT_FILENAME, AnalysisReport
+from i2as.analysis.report import AnalysisReport
 from i2as.core.data_manager import DataManager
 from i2as.core.orchestrator import Orchestrator
 from i2as.core.station import build_station
 from i2as.session.analysis_runner import AnalysisRunner
-from i2as.session.eln.outbox import DRAIN_PUBLISHED
-from i2as.session.eln.publisher import ElnPublisher
-from i2as.session.eln.settings import AnalysisSettings, ElnSettings
-from i2as.session.eln.sim_eln import SimElnAdapter
+from i2as.session.analysis_sandbox import SubprocessSandbox
+from i2as.session.analysis_trigger import AnalysisTrigger
+from i2as.session.app_config import AnalysisSettings
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import User
 from i2as.session.store import ExperimentStore, UserRoster
+from tests.notebook_support import notebook_service
 
 pytestmark = pytest.mark.skipif(
     sys.platform.startswith("win"), reason="POSIX subprocess semantics assumed"
@@ -156,23 +156,16 @@ def _wire(tmp_path, monkeypatch, *, config_name: str, procedure: str, write_run,
     orchestrator.run_started.emit(started)
     finished = dict(started, finished_utc="2026-01-01T10:05:00+00:00", status="done", reason="")
 
-    settings = ElnSettings(
-        enabled=True,
-        backend="sim_eln",
-        base_url="https://sim.example",
-        api_key="k",
-        retry_base_s=0.0,
-        retry_max_s=0.0,
-        analysis=AnalysisSettings(enabled=True, timeout_s=120.0),
-    )
-    adapter = SimElnAdapter({})
-    publisher = ElnPublisher(manager, settings, adapter=adapter)
-    manager.attach_eln_publisher(publisher)
-    orchestrator.run_finished.connect(publisher.on_run_finished)
-    runner = AnalysisRunner(manager, publisher, lambda: publisher.settings)
-    publisher.analysis_requested.connect(runner.start)
+    analysis = AnalysisSettings(enabled=True, timeout_s=120.0)
+    # A plain child process stands in for the container: no engine on a test box.
+    runner = AnalysisRunner(manager, lambda: analysis, sandbox_factory=lambda _settings: SubprocessSandbox())
+    trigger = AnalysisTrigger(manager, runner, lambda: analysis)
+    orchestrator.run_finished.connect(trigger.on_run_finished)
+    service, notebook = notebook_service(manager, tmp_path)
+    service.link_experiment("lab")
+    manager.approve_eln_publishing("jdoe")
 
-    return manager, publisher, adapter, runner, orchestrator, finished, experiment.experiment_id
+    return manager, service, notebook, runner, orchestrator, finished, experiment.experiment_id
 
 
 @pytest.fixture
@@ -191,6 +184,11 @@ def wired(tmp_path, qtbot, monkeypatch):
     parts[1].stop()
 
 
+def _page(notebook):
+    (page,) = notebook()["entries"].values()
+    return page
+
+
 @pytest.fixture
 def wired_imaging(tmp_path, qtbot, monkeypatch):
     """The imaging example: a Field Imaging run on the sim imaging station."""
@@ -207,49 +205,33 @@ def wired_imaging(tmp_path, qtbot, monkeypatch):
     parts[1].stop()
 
 
-def test_a_finished_run_reaches_the_notebook_as_an_analysed_entry(wired, qtbot):
-    """Run end → worker → parked entry → approval → one entry with one figure."""
-    manager, publisher, adapter, runner, orchestrator, finished, experiment_id = wired
+def test_a_finished_run_reaches_the_page_as_an_analysed_section(wired, qtbot):
+    """Run end → worker → sealed, selected bundle → one publish → one section with its figure."""
+    manager, service, notebook, runner, orchestrator, finished, experiment_id = wired
 
-    with qtbot.waitSignal(runner.analysis_finished, timeout=90_000) as blocker:
+    with qtbot.waitSignal(runner.bundle_ready, timeout=90_000) as blocker:
         orchestrator.run_finished.emit(finished)
 
-    # Nothing was queued at run end: analysis is on, so approval is the gate.
-    assert publisher.pending_count() == 0
-    run_id, payload = blocker.args
-    assert run_id == "run-0001"
-    report = AnalysisReport.from_dict(payload)
-    assert report.ok, report.error
-    assert report.recipe == "generic_sweep"
-    report_dir = manager.store.report_dir(experiment_id, run_id)
-    assert (report_dir / REPORT_FILENAME).is_file()
-    assert report.figures, "the generic sweep recipe draws one overview figure"
-    figure = report_dir / report.figures[0].file
-    assert figure.is_file() and figure.stat().st_size > 0
+    run_id, bundle_id, payload = blocker.args
+    assert run_id == "run-0001" and payload["status"] == "ok", payload.get("error")
+    assert payload["producer"]["name"] == "generic_sweep"
+    assert manager.current_experiment().find_run(run_id).selected_bundle == bundle_id
+    figures = [a["path"] for a in payload["artifacts"] if a["kind"] == "figure"]
+    assert figures, "the generic sweep recipe draws one overview figure"
+    assert _page(notebook)["body"] == "", "analysis never publishes anything"
 
-    pending = manager.pending_eln_draft(run_id)
-    assert pending["source"] == "analysis"
-    assert "Provenance" in pending["body_html"] or "provenance" in pending["body_html"].lower()
-    assert "<img" not in pending["body_html"], "the published body never embeds an image"
-    assert "Parameters" not in pending["body_html"], "fact tables are opt-in"
-    assert [a["path"] for a in pending["attachments"]] == [str(figure)]
+    service.publish()
 
-    # The human approves in the eLab tab; the ordinary drain publishes it.
-    job_id = manager.approve_eln_draft(run_id)
-    assert job_id
-    assert publisher.drain_once().state == DRAIN_PUBLISHED
-    assert len(adapter.entries) == 1
-    entry = next(iter(adapter.entries.values()))
-    assert entry["body_html"] == pending["body_html"]
-    uploaded = [Path(u["path"]).name for u in adapter.uploads]
-    assert uploaded == [figure.name], "the figure is attached, the raw data file is not"
-    assert manager.pending_eln_draft(run_id) == {}
-    assert manager.current_experiment().find_run(run_id).eln_link is not None
+    page = _page(notebook)
+    assert page["body"].count("<h2>I2AS") == 1 and run_id in page["body"]
+    assert "<img" not in page["body"], "a figure travels as an upload, never embedded"
+    assert [u["name"] for u in page["uploads"]] == [f"{run_id}_{name}" for name in figures]
+    assert manager.current_experiment().find_run(run_id).published
 
 
-def test_a_failing_recipe_parks_a_facts_only_entry(wired, qtbot):
-    """A broken experiment recipe never loses the run: facts fall back, flagged."""
-    manager, publisher, _adapter, runner, orchestrator, finished, experiment_id = wired
+def test_a_failing_recipe_leaves_a_failed_bundle_and_the_run_is_published_from_its_facts(wired, qtbot):
+    """A broken experiment recipe never loses the run: it is still published, from its facts."""
+    manager, service, notebook, runner, orchestrator, finished, experiment_id = wired
     recipes_dir = manager.store.recipes_dir(experiment_id)
     recipes_dir.mkdir(parents=True)
     (recipes_dir / "broken.py").write_text(
@@ -268,39 +250,30 @@ def test_a_failing_recipe_parks_a_facts_only_entry(wired, qtbot):
 
     run_id, error = blocker.args
     assert "ZeroDivisionError" in error
-    pending = manager.pending_eln_draft(run_id)
-    assert pending["source"] == "facts"
-    assert "ZeroDivisionError" in pending["body_html"]
-    assert publisher.pending_count() == 0, "nothing publishes without approval"
+    assert manager.current_experiment().find_run(run_id).selected_bundle == ""
+    [bundle] = manager.store.list_bundles(experiment_id, run_id)
+    assert not bundle.ok and "ZeroDivisionError" in bundle.error
+    service.publish()
+    assert "Parameters" in _page(notebook)["body"], "the run is presented from its facts"
 
+def test_a_finished_imaging_run_reaches_the_page_with_its_montage(wired_imaging, qtbot):
+    """The imaging twin: run end → worker → the image-stack bundle → the montage uploaded."""
+    manager, service, notebook, runner, orchestrator, finished, experiment_id = wired_imaging
 
-def test_a_finished_imaging_run_reaches_the_notebook_with_its_montage(wired_imaging, qtbot):
-    """The imaging twin: run end → worker → the image-stack report → the montage attached."""
-    manager, publisher, adapter, runner, orchestrator, finished, experiment_id = wired_imaging
-
-    with qtbot.waitSignal(runner.analysis_finished, timeout=90_000) as blocker:
+    with qtbot.waitSignal(runner.bundle_ready, timeout=90_000) as blocker:
         orchestrator.run_finished.emit(finished)
 
-    run_id, payload = blocker.args
-    report = AnalysisReport.from_dict(payload)
+    run_id, bundle_id, payload = blocker.args
+    report = AnalysisReport.from_dict(json.loads((manager.store.bundle_dir(experiment_id, run_id, bundle_id) / "report.json").read_text()))
     assert report.ok, report.error
     assert report.recipe == "field_image_stack", "the procedure-specific recipe wins"
     assert [f.file for f in report.figures] == ["montage.png", "difference.png", "loop.png"]
-    report_dir = manager.store.report_dir(experiment_id, run_id)
-    for figure in report.figures:
-        assert (report_dir / figure.file).stat().st_size > 0
     assert any(r.name == "Coercive field" for r in report.results)
 
-    pending = manager.pending_eln_draft(run_id)
-    assert pending["source"] == "analysis"
-    assert "reference frame" in pending["body_html"]
-    assert [Path(a["path"]).name for a in pending["attachments"]] == [
-        "montage.png", "difference.png", "loop.png"
-    ]
+    service.publish()
 
-    job_id = manager.approve_eln_draft(run_id)
-    assert job_id
-    assert publisher.drain_once().state == DRAIN_PUBLISHED
-    assert len(adapter.entries) == 1
-    uploaded = sorted(Path(u["path"]).name for u in adapter.uploads)
-    assert uploaded == ["difference.png", "loop.png", "montage.png"]
+    page = _page(notebook)
+    assert "reference frame" in page["body"]
+    assert sorted(u["name"] for u in page["uploads"]) == sorted(
+        f"{run_id}_{name}" for name in ("montage.png", "difference.png", "loop.png")
+    )

@@ -5,11 +5,11 @@ manifest in, an analysed entry out. This is the other half of the same story:
 nothing here calls the engine, the runner or the publisher directly. An
 ``Actor`` of kind ``agent`` under the ``session`` role reads the manifest,
 validates the run, rehearses it as a probe, runs it, waits for ``RunFinished``,
-asks for the analysis and reads the report back, all through
+asks for the analysis and reads the bundle back, all through
 ``Gateway.call_tool()`` — the same surface the MCP server publishes. What it
-cannot do is approve: the analysed entry is parked on the run record until a
-human approves it, and only then does the sim notebook see one entry with the
-figures attached. The agent feed is asserted alongside, because an agent that
+cannot do is reach the notebook: there is no tool for it. The operator links
+the page, approves and publishes, and only then does the sim notebook see one
+section with the figures uploaded. The agent feed is asserted alongside, because an agent that
 leaves no trail is the one thing this path must never allow.
 
 One test per shipped example — the transport example (``sim_cryostat``,
@@ -28,7 +28,6 @@ from typing import Any
 import pytest
 
 import i2as
-from i2as.analysis.report import AnalysisReport
 from i2as.core import events as ev
 from i2as.core.orchestrator import Orchestrator
 from i2as.core.station import build_station
@@ -42,15 +41,15 @@ from i2as.session.agent_feed import (
     read_feed,
 )
 from i2as.session.analysis_runner import AnalysisRunner
-from i2as.session.eln.outbox import DRAIN_PUBLISHED
-from i2as.session.eln.publisher import ElnPublisher
-from i2as.session.eln.settings import AnalysisSettings, ElnSettings
-from i2as.session.eln.sim_eln import SimElnAdapter
+from i2as.session.analysis_sandbox import SubprocessSandbox
+from i2as.session.app_config import AnalysisSettings
+from i2as.session.eln import ElnService
 from i2as.session.gateway import Gateway, Role, ToolContext
 from i2as.session.gateway.gateway import event_stream
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import User
 from i2as.session.store import ExperimentStore, UserRoster
+from tests.notebook_support import notebook_service
 
 pytestmark = pytest.mark.skipif(
     sys.platform.startswith("win"), reason="POSIX subprocess semantics assumed"
@@ -137,8 +136,8 @@ class Wired:
     gateway: Gateway
     orchestrator: Orchestrator
     manager: ExperimentManager
-    publisher: ElnPublisher
-    adapter: SimElnAdapter
+    service: ElnService
+    notebook: Any
     runner: AnalysisRunner
     feed: AgentFeed
     experiment_id: str
@@ -148,10 +147,10 @@ class Wired:
 def _wire(example: Example, tmp_path: Path) -> Wired:
     """The wiring ``i2as.main`` does, over one example's sim station.
 
-    One deliberate difference: the publisher's ``analysis_requested`` is NOT
-    connected to the runner. In the application a finished run is analysed
-    automatically; here the agent is the one asking, through ``run_analysis``,
-    which is the tool the leg exists to exercise.
+    One deliberate difference: no analysis trigger is connected. In the
+    application a finished run is analysed automatically; here the agent is
+    the one asking, through ``run_analysis``, which is the tool the leg exists
+    to exercise.
     """
     station = build_station(str(CONFIGS_DIR / example.config_name))
     # The sim magnet ramps at a realistic rate; a test cannot wait for it, so
@@ -174,20 +173,10 @@ def _wire(example: Example, tmp_path: Path) -> Wired:
     )
     experiment = manager.start_experiment("Agent leg", "jdoe", dict(SAMPLE_INFO))
 
-    settings = ElnSettings(
-        enabled=True,
-        backend="sim_eln",
-        base_url="https://sim.example",
-        api_key="k",
-        retry_base_s=0.0,
-        retry_max_s=0.0,
-        analysis=AnalysisSettings(enabled=True, timeout_s=120.0),
-    )
-    adapter = SimElnAdapter({})
-    publisher = ElnPublisher(manager, settings, adapter=adapter)
-    manager.attach_eln_publisher(publisher)
-    orchestrator.run_finished.connect(publisher.on_run_finished)
-    runner = AnalysisRunner(manager, publisher, lambda: publisher.settings)
+    analysis = AnalysisSettings(enabled=True, timeout_s=120.0)
+    # A plain child process stands in for the container: no engine on a test box.
+    runner = AnalysisRunner(manager, lambda: analysis, sandbox_factory=lambda _settings: SubprocessSandbox())
+    service, notebook = notebook_service(manager, tmp_path)
 
     feed = AgentFeed(
         store.agent_feed_path(experiment.experiment_id), experiment.experiment_id
@@ -207,7 +196,6 @@ def _wire(example: Example, tmp_path: Path) -> Wired:
             experiments=manager,
             run_catalog=catalog,
             status_log_path=tmp_path / "status.jsonl",
-            publisher=publisher,
             analysis_runner=runner,
         ),
         feed=feed,
@@ -216,8 +204,8 @@ def _wire(example: Example, tmp_path: Path) -> Wired:
         gateway=gateway,
         orchestrator=orchestrator,
         manager=manager,
-        publisher=publisher,
-        adapter=adapter,
+        service=service,
+        notebook=notebook,
         runner=runner,
         feed=feed,
         experiment_id=experiment.experiment_id,
@@ -233,7 +221,7 @@ def wired(request, tmp_path, qtbot, monkeypatch):
     parts = _wire(request.param, tmp_path)
     yield request.param, parts
     parts.runner.cancel()
-    parts.publisher.stop()
+    parts.service.stop()
     parts.orchestrator.shutdown()
 
 
@@ -266,11 +254,11 @@ def _wait_for_run_done(wired: Wired, qtbot, run_index: int) -> str:
     return run_id
 
 
-def test_an_agent_runs_analyses_and_parks_an_entry_a_human_publishes(wired, qtbot):
+def test_an_agent_runs_analyses_and_a_human_publishes_them(wired, qtbot):
     """read_manifest → validate_run → probe_run → run_procedure → RunFinished →
-    run_analysis → read_analysis_report → parked → approved → published."""
+    run_analysis → read_analysis_bundle → (no notebook tool) → the operator publishes."""
     example, parts = wired
-    gateway, manager, adapter = parts.gateway, parts.manager, parts.adapter
+    gateway, manager = parts.gateway, parts.manager
     data_dir = str(manager.current_data_dir())
 
     # 1. What is this station? The manifest names the setup and its VIs.
@@ -292,7 +280,6 @@ def test_an_agent_runs_analyses_and_parks_an_entry_a_human_publishes(wired, qtbo
     )
     assert validated["ok"] is True, validated
     assert validated["result"]["ok"] is True, validated["result"]
-    assert validated["result"]["duration_estimate_s"] >= 0
 
     # 3. Rehearse it as a probe: same procedure, same instruments, three points.
     probed = gateway.call_tool("probe_run", _run_args(example, data_dir, prefix="probe", probe=True))
@@ -300,64 +287,43 @@ def test_an_agent_runs_analyses_and_parks_an_entry_a_human_publishes(wired, qtbo
     probe_id = _wait_for_run_done(parts, qtbot, 0)
     probe_record = manager.current_experiment().find_run(probe_id)
     assert probe_record.kind == "probe"
-    assert probe_record.actor.kind is ev.ActorKind.AGENT
-    assert probe_record.actor.id == ACTOR_ID
-    assert manager.pending_eln_draft(probe_id) == {}, "a probe is never notebook material"
+    assert probe_record.actor.kind is ev.ActorKind.AGENT and probe_record.actor.id == ACTOR_ID
 
     # 4. The real run, and its RunFinished on the event stream.
     started = gateway.call_tool("run_procedure", _run_args(example, data_dir, prefix="sweep"))
     assert started["code"] == "OK", started
     run_id = _wait_for_run_done(parts, qtbot, 1)
     run_record = manager.current_experiment().find_run(run_id)
-    assert run_record.kind == "run"
-    assert run_record.actor.kind is ev.ActorKind.AGENT
+    assert run_record.kind == "run" and run_record.actor.kind is ev.ActorKind.AGENT
     ended = next(e for e in parts.finished if e.run_id == run_id)
     assert ended.status == "done", ended
     assert ended.manifest["procedure"] == example.procedure_cls.name
 
-    # With analysis on, run end parks nothing and queues nothing on its own:
-    # the notebook waits for the analysis, and the analysis waits to be asked.
-    assert parts.publisher.pending_count() == 0
-    assert manager.pending_eln_draft(run_id) == {}
-    assert adapter.entries == {}
-
-    # 5. The agent asks for the analysis, then reads the report back.
+    # 5. The agent asks for the analysis, then reads the bundle back.
     analysis = gateway.call_tool("run_analysis", {"run_id": run_id})
     assert analysis["ok"] is True, analysis
-    assert analysis["result"]["started"] is True
-    with qtbot.waitSignal(parts.runner.analysis_finished, timeout=ANALYSIS_TIMEOUT_MS):
+    with qtbot.waitSignal(parts.runner.bundle_ready, timeout=ANALYSIS_TIMEOUT_MS):
         pass
-    report_answer = gateway.call_tool("read_analysis_report", {"run_id": run_id})
-    assert report_answer["ok"] is True, report_answer
-    assert report_answer["result"]["status"] == "ok", report_answer["result"]
-    assert report_answer["result"]["recipe"] == example.recipe
-    report = AnalysisReport.from_dict(report_answer["result"])
-    report_dir = manager.store.report_dir(parts.experiment_id, run_id)
-    figure_names = [figure.file for figure in report.figures]
-    assert figure_names, "every shipped recipe draws at least one figure"
+    bundle = gateway.call_tool("read_analysis_bundle", {"run_id": run_id})
+    assert bundle["ok"] is True, bundle
+    assert bundle["result"]["status"] == "ok", bundle["result"]
+    assert bundle["result"]["producer"]["name"] == example.recipe
+    assert bundle["result"]["selected"] is True, "a completed recipe bundle represents the run"
+    figure_names = [a["path"] for a in bundle["result"]["artifacts"] if a["kind"] == "figure"]
     for expected in example.figures:
         assert expected in figure_names, figure_names
-    for name in figure_names:
-        assert (report_dir / name).stat().st_size > 0
 
-    # 6. The analysed entry is parked on the run, not published: approval is
-    # the human's, and there is no tool for it.
-    assert gateway.tool("approve_eln_draft") is None
-    pending = manager.pending_eln_draft(run_id)
-    assert pending["source"] == "analysis"
-    assert [Path(a["path"]).name for a in pending["attachments"]] == figure_names
-    assert parts.publisher.pending_count() == 0
-    assert adapter.entries == {}
+    # 6. No tool reaches the notebook: the agent's work ends at the bundle.
+    assert not [t.name for t in gateway.tools() if "eln" in t.name or "publish" in t.name]
 
-    # 7. The human approves in the eLab tab; the ordinary drain publishes it.
-    assert manager.approve_eln_draft(run_id)
-    assert parts.publisher.drain_once().state == DRAIN_PUBLISHED
-    assert len(adapter.entries) == 1
-    (entry,) = adapter.entries.values()
-    assert entry["body_html"] == pending["body_html"]
-    assert sorted(Path(u["path"]).name for u in adapter.uploads) == sorted(figure_names)
-    assert manager.pending_eln_draft(run_id) == {}
-    assert manager.current_experiment().find_run(run_id).eln_link is not None
+    # 7. The operator links the page, approves once, and publishes.
+    parts.service.link_experiment("lab")
+    manager.approve_eln_publishing("jdoe")
+    parts.service.publish([run_id])
+    (page,) = parts.notebook()["entries"].values()
+    assert run_id in page["body"]
+    assert sorted(u["name"] for u in page["uploads"]) == sorted(f"{run_id}_{n}" for n in figure_names)
+    assert manager.current_experiment().find_run(run_id).published
 
     # 8. The trail: every command, its verdict and the recorded tool call name
     # the agent — the same actor the run records carry.

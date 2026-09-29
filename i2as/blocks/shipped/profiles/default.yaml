@@ -1,0 +1,34 @@
+# The default publishing profile — how an experiment reads from and writes to
+# its notebook page. Copy it into <user config>/blocks/profiles/ under a new
+# name to make your own; the file name (without .yaml) is the profile's id.
+
+# Which connector this profile is written for ("" = any).
+connector: ""
+
+# Which renderer lays out each published section (a renderer's NAME).
+renderer: default
+
+# The page template a NEW page is created from ("" = the notebook's default).
+template: ""
+
+# Read map: notebook fields -> the experiment's sample metadata.
+#   from: "<role>:<field>"  — <role> is a linked item's role (e.g. "sample"),
+#                             or "page" for the experiment's own page.
+#   type: text | float | int (default text); unit: shown beside the value.
+read:
+  sample_id:  {from: "sample:Sample ID"}
+  thickness:  {from: "sample:Thickness", type: float, unit: nm}
+  substrate:  {from: "sample:Substrate"}
+
+# Write map: page fields -> where each value comes from, overwritten on every
+# publish with the latest value.
+#   "result:<name>"      the newest published run's result called <name>
+#   "experiment:<key>"   title, experiment_id, user_name
+#   "sample:<key>"       a key of the experiment's sample metadata
+#   "text:<literal>"     a fixed text
+fields: {}
+
+# Options passed to the renderer unchanged (see the renderer's docstring).
+render:
+  include_parameters: true
+  include_warnings: true

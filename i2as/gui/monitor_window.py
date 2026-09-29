@@ -36,8 +36,7 @@ from i2as.core.config import read_instrument_metadata
 from i2as.gui import app_settings  # import the module (not the function) so tests can monkeypatch the factory
 from i2as.gui import form_autosave  # module import keeps save/load monkeypatchable
 from i2as.gui import window_geometry
-from i2as.gui.connections_dialog import ConnectionsDialog
-from i2as.gui.eln_settings_dialog import ElnSettingsDialog, persist_eln_settings
+from i2as.gui.settings_dialog import PAGE_ANALYSIS, PAGE_CONNECTIONS, PAGE_NOTEBOOK, SettingsDialog
 from i2as.gui.experiment_info_panel import ExperimentInfoPanel
 from i2as.gui.agent_panel import AgentPanel
 from i2as.gui.alerts import (
@@ -145,12 +144,15 @@ class MonitorWindow(QMainWindow):
         startup_warning: Startup config-fallback warning to surface, or None.
         session_manager: Optional ExperimentManager (L6), forwarded to
             ExperimentInfoPanel and used for attribution prefills.
-        eln_publisher: Optional ``ElnPublisher``, passed through to the
-            procedure window's **eLab tab** and edited by the User menu's
-            "eLab notebook…" action. ``None`` leaves both inert.
+        eln_service: Optional ``ElnService``, passed through to the
+            procedure window's **Analysis tab** and offered the moment an
+            experiment is started (link or create its notebook page).
         analysis_runner: Optional ``AnalysisRunner``, passed through to the
-            procedure window's **eLab tab**. ``None`` disables its "Run
+            procedure window's **Analysis tab**. ``None`` disables its "Run
             analysis" button.
+        user_profiles: Optional ``UserProfileStore`` — the Settings dialog's
+            Electronic notebook page edits the logged-in user's profile.
+        credentials: Optional ``CredentialStore`` for that page's API key.
         session_store: Optional SessionStore (the L6 Session tier above
             ``session_manager``), used by the User menu's "Resume Session…"
             action to list/create sessions and persist the active one.
@@ -172,12 +174,14 @@ class MonitorWindow(QMainWindow):
         active_config_path: str | None = None,
         startup_warning: str | None = None,
         session_manager: ExperimentManager | None = None,
-        eln_publisher: Any | None = None,
+        eln_service: Any | None = None,
         analysis_runner: Any | None = None,
         session_store: SessionStore | None = None,
         panels_config: dict[str, list[str]] | None = None,
         mirror: StatusMirror | None = None,
         gateway_controller: Any | None = None,
+        user_profiles: Any | None = None,
+        credentials: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self._station = station
@@ -198,13 +202,16 @@ class MonitorWindow(QMainWindow):
         # stamps built procedures; the experiment start/close/attendance/findings
         # controls live on the ExperimentInfoPanel, which owns session_manager directly.
         self._session_manager = session_manager
-        # The ELN/analysis pair: held only to hand on to the procedure
-        # window's eLab tab and to open the eLab setup dialog. This window
-        # neither publishes nor analyses anything itself.
-        self._eln_publisher = eln_publisher
+        # The notebook service and the analysis runner: held only to hand on
+        # to the procedure window's Analysis tab, to open the Settings
+        # dialog's notebook page, and to offer linking a new experiment to
+        # its page. This window neither publishes nor analyses anything.
+        self._eln_service = eln_service
         self._analysis_runner = analysis_runner
-        # The Connections menu's collaborator — None in a unit test that
-        # builds this window without one, in which case the menu says so
+        self._user_profiles = user_profiles
+        self._credentials = credentials
+        # The Settings dialog's Connections page's collaborator — None in a
+        # unit test that builds this window without one, in which case the page says so
         # rather than showing controls that could not be applied.
         self._gateway_controller = gateway_controller
         # The L6 Session tier above session_manager, used only by the User
@@ -355,15 +362,11 @@ class MonitorWindow(QMainWindow):
         user_menu.addAction(session_folder_action)
 
         # The notebook account is a property of the PERSON, like the login
-        # above and unlike a config: an API key must never travel with a
-        # config directory (session/eln/settings.py), so the eLab setup
-        # dialog belongs in this Setup-tier menu.
-        eln_action = QAction("eLab notebook…", self)
-        eln_action.setToolTip(
-            "Notebook address, credentials, and whether a finished run is "
-            "analysed before its entry is written"
-        )
-        eln_action.triggered.connect(self._open_eln_settings)
+        # above and unlike a config: it lives in the user's own profile and
+        # the key in the system keyring (Settings → Electronic notebook).
+        eln_action = QAction("Electronic notebook…", self)
+        eln_action.setToolTip("Your notebook account, API key and blocks")
+        eln_action.triggered.connect(lambda: self._open_settings(PAGE_NOTEBOOK))
         user_menu.addAction(eln_action)
 
         # Setup-tier, read-only: what the active config says each instrument
@@ -394,19 +397,36 @@ class MonitorWindow(QMainWindow):
         open_action.triggered.connect(self._open_procedures)
         proc_menu.addAction(open_action)
 
-        # The Agent gateway's on/off switch and role ceiling, editable at
-        # runtime instead of only via monitor.yaml + restart — see
-        # i2as/session/gateway/controller.py's module docstring for what
-        # the menu can and cannot change (it can never exceed monitor.yaml's
-        # own gateway_max_role).
-        connections_menu = menu_bar.addMenu("Connections")
-        gateway_settings_action = QAction("Gateway Settings…", self)
-        gateway_settings_action.setToolTip(
+        # The Settings dialog: one page per section of the general settings
+        # file (i2as/session/app_config.py). Connections is the Agent
+        # gateway's on/off switch and role ceiling, editable at runtime —
+        # never above monitor.yaml's own gateway_max_role (see
+        # i2as/session/gateway/controller.py); Analysis is the analysis
+        # stage and the container it runs in.
+        settings_menu = menu_bar.addMenu("Settings")
+        settings_action = QAction("Settings…", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(lambda: self._open_settings())
+        settings_menu.addAction(settings_action)
+        settings_menu.addSeparator()
+        connections_action = QAction("Connections…", self)
+        connections_action.setToolTip(
             "Turn the Agent gateway on or off, and choose which role it "
             "hands out to a connecting agent"
         )
-        gateway_settings_action.triggered.connect(self._open_connections_dialog)
-        connections_menu.addAction(gateway_settings_action)
+        connections_action.triggered.connect(lambda: self._open_settings(PAGE_CONNECTIONS))
+        settings_menu.addAction(connections_action)
+        analysis_action = QAction("Analysis…", self)
+        analysis_action.setToolTip(
+            "Whether a finished run is analysed before its entry is written, "
+            "and the container every analysis runs in"
+        )
+        analysis_action.triggered.connect(lambda: self._open_settings(PAGE_ANALYSIS))
+        settings_menu.addAction(analysis_action)
+        notebook_action = QAction("Electronic notebook…", self)
+        notebook_action.setToolTip("Your notebook account, API key, profile and blocks")
+        notebook_action.triggered.connect(lambda: self._open_settings(PAGE_NOTEBOOK))
+        settings_menu.addAction(notebook_action)
 
     def _open_procedures(self) -> None:
         """Lazily create and show the ProcedureWindow."""
@@ -426,8 +446,9 @@ class MonitorWindow(QMainWindow):
                 ),
                 mirror=self._mirror,
                 session_manager=self._session_manager,
-                eln_publisher=self._eln_publisher,
+                eln_service=self._eln_service,
                 analysis_runner=self._analysis_runner,
+                open_notebook_settings=lambda: self._open_settings(PAGE_NOTEBOOK),
             )
             self._sync_context()  # titles the new window with the context
         self._procedure_window.show()
@@ -474,7 +495,9 @@ class MonitorWindow(QMainWindow):
         # ── Fixed 2x2 quadrant grid (Page 1 — Monitor) ───────────────
         top_left = self._build_instruments_quadrant(measurement_vis)
         self._trends = TrendsQuadrant(self._station, parent=self)
-        self._session_info = ExperimentInfoPanel(session_manager=self._session_manager)
+        self._session_info = ExperimentInfoPanel(
+            session_manager=self._session_manager, after_start=self.offer_notebook_link
+        )
         bottom_right = self._build_bottom_right_quadrant()
 
         self._left_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1078,52 +1101,66 @@ class MonitorWindow(QMainWindow):
             self._procedure_window.reset_session()
         self._save_session()
 
-    def _open_eln_settings(self) -> None:
-        """Open the **eLab setup dialog** over the publisher's settings.
+    def offer_notebook_link(self) -> None:
+        """Offer to link the experiment just started to its notebook page.
 
-        The same dialog the procedure window's **eLab tab** opens, over the
-        same record. Saving writes the user-level settings file and hands
-        the new record to the publisher; with no publisher wired there is
-        nothing to edit, and the window says so rather than showing a form
-        that could not be applied.
+        Shown right after Start Experiment when the experiment's user
+        publishes to a notebook: link an existing page, create a new one, or
+        not now. Nothing happens for a user with publishing off.
         """
-        settings = getattr(self._eln_publisher, "settings", None)
-        if settings is None:
-            QMessageBox.information(
-                self,
-                "eLab notebook",
-                "No electronic lab notebook is wired into this session.",
-            )
+        service = self._eln_service
+        manager = self._session_manager
+        if service is None or manager is None:
             return
+        record = manager.current_experiment()
+        if record is None or record.eln is not None:
+            return
+        try:
+            if not service.enabled(record.user_id or "guest"):
+                return
+        except Exception:  # noqa: BLE001 - a missing profile is "off"
+            return
+        from i2as.gui.notebook_dialogs import LinkNotebookDialog
 
-        def _save(edited: Any) -> None:
-            """Write the edited settings and reload the publisher.
+        LinkNotebookDialog(service, record, self).exec()
 
-            Args:
-                edited: The ``ElnSettings`` the dialog's form produced.
-            """
-            persist_eln_settings(edited, self._eln_publisher)
+    def _open_settings(self, page: str = PAGE_CONNECTIONS) -> None:
+        """Open the **Settings dialog** on one page.
+
+        With no gateway controller wired (a unit test's window, or a build
+        that predates the Agent gateway) the Connections page says so rather
+        than showing controls that could not be applied.
+
+        Args:
+            page: ``PAGE_CONNECTIONS``, ``PAGE_ANALYSIS`` or ``PAGE_NOTEBOOK``.
+        """
+
+        def _analysis_saved(_analysis: Any) -> None:
             if self._procedure_window is not None:
                 self._procedure_window.reload_analysis_panel()
 
-        ElnSettingsDialog(settings, on_save=_save, parent=self).exec()
+        notebook = None
+        if self._user_profiles is not None and self._credentials is not None:
+            from i2as.session.eln.publishing import BlockCatalog
 
-    def _open_connections_dialog(self) -> None:
-        """Open the **Connections dialog** over the Gateway controller.
-
-        With no controller wired (a unit test's window, or a build that
-        predates the Agent gateway) there is nothing to switch on or off,
-        and the window says so rather than showing controls that could not
-        be applied — the same shape ``_open_eln_settings`` follows.
-        """
-        if self._gateway_controller is None:
-            QMessageBox.information(
-                self,
-                "Connections",
-                "This session has no Agent gateway wired in.",
+            catalog = self._eln_service.catalog() if self._eln_service is not None else BlockCatalog()
+            notebook = (
+                self._user_profiles,
+                self._credentials,
+                self._current_user_id or "guest",
+                catalog,
+                self._eln_service,
             )
-            return
-        ConnectionsDialog(self._gateway_controller, parent=self).exec()
+        SettingsDialog(
+            app_settings.config_store(),
+            gateway_controller=self._gateway_controller,
+            on_analysis_saved=_analysis_saved,
+            notebook=notebook,
+            page=page,
+            parent=self,
+        ).exec()
+        if self._procedure_window is not None:
+            self._procedure_window.reload_analysis_panel()
 
     def _open_login_dialog(self) -> None:
         """Open LoginDialog and switch to the picked user, if any."""

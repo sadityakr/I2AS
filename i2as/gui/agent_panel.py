@@ -15,15 +15,11 @@ answer to "what did the machines do" lives:
   destruction-order rule: a panel never connects to the engine itself);
 * the **Agent feed** of the open experiment, read once when the panel opens,
   so the trail survives a restart of the application rather than starting
-  blank at every launch;
-* the **Draft entry** waiting on a run, which is the one row that is a
-  QUESTION rather than a record: it carries an Approve button, and approving
-  it is the human's half of the ELN approval gate.
+  blank at every launch.
 
 What the panel never does: touch the engine, judge an action, or hold a
-session object it did not receive. Approval goes through
-``ExperimentManager.approve_eln_draft()``, which is the single writer for
-that record exactly as the Orchestrator is for hardware.
+session object it did not receive. Publishing to the notebook is approved in
+the Analysis tab, once per experiment; no agent can reach the notebook.
 """
 
 from __future__ import annotations
@@ -40,7 +36,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QScrollArea,
     QSizePolicy,
     QVBoxLayout,
@@ -124,9 +119,8 @@ class AgentAction:
         code: The ``VerdictCode`` value, ``""`` for a state change.
         reason: The engine's own words for the outcome, ``""`` when it had
             none. The transition's cause for a state change.
-        run_id: The run a pending **Draft entry** belongs to; ``""`` on every
-            other row.
-        kind: ``"verdict"``, ``"state"`` or ``"draft"``.
+        run_id: Unused (kept for older feed rows); ``""``.
+        kind: ``"verdict"`` or ``"state"``.
         takeover_owner: The **Run owner** this action was taken over, id
             only, read off the verdict's ``detail.takeover``; ``""`` on every
             ordinary row. When it is set, ``reason`` is the reason the actor
@@ -160,8 +154,6 @@ class AgentAction:
     @property
     def outcome(self) -> str:
         """The row's dynamic-property value (see the ``OUTCOME_*`` constants)."""
-        if self.kind == "draft":
-            return OUTCOME_PENDING
         if self.refused:
             return OUTCOME_REFUSED
         if self.takeover_owner:
@@ -440,16 +432,14 @@ class AgentPanel(QWidget):
     holding the rows ``agent_panel_rows``, the empty-state label
     ``agent_panel_empty_label``, the system filter
     ``agent_panel_system_checkbox``, the run-owner line
-    ``agent_panel_run_owner_label``, and each pending draft's button
-    ``agent_approve_<run_id>``. Rows themselves are not named: they are
+    ``agent_panel_run_owner_label``. Rows themselves are not named: they are
     rebuilt whenever the filter changes, so an index-based name would point
     at a different action after every toggle. ``row_texts()`` is what a
     reader of the rows asks instead.
 
     Args:
-        session_manager: The L6 ``ExperimentManager``, used for three things
-            and nothing else — the **Agent feed** to seed from, the pending
-            **Draft entry** rows, and ``approve_eln_draft()``. ``None`` (a
+        session_manager: The L6 ``ExperimentManager``, used for one thing
+            and nothing else — the **Agent feed** to seed from. ``None`` (a
             unit test, or a launch with no session layer) leaves the panel a
             pure view of the live stream.
         parent: Optional Qt parent widget.
@@ -473,9 +463,6 @@ class AgentPanel(QWidget):
         self._row_widgets: list[QWidget] = []
         #: ``{actor_id: last action's unix time}`` — the "agents active" ledger.
         self._last_seen: dict[str, float] = {}
-        #: Run ids that already have a pending-draft row, so a re-emitted run
-        #: record does not append the same question twice.
-        self._draft_rows: dict[str, QWidget] = {}
         self._follow_tail = True
 
         root = QVBoxLayout(self)
@@ -513,7 +500,6 @@ class AgentPanel(QWidget):
             self._session_manager.experiment_changed.connect(
                 self._on_experiment_changed
             )
-            self._session_manager.run_recorded.connect(self._on_run_recorded)
             self.reload_experiment()
 
     # ------------------------------------------------------------------
@@ -618,11 +604,11 @@ class AgentPanel(QWidget):
         self._note_activity(action)
 
     # ------------------------------------------------------------------
-    # The experiment: the feed seed and the pending drafts
+    # The experiment: the feed seed
     # ------------------------------------------------------------------
 
     def reload_experiment(self) -> None:
-        """Re-seed the panel from the open experiment: its feed, its drafts.
+        """Re-seed the panel from the open experiment's feed.
 
         Called when the panel is built and on every experiment change, so
         opening (or switching to) an experiment shows the trail that
@@ -642,7 +628,6 @@ class AgentPanel(QWidget):
             logger.exception("Agent panel: could not resolve the agent feed path")
             return
         self.seed_from_feed(path)
-        self._sync_pending_drafts()
 
     def seed_from_feed(self, path: Any) -> int:
         """Seed the panel from an **Agent feed** file, oldest first.
@@ -687,78 +672,7 @@ class AgentPanel(QWidget):
                 the manager rather than the payload, so one slot serves every
                 path.
         """
-        for widget in list(self._draft_rows.values()):
-            self._remove_row_widget(widget)
-        self._draft_rows.clear()
         self.reload_experiment()
-
-    def _on_run_recorded(self, _record: dict) -> None:
-        """Re-check the pending drafts whenever a run record changes.
-
-        Args:
-            _record: The ``RunRecord`` as a dict; the panel re-reads the
-                manager, which is the single writer for that record.
-        """
-        self._sync_pending_drafts()
-
-    def _sync_pending_drafts(self) -> None:
-        """Add a row per **Draft entry** waiting, and drop the approved ones."""
-        if self._session_manager is None:
-            return
-        record = self._session_manager.current_experiment()
-        pending = {
-            run.run_id
-            for run in (record.runs if record is not None else ())
-            if run.pending_eln_draft
-        }
-        for run_id in sorted(pending - set(self._draft_rows)):
-            self._draft_rows[run_id] = self._add_draft_row(run_id)
-        for run_id in set(self._draft_rows) - pending:
-            self._remove_row_widget(self._draft_rows.pop(run_id))
-        self._refresh_empty_state()
-
-    def _add_draft_row(self, run_id: str) -> QWidget:
-        """Build and append the one row that asks a question of the human.
-
-        Args:
-            run_id: The run whose draft is waiting.
-
-        Returns:
-            The row widget, so the panel can drop it once approved.
-        """
-        action = AgentAction(
-            ts=time.time(),
-            actor_id="eln",
-            actor_kind=ActorKind.SYSTEM.value,
-            what=f"ELN draft for run {run_id}",
-            reason="waiting for your approval",
-            run_id=run_id,
-            kind="draft",
-        )
-        row = self._build_row(action)
-        button = QPushButton("Approve")
-        button.setObjectName(f"agent_approve_{run_id}")
-        button.setToolTip(
-            "Queue this drafted notebook entry for publishing. Nothing is "
-            "published until you do."
-        )
-        button.clicked.connect(lambda _checked=False, rid=run_id: self._approve(rid))
-        row.layout().addWidget(button)
-        self._add_row_widget(row)
-        return row
-
-    def _approve(self, run_id: str) -> None:
-        """Approve one pending **Draft entry** and re-sync the rows.
-
-        Args:
-            run_id: The run whose draft the human approved.
-        """
-        if self._session_manager is None:
-            return
-        job_id = self._session_manager.approve_eln_draft(run_id)
-        if not job_id:
-            logger.warning("Agent panel: nothing was queued for run %s", run_id)
-        self._sync_pending_drafts()
 
     # ------------------------------------------------------------------
     # Rows
@@ -833,27 +747,18 @@ class AgentPanel(QWidget):
         """
         if row in self._row_widgets:
             self._row_widgets.remove(row)
-        for run_id, draft_row in list(self._draft_rows.items()):
-            if draft_row is row:
-                del self._draft_rows[run_id]
         retire_widget(row, self._rows_layout)
 
     def _rebuild(self) -> None:
         """Rebuild every row from the action list under the current filter.
 
-        A retired widget is never reused (the card-retirement standard), so
-        the pending-draft rows are rebuilt too — their run ids are what
-        survives the rebuild, not their widgets.
+        A retired widget is never reused (the card-retirement standard).
         """
-        pending = list(self._draft_rows)
         for row in list(self._row_widgets):
             self._remove_row_widget(row)
-        self._draft_rows.clear()
         for action in self._actions:
             if self._is_visible(action):
                 self._add_row_widget(self._build_row(action))
-        for run_id in pending:
-            self._draft_rows[run_id] = self._add_draft_row(run_id)
         self._refresh_empty_state()
 
     def _refresh_empty_state(self) -> None:

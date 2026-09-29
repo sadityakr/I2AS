@@ -42,7 +42,10 @@ _VALID_EXPERIMENT_STATUSES = frozenset(
 # Bumped 1 -> 2 for Session.experiments: an older app's Session.to_dict()
 # does not emit that field, so resaving a newer session.json without this
 # bump would silently drop the experiment index.
-SCHEMA_VERSION = 2
+# Bumped 2 -> 3 for ExperimentRecord.eln (the experiment's notebook binding):
+# an older app would drop the binding, which page this experiment publishes
+# to, on resave.
+SCHEMA_VERSION = 3
 
 # The fixed roster identity used when nobody has logged in (see
 # i2as.main._ensure_guest_user_registered). A real roster entry, not a
@@ -221,7 +224,7 @@ class User:
 
 @dataclass
 class ElnLink:
-    """Reference to the ELN entry an experiment is published to.
+    """Reference to one ELN page (entry) on one backend.
 
     Attributes:
         backend: ELN backend identifier (e.g. ``"elabftw"``).
@@ -254,6 +257,165 @@ class ElnLink:
             entry_id=_as_str(data.get("entry_id")),
             url=_as_str(data.get("url")),
             template_id=_as_str(data.get("template_id")),
+        )
+
+
+@dataclass
+class PinnedBlock:
+    """One user block (connector, renderer, profile), pinned by its source digest.
+
+    Attributes:
+        block_id: The block's id (a connector's ``backend``, a renderer's or
+            profile's name).
+        digest: SHA-256 of the block's source when the experiment was linked.
+            A block whose file has changed since then is not run for this
+            experiment until the user confirms the new version.
+    """
+
+    block_id: str = ""
+    digest: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe dict representation."""
+        return {"id": self.block_id, "digest": self.digest}
+
+    @classmethod
+    def from_dict(cls, data: object) -> PinnedBlock:
+        """Build a ``PinnedBlock`` from a parsed dict, tolerating bad input."""
+        if not isinstance(data, dict):
+            return cls()
+        return cls(block_id=_as_str(data.get("id")), digest=_as_str(data.get("digest")))
+
+
+@dataclass
+class LinkedItem:
+    """One ELN item (a sample, a resource, a page) linked to the experiment.
+
+    Attributes:
+        backend: The backend the item lives on.
+        item_id: The item's id there.
+        kind: ``"item"`` (a resource or sample database entry) or ``"entry"``.
+        role: What the item is to this experiment (``"sample"``): the name
+            the profile's read map uses for it.
+        title: The item's title when it was linked.
+        url: Where a human opens it.
+    """
+
+    backend: str = ""
+    item_id: str = ""
+    kind: str = "item"
+    role: str = "sample"
+    title: str = ""
+    url: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe dict representation."""
+        return {
+            "backend": self.backend,
+            "item_id": self.item_id,
+            "kind": self.kind,
+            "role": self.role,
+            "title": self.title,
+            "url": self.url,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> LinkedItem:
+        """Build a ``LinkedItem`` from a parsed dict, tolerating bad input."""
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            backend=_as_str(data.get("backend")),
+            item_id=_as_str(data.get("item_id")),
+            kind=_as_str(data.get("kind"), "item"),
+            role=_as_str(data.get("role"), "sample"),
+            title=_as_str(data.get("title")),
+            url=_as_str(data.get("url")),
+        )
+
+
+@dataclass
+class ElnBinding:
+    """How one experiment is connected to its ONE notebook page.
+
+    Written when the experiment is linked (at start, or later), and only by
+    the ``ExperimentManager``. The page belongs to the experiment; runs get no
+    page of their own. Publishing appends sections to it.
+
+    Attributes:
+        account_id: The user's ELN account (per-user settings) the page is
+            reached through.
+        connector: The connector block, pinned.
+        renderer: The renderer block, pinned.
+        profile: The profile block, pinned; a copy is kept in the
+            experiment's ``eln/profile.yaml``.
+        template_id: The template a created page was made from.
+        entry: The page, once it exists; ``None`` while its creation is still
+            queued (``create_pending``).
+        create_pending: A new page was asked for and the backend has not
+            confirmed it yet.
+        linked_items: Samples and resources linked to the experiment.
+        field_snapshot: The last fields read back from the notebook, as
+            ``{key: {"value", "unit", "source", "fetched_utc"}}``.
+        publish_approved: A human approved publishing for this experiment;
+            every later publish appends without asking again.
+        approved_by: Who approved (a user id).
+        approved_utc: When.
+    """
+
+    account_id: str = ""
+    connector: PinnedBlock = field(default_factory=PinnedBlock)
+    renderer: PinnedBlock = field(default_factory=PinnedBlock)
+    profile: PinnedBlock = field(default_factory=PinnedBlock)
+    template_id: str = ""
+    entry: ElnLink | None = None
+    create_pending: bool = False
+    linked_items: list[LinkedItem] = field(default_factory=list)
+    field_snapshot: dict[str, Any] = field(default_factory=dict)
+    publish_approved: bool = False
+    approved_by: str = ""
+    approved_utc: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe dict representation."""
+        return {
+            "account_id": self.account_id,
+            "connector": self.connector.to_dict(),
+            "renderer": self.renderer.to_dict(),
+            "profile": self.profile.to_dict(),
+            "template_id": self.template_id,
+            "entry": self.entry.to_dict() if self.entry else None,
+            "create_pending": self.create_pending,
+            "linked_items": [item.to_dict() for item in self.linked_items],
+            "field_snapshot": dict(self.field_snapshot),
+            "publish_approved": self.publish_approved,
+            "approved_by": self.approved_by,
+            "approved_utc": self.approved_utc,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> ElnBinding:
+        """Build an ``ElnBinding`` from a parsed dict, tolerating bad input."""
+        if not isinstance(data, dict):
+            return cls()
+        raw_items = data.get("linked_items")
+        return cls(
+            account_id=_as_str(data.get("account_id")),
+            connector=PinnedBlock.from_dict(data.get("connector")),
+            renderer=PinnedBlock.from_dict(data.get("renderer")),
+            profile=PinnedBlock.from_dict(data.get("profile")),
+            template_id=_as_str(data.get("template_id")),
+            entry=ElnLink.from_dict(data["entry"]) if isinstance(data.get("entry"), dict) else None,
+            create_pending=_as_bool(data.get("create_pending"), False),
+            linked_items=(
+                [LinkedItem.from_dict(item) for item in raw_items if isinstance(item, dict)]
+                if isinstance(raw_items, list)
+                else []
+            ),
+            field_snapshot=_as_dict(data.get("field_snapshot")),
+            publish_approved=_as_bool(data.get("publish_approved"), False),
+            approved_by=_as_str(data.get("approved_by")),
+            approved_utc=_as_str(data.get("approved_utc")),
         )
 
 
@@ -291,24 +453,18 @@ class RunRecord:
         finished_utc: ISO 8601 end time; empty while running.
         status: ``running`` → ``done`` / ``failed`` / ``aborted``.
         reason: Error text for a failed run; empty otherwise.
-        published: Whether this run has been mirrored to the ELN entry yet
-            (written by the publishing track).
-        eln_link: The ELN entry this run was published to, or ``None`` while
-            it is unpublished. Written once, by the publisher, after the
-            backend confirms the entry — so a run that carries a link really
-            is in the notebook. One run maps to one entry (see the **Outbox**
-            and `session/eln/README.md`); the experiment-level ``eln_link`` on
-            ``ExperimentRecord`` is a separate, coarser link.
-        pending_eln_draft: A **draft entry** awaiting a human's approval, as
-            its JSON dict (``session/eln/drafting.py``'s
-            ``DraftEntry.to_dict()``), or ``{}`` when none is pending. Written
-            when an agent drafts an entry for an ATTENDED experiment, where
-            publishing is the human's to authorise: the draft is parked here
-            and ``ExperimentManager.approve_eln_draft()`` is what enqueues it.
-            Deliberately NOT a ``SCHEMA_VERSION`` bump — a pending draft is an
-            unapproved proposal that can be redrawn at any time, so an older
-            app dropping one on resave loses nothing authoritative, which is
-            the only thing that rule protects.
+        published: Whether this run has been published to the experiment's
+            notebook page yet (a section covering it was appended).
+        eln_link: The per-run ELN entry an OLDER version of I2AS created for
+            this run, kept as history and linked from the run's section on
+            the experiment's page. New runs never get one.
+        selected_bundle: The id of the **analysis bundle** that represents
+            this run when it is published, or ``""`` when none is selected
+            (the run is then published from its facts). Chosen by the
+            analysis stage (the latest completed recipe bundle) or by
+            ``select_analysis_bundle``; it knows nothing about any notebook.
+        eln_publish: The last publish covering this run, as
+            ``{"publish_id", "published_utc", "bundle_id"}``, or ``{}``.
     """
 
     run_id: str = ""
@@ -325,7 +481,8 @@ class RunRecord:
     reason: str = ""
     published: bool = False
     eln_link: ElnLink | None = None
-    pending_eln_draft: dict[str, Any] = field(default_factory=dict)
+    selected_bundle: str = ""
+    eln_publish: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict representation."""
@@ -344,7 +501,8 @@ class RunRecord:
             "reason": self.reason,
             "published": self.published,
             "eln_link": self.eln_link.to_dict() if self.eln_link else None,
-            "pending_eln_draft": dict(self.pending_eln_draft),
+            "selected_bundle": self.selected_bundle,
+            "eln_publish": dict(self.eln_publish),
         }
 
     @classmethod
@@ -383,7 +541,8 @@ class RunRecord:
                 if isinstance(data.get("eln_link"), dict)
                 else None
             ),
-            pending_eln_draft=_as_dict(data.get("pending_eln_draft")),
+            selected_bundle=_as_str(data.get("selected_bundle")),
+            eln_publish=_as_dict(data.get("eln_publish")),
         )
 
 
@@ -414,7 +573,8 @@ class ExperimentRecord:
             (``envelope_to_dict()``); ``{}`` means no envelope.
         runs: The experiment's runs, oldest first.
         findings: Free-text science notes (markdown).
-        eln_link: The ELN entry this experiment publishes to, or ``None``.
+        eln: The experiment's notebook binding (``ElnBinding``): which page
+            it publishes to and how. ``None`` while it is not linked.
         queue: The GUI's run queue, as opaque JSON dicts. The session layer
             stores and round-trips this list but never interprets it — the
             GUI (``gui.form_autosave.QueueItemState``) is the only place that
@@ -439,7 +599,7 @@ class ExperimentRecord:
     envelope: dict[str, Any] = field(default_factory=dict)
     runs: list[RunRecord] = field(default_factory=list)
     findings: str = ""
-    eln_link: ElnLink | None = None
+    eln: ElnBinding | None = None
     queue: list[dict[str, Any]] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
 
@@ -465,7 +625,7 @@ class ExperimentRecord:
             "envelope": dict(self.envelope),
             "runs": [run.to_dict() for run in self.runs],
             "findings": self.findings,
-            "eln_link": self.eln_link.to_dict() if self.eln_link else None,
+            "eln": self.eln.to_dict() if self.eln else None,
             "queue": [dict(item) for item in self.queue],
             "schema_version": SCHEMA_VERSION,
         }
@@ -488,8 +648,13 @@ class ExperimentRecord:
             if isinstance(raw_runs, list)
             else []
         )
+        raw_binding = data.get("eln")
+        eln = ElnBinding.from_dict(raw_binding) if isinstance(raw_binding, dict) else None
         raw_link = data.get("eln_link")
-        eln_link = ElnLink.from_dict(raw_link) if isinstance(raw_link, dict) else None
+        if eln is None and isinstance(raw_link, dict) and raw_link.get("entry_id"):
+            # Schema 2 kept a bare experiment-level link; it becomes the
+            # binding's page, with no account yet (the user re-links it).
+            eln = ElnBinding(entry=ElnLink.from_dict(raw_link))
         return cls(
             experiment_id=_as_str(data.get("experiment_id")),
             title=_as_str(data.get("title")),
@@ -503,7 +668,7 @@ class ExperimentRecord:
             envelope=_as_dict(data.get("envelope")),
             runs=runs,
             findings=_as_str(data.get("findings")),
-            eln_link=eln_link,
+            eln=eln,
             queue=_as_dict_list(data.get("queue")),
             # Absent on disk means "today's files" — version 1, not whatever
             # SCHEMA_VERSION the running app happens to define.

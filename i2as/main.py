@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QApplication
 from i2as.core.config_catalog import ConfigCatalog
 from i2as.core.instrument_host import InstrumentHost, resolve_mode
 from i2as.core.logging_config import setup_logging
-from i2as.core.paths import measurement_root
+from i2as.core.paths import measurement_root, user_config_dir
 from i2as.core.request_spool import RequestSpool
 from i2as.core.config import (
     read_gateway_config,
@@ -33,9 +33,11 @@ from i2as.gui import app_settings
 from i2as.gui.monitor_window import MonitorWindow
 from i2as.gui.theme import PLOT_AXIS, PLOT_BG, build_stylesheet
 from i2as.session.agent_feed import AgentFeed
-from i2as.session.eln.publisher import ElnPublisher
+from i2as.session.analysis_trigger import AnalysisTrigger
+from i2as.session.credentials import SCOPE_ASSISTANT, CredentialStore, credential_key
+from i2as.session.eln import BlockCatalog, ElnService
 from i2as.session.gateway import authorize_spooled
-from i2as.session.eln.settings import load_eln_settings
+from i2as.session.user_profile import UserProfileStore
 from i2as.session.gateway import (
     GatewayController,
     GatewayServer,
@@ -199,25 +201,31 @@ def _resolve_active_session(store: SessionStore) -> Path:
 def gateway_tool_context(
     session_manager: Any,
     run_catalog: Mapping[str, type],
-    publisher: Any | None,
     analysis_runner: Any | None,
+    config_store: Any | None = None,
+    draft_client: Any | None = None,
+    assistant_settings: Any | None = None,
 ) -> ToolContext:
     """Build the ``ToolContext`` every gateway connection answers session tools from.
 
     One construction, so the socket server, the HTTP endpoint and the
     embedded analyst all hand an agent the same collaborators: the
-    experiment layer, the run catalog, the ELN publisher
-    (``stage_analysis_result``, ``publish_eln_entry``, the per-procedure
-    recipe preference) and the analysis runner (``run_analysis``,
-    ``run_analysis_script``). A collaborator left out here is a tool every
-    agent is refused, which is why this is a function a test can call.
+    experiment layer, the run catalog, the analysis runner (``run_analysis``,
+    ``run_analysis_script``), the general settings (the per-procedure recipe
+    preference and ``read_settings``) and — when the user switched drafting
+    on — the drafting model. No notebook collaborator is ever handed to an
+    agent: the notebook is the operator's. A collaborator left out here is a
+    tool every agent is refused, which is why this is a function a test can
+    call.
 
     Args:
         session_manager: The session layer's experiment façade.
         run_catalog: The procedures a run may name.
-        publisher: The ``ElnPublisher``, or ``None`` when there is none.
         analysis_runner: The ``AnalysisRunner``, or ``None`` when the build
             has no analysis stage.
+        config_store: The ``AppConfigStore``, or ``None``.
+        draft_client: The **Draft client**, or ``None`` (drafting off).
+        assistant_settings: The drafting settings, or ``None``.
 
     Returns:
         The context.
@@ -225,9 +233,39 @@ def gateway_tool_context(
     return ToolContext(
         experiments=session_manager,
         run_catalog=run_catalog,
-        publisher=publisher,
         analysis_runner=analysis_runner,
+        analysis_settings=config_store.analysis if config_store is not None else None,
+        settings_source=(lambda: config_store.current) if config_store is not None else None,
+        draft_client=draft_client,
+        assistant_settings=assistant_settings,
     )
+
+
+def build_draft_client(profiles: UserProfileStore, credentials: CredentialStore, user_id: str) -> tuple[Any | None, Any | None]:
+    """Build the drafting model the user switched on, or nothing.
+
+    Args:
+        profiles: The user profile store.
+        credentials: The credential store (the model key is the user's own).
+        user_id: The logged-in user.
+
+    Returns:
+        ``(client, settings)``; ``(None, settings)`` when drafting is off or
+        the client cannot be built (logged).
+    """
+    from dataclasses import replace
+
+    from i2as.session.drafting import AnthropicDraftClient, DraftError
+
+    settings = profiles.load(user_id).assistant
+    if not settings.enabled:
+        return None, settings
+    key = credentials.get(credential_key(SCOPE_ASSISTANT, "default", user_id))
+    try:
+        return AnthropicDraftClient(replace(settings, api_key=key)), settings
+    except DraftError as exc:
+        logger.warning("Drafting is switched on but unavailable: %s", exc)
+        return None, settings
 
 
 class ExperimentFeeds:
@@ -550,7 +588,14 @@ def main(
     # Session). The user roster lives at measurement_root()/"users.json".
     roster = UserRoster(measurement_root() / "users.json")
     _ensure_guest_user_registered(roster)
-    session_store = SessionStore(measurement_root())
+    # Per-user state (i2as.session.user_profile): each person's notebook
+    # accounts, drafting assistant and session list live in their own
+    # profile, and their API keys in the system keyring. The session list is
+    # read through the logged-in user's profile.
+    credentials = CredentialStore()
+    profiles = UserProfileStore(credentials=credentials)
+    user_id = app_settings.current_user_id() or GUEST_USER_ID
+    session_store = SessionStore(measurement_root(), registry=profiles.session_registry(user_id))
     session_folder = _resolve_active_session(session_store)
     session_manager = ExperimentManager(
         store=ExperimentStore(session_folder),
@@ -591,13 +636,14 @@ def main(
     # second writer to the bus. Wired here because this is the one place that
     # owns both the proxy and the session layer; attached to `app` so its
     # ownership is explicit, like every other QObject built in main().
-    # The Connections menu (i2as/gui/monitor_window.py, i2as/gui/connections_dialog.py)
+    # The Settings dialog's Connections page (i2as/gui/connections_page.py)
     # is what lets an operator turn this on/off and pick the role at runtime,
     # without an edit-and-restart — but monitor.yaml's gateway_max_role stays
-    # the one thing that menu cannot raise: it is the ceiling GatewayController
+    # the one thing that page cannot raise: it is the ceiling GatewayController
     # enforces (see controller.py's module docstring), read once here and never
-    # re-read from the menu. gateway_server / gateway_max_role in QSettings (set
-    # only by that menu) override monitor.yaml's own defaults for whether the
+    # re-read from the page. gateway_enabled / gateway_max_role in the settings
+    # file's connections section (set only by that page) override
+    # monitor.yaml's own defaults for whether the
     # door starts open and which role — up to the ceiling — walks through it;
     # absent that, monitor.yaml's own values seed the very first launch.
     gateway_config = read_gateway_config(used_path)
@@ -627,52 +673,45 @@ def main(
             gateway_role = candidate_role
 
 
-    # Read once and shared with the publisher below: the drafting model,
-    # key, token cap and price table live in the same user-level settings
-    # file the notebook's do, and two reads could disagree.
-    eln_settings = load_eln_settings()
+    # The general settings file (i2as/session/app_config.py): ONE store shared
+    # by the analysis runner, the notebook service, the gateway and the
+    # Settings dialog, so a change saved there is what the next run uses.
+    config_store = app_settings.config_store()
 
-    # ELN publishing (i2as/session/eln/): entirely opt-in and entirely
-    # GUI-side. With no user-level settings file — the default — the
-    # publisher is built, finds nothing configured, and does nothing: the
-    # drain timer never starts and on_run_finished() returns immediately, so
-    # a setup that has no notebook carries no footprint. The timer lives HERE,
-    # in the application entry point, rather than in the Orchestrator, for the
-    # same reason all network I/O does: it must never share the tick that
-    # writes to hardware. Attached to `app` so its ownership is explicit — a QObject with no Python reference is eligible
-    # for GC regardless of Qt-side parenting.
-    app.eln_publisher = ElnPublisher(session_manager, eln_settings)
-    orchestrator.run_finished.connect(app.eln_publisher.on_run_finished)
-    # The other direction of the same seam: the manager holds the publisher so
-    # that approving a **draft entry** parked on a run record can queue it.
-    session_manager.attach_eln_publisher(app.eln_publisher)
-    app.eln_publisher.start()
-
-    # Analysis before the notebook: with analysis on, a finished run is
-    # analysed by a recipe in its OWN process first, and the entry that
-    # analysis produced waits on the run for a human's approval in the eLab
-    # tab. The runner lives here beside the publisher for the same reason the
-    # drain timer does — a recipe is user code that may take seconds, so it
-    # belongs on the client side of the control contract, never on the tick.
+    # Analysis (tier 3): a finished run is analysed in its own container when
+    # the analysis settings say so, decided by the analysis layer alone. The
+    # runner seals what the worker leaves into an analysis bundle and selects
+    # a completed recipe bundle; it knows nothing about any notebook.
     app.analysis_runner = None
     try:
         from i2as.session.analysis_runner import AnalysisRunner
     except ImportError:
         logger.warning("This build has no analysis runner — analysis stays off")
     else:
-        app.analysis_runner = AnalysisRunner(
-            session_manager,
-            app.eln_publisher,
-            lambda: app.eln_publisher.settings,
-        )
-        requested = getattr(app.eln_publisher, "analysis_requested", None)
-        if requested is not None:
-            requested.connect(app.analysis_runner.start)
+        app.analysis_runner = AnalysisRunner(session_manager, config_store.analysis)
+        app.analysis_trigger = AnalysisTrigger(session_manager, app.analysis_runner, config_store.analysis)
+        orchestrator.run_finished.connect(app.analysis_trigger.on_run_finished)
 
-    # The gateway is built AFTER the publisher and the analysis runner, so
-    # every agent connection is handed the same collaborators the GUI
-    # uses: an MCP client and the embedded analyst see one tool surface
-    # that can actually analyse, stage and publish.
+    # The notebook service (i2as/session/eln/): the bridge from analysis
+    # bundles to each experiment's ONE notebook page. Every notebook call runs
+    # on the service's own worker thread, in the block's helper process —
+    # never on the GUI thread, never near the instrument thread — and with
+    # publishing switched off in the user's profile it sends nothing.
+    app.eln_service = ElnService(
+        session_manager,
+        profiles,
+        credentials,
+        publishing=config_store.publishing,
+        catalog=BlockCatalog(user_config_dir() / "blocks"),
+    )
+    app.eln_service.start()
+    app.aboutToQuit.connect(app.eln_service.stop)
+    draft_client, assistant_settings = build_draft_client(profiles, credentials, user_id)
+
+    # The gateway is built AFTER the analysis runner, so every agent
+    # connection is handed the same collaborators the GUI uses: an MCP client
+    # and the embedded analyst see one tool surface that can actually analyse
+    # and choose a run's bundle. The notebook is not among them.
     # One attached feed per experiment, shared by every connection (see
     # ExperimentFeeds). Owned by the app so its lifetime is explicit.
     app.experiment_feeds = ExperimentFeeds(session_manager, orchestrator)
@@ -680,7 +719,12 @@ def main(
         orchestrator,
         station_info=station.station_info,
         tool_context=gateway_tool_context(
-            session_manager, run_catalog, app.eln_publisher, app.analysis_runner
+            session_manager,
+            run_catalog,
+            app.analysis_runner,
+            config_store,
+            draft_client,
+            assistant_settings,
         ),
         feed=app.experiment_feeds.current,
         ceiling=gateway_ceiling,
@@ -715,8 +759,10 @@ def main(
         active_config_path=used_path,
         startup_warning="; ".join(warnings) if warnings else None,
         session_manager=session_manager,
-        eln_publisher=app.eln_publisher,
+        eln_service=app.eln_service,
         analysis_runner=app.analysis_runner,
+        user_profiles=profiles,
+        credentials=credentials,
         session_store=session_store,
         panels_config=read_panels_config(used_path),
         mirror=mirror,

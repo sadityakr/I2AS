@@ -1514,24 +1514,26 @@ def test_start_experiment_updates_panel_and_manager(monitor_win_session, session
     assert "J. Doe" in panel._experiment_status_label.text()
     assert panel._attended_checkbox.isVisible()
     assert panel._attended_checkbox.isChecked()
-    assert "not configured" in panel._eln_status_label.text()
+    assert "No notebook page" in panel._eln_status_label.text()
 
 
-def test_eln_status_shows_published_url_when_eln_link_set(
+def test_eln_status_shows_the_linked_notebook_page(
     monitor_win_session, session_manager, monkeypatch
 ):
-    """Once ElnLink carries a url, the panel reflects it instead of the placeholder."""
-    from i2as.session.models import ElnLink
+    """Once the experiment is linked to its page, the panel names it."""
+    from i2as.session.models import ElnBinding, ElnLink
 
     _stub_start_dialog(monkeypatch, "Hall bar A3", "jdoe")
     panel = monitor_win_session._session_info
     panel._start_close_btn.click()
 
-    experiment = session_manager.current_experiment()
-    experiment.eln_link = ElnLink(backend="elabftw", entry_id="42", url="https://elab.example/42")
-    session_manager.experiment_changed.emit(experiment.to_dict())
-
-    assert panel._eln_status_label.text() == "Published: https://elab.example/42"
+    session_manager.link_eln(ElnBinding(account_id="lab", create_pending=True))
+    assert panel._eln_status_label.text() == "Notebook page being created…"
+    session_manager.set_eln_entry(
+        session_manager.current_experiment().experiment_id,
+        ElnLink(backend="elabftw", entry_id="42", url="https://elab.example/42"),
+    )
+    assert panel._eln_status_label.text() == "Notebook page: https://elab.example/42"
 
 
 def test_close_experiment_saves_findings_and_resets_panel(
@@ -1550,7 +1552,7 @@ def test_close_experiment_saves_findings_and_resets_panel(
     assert panel._start_close_btn.text() == "Start Experiment…"
     assert panel._experiment_status_label.text() == "No experiment open"
     assert not panel._attended_checkbox.isVisible()
-    assert "not configured" in panel._eln_status_label.text()
+    assert "No notebook page" in panel._eln_status_label.text()
     closed = session_manager.store.load(experiment_id)
     assert closed.findings == "Saw a clean switching signal."
     assert closed.status == "closed"
@@ -3108,8 +3110,8 @@ def test_procedure_quadrant_splitters_correctly_oriented(procedure_win):
     assert procedure_win._right_splitter.widget(1) is procedure_win._plot2
 
 
-def test_procedure_right_quadrant_has_the_queue_and_elab_tabs(procedure_win):
-    """The top-right quadrant is a two-tab widget, Queue first, eLab second.
+def test_procedure_right_quadrant_has_the_queue_and_analysis_tabs(procedure_win):
+    """The top-right quadrant is a two-tab widget, Queue first, Analysis second.
 
     The Queue tab still holds exactly what the quadrant always held (the
     queue-over-status splitter), so nothing that used to be found by name in
@@ -3119,24 +3121,25 @@ def test_procedure_right_quadrant_has_the_queue_and_elab_tabs(procedure_win):
 
     tabs = procedure_win.findChild(QTabWidget, "right_tabs")
     assert tabs is not None
-    assert [tabs.tabText(i) for i in range(tabs.count())] == ["Queue", "eLab"]
+    assert [tabs.tabText(i) for i in range(tabs.count())] == ["Queue", "Analysis"]
     assert tabs.widget(0).findChild(QSplitter, "queue_status_splitter") is not None
     assert tabs.widget(0).findChild(QTextEdit, "status_log") is not None
     assert tabs.widget(1).objectName() == "analysis_panel"
 
 
-def test_procedure_window_builds_with_no_elab_collaborators(procedure_win):
-    """Built with no session layer, the eLab tab says so and offers nothing."""
+def test_procedure_window_builds_with_no_analysis_collaborators(procedure_win):
+    """Built with no session layer, the Analysis tab says so and offers nothing."""
     from i2as.gui.analysis_panel import NO_SESSION_TEXT
 
     panel = procedure_win.findChild(QWidget, "analysis_panel")
     assert panel is not None
     assert panel.findChild(QLabel, "analysis_status_label").text() == NO_SESSION_TEXT
-    assert not panel.findChild(QPushButton, "analysis_publish_btn").isEnabled()
+    assert not panel.findChild(QPushButton, "notebook_publish_btn").isEnabled()
+    assert not panel.findChild(QPushButton, "notebook_link_btn").isEnabled()
 
 
-def test_procedure_run_finished_points_the_elab_tab_at_that_run(procedure_win):
-    """A finished run reaches the eLab tab through the window's own slot."""
+def test_procedure_run_finished_points_the_analysis_tab_at_that_run(procedure_win):
+    """A finished run reaches the Analysis tab through the window's own slot."""
     seen = []
     procedure_win._analysis_panel.on_run_finished = seen.append
     procedure_win._orchestrator.run_finished.emit({"run_id": "run_042"})
@@ -3702,10 +3705,13 @@ def _catalog(tmp_path):
     return ConfigCatalog(_app_settings.shipped_config_dir(), tmp_path / "user")
 
 
-def test_monitor_menu_bar_is_user_procedures_and_connections_only(monitor_win):
-    """The operator menu bar is exactly User + Procedures + Connections."""
+def test_monitor_menu_bar_is_user_procedures_and_settings_only(monitor_win):
+    """The operator menu bar is exactly User + Procedures + Settings."""
     titles = [a.text() for a in monitor_win.menuBar().actions()]
-    assert titles == ["User", "Procedures", "Connections"]
+    assert titles == ["User", "Procedures", "Settings"]
+    settings_menu = monitor_win.menuBar().actions()[2].menu()
+    labels = [a.text() for a in settings_menu.actions() if a.text()]
+    assert labels == ["Settings…", "Connections…", "Analysis…", "Electronic notebook…"]
 
 
 def test_instrument_info_lives_in_the_user_menu(monitor_win):

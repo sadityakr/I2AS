@@ -16,36 +16,38 @@ and further requests wait in a FIFO queue, for the same reason the **Outbox**
 drains one job per firing: a slow analysis delays the next analysis, never the
 GUI's next turn.
 
-**Every ending produces an entry.** A report that ran becomes an **analysed
-entry** through ``ElnPublisher.export_report()``; a recipe that raised, a
-worker that timed out, one that never wrote a report, one that was cancelled
-— each becomes a `failed` report, and the publisher parks the facts-only
-entry instead (``park_facts_entry()``), carrying the reason. A run is never
-silently left with nothing waiting for its human.
+**Every ending produces a bundle.** Each analysis writes into a folder of its
+own, and when the worker ends — a report, a raising recipe, a timeout, a
+missing report, a cancellation — the application SEALS that folder into an
+**analysis bundle** (``i2as.analysis.bundle``): the worker's files hashed and
+listed, its report parsed and capped, a ``failed`` status with the reason when
+there was no usable report. The worker never writes the manifest itself.
 
-Both hand-offs PARK; neither publishes. Approval stays exactly where it was,
-``ExperimentManager.approve_eln_draft()``.
+**The runner knows no notebook.** A completed recipe bundle becomes the run's
+**selected bundle** (``ExperimentManager.select_bundle``) and is announced on
+``bundle_ready``; what happens to it next — a preview, a publish — is decided
+elsewhere, from the bundle alone.
 
-**An analysis script parks nothing.** ``start_script()`` runs one
+**An analysis script selects nothing.** ``start_script()`` runs one
 exploratory **analysis script** (``i2as.analysis.scripts``) over one run, in
-the same worker and the same queue, but writes into the script's own folder
-and announces its answer on ``script_finished`` only. Whether its result
-becomes the run's pending entry is a separate, explicit decision
-(``stage_analysis_result``), so exploring a run never replaces what a human
-is about to approve.
+the same worker and the same queue, into the script's own folder, sealed as
+the bundle ``script-<script_id>``. Whether it represents the run is a
+separate, explicit decision (``select_analysis_bundle``), so exploring a run
+never replaces what it already stands for.
 
-**Where the worker runs is the sandbox's decision** (``analysis_sandbox``):
-the settings' ``analysis.sandbox`` names a backend, which stages the spec's
-inputs when the analysis is started and plans the worker's program,
-environment and working directory when it is launched. A backend that
-cannot run the worker is a ``failed`` report naming why.
+**Every worker runs in a container** (``analysis_sandbox``): the settings'
+``analysis.sandbox`` names the engine and the image; the sandbox maps the
+spec's paths into the container when the analysis is started, and plans the
+``<engine> run`` command — and the command that stops it — when it is
+launched. No engine, no image, or an unmountable path is a ``failed`` report
+naming why. Tests hand in a ``sandbox_factory`` that runs the worker as a
+plain child process instead.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +55,15 @@ from typing import Any
 
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
+from i2as.analysis.bundle import (
+    PRODUCER_RECIPE,
+    PRODUCER_SCRIPT,
+    BundleInput,
+    Producer,
+    new_bundle_id,
+    script_bundle_id,
+    seal_bundle,
+)
 from i2as.analysis.report import (
     REPORT_FAILED,
     REPORT_FILENAME,
@@ -67,9 +78,9 @@ from i2as.session.analysis_sandbox import (
     SandboxError,
     build_sandbox,
 )
-from i2as.session.eln.drafting import manifest_from_run
-from i2as.session.eln.settings import ElnSettings
+from i2as.session.app_config import AnalysisSettings, SandboxSettings
 from i2as.session.manager import ExperimentManager
+from i2as.session.run_facts import manifest_from_run
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +103,11 @@ class _Request:
         sandbox: The backend that staged this analysis's inputs and will
             launch its worker.
         script_id: The **analysis script** this request runs, or ``""`` for a
-            recipe analysis. A script's report is never parked.
+            recipe analysis. A script's bundle is never selected here.
+        bundle_id: The bundle this analysis is sealed as.
+        experiment_id: The experiment the run belongs to.
+        inputs: The run's identity, stamped into the bundle.
+        actor: Who asked for the analysis.
     """
 
     run_id: str
@@ -101,63 +116,64 @@ class _Request:
     output_dir: Path
     sandbox: AnalysisSandbox
     script_id: str = ""
+    bundle_id: str = ""
+    experiment_id: str = ""
+    inputs: tuple[BundleInput, ...] = ()
+    actor: str = ""
 
 
 class AnalysisRunner(QObject):
-    """Runs one analysis worker at a time and hands its report to the publisher.
+    """Runs one analysis worker at a time and seals what it leaves as a bundle.
 
     Signals:
         analysis_started (str): The run id, when its worker actually starts.
         analysis_finished (str, dict): The run id and the report as its JSON
             dict, when a recipe ran to completion.
         analysis_failed (str, str): The run id and the failure text, for every
-            other ending — a raising recipe, a timeout, a missing report, a
-            cancellation.
+            other ending of a recipe analysis — a raising recipe, a timeout, a
+            missing report, a cancellation.
         script_finished (str, str, dict): The run id, the script id and the
             report as its JSON dict, for EVERY ending of an analysis script —
-            ok or failed. The three signals above are never emitted for a
-            script, so the eLab tab only ever hears about the run's recipe.
+            ok or failed. The two signals above are never emitted for a
+            script, so the analysis tab only ever hears about the run's recipe.
+        bundle_ready (str, str, dict): The run id, the bundle id and the
+            sealed bundle as its JSON dict, for EVERY ending, recipe or script.
     """
 
     analysis_started = pyqtSignal(str)
     analysis_finished = pyqtSignal(str, dict)
     analysis_failed = pyqtSignal(str, str)
     script_finished = pyqtSignal(str, str, dict)
+    bundle_ready = pyqtSignal(str, str, dict)
 
     def __init__(
         self,
         manager: ExperimentManager,
-        publisher: Any,
-        settings_source: Callable[[], ElnSettings],
-        python: str = sys.executable,
+        settings_source: Callable[[], AnalysisSettings],
+        sandbox_factory: Callable[[SandboxSettings], AnalysisSandbox] = build_sandbox,
         parent: QObject | None = None,
     ) -> None:
-        """Wire the runner to the session layer and the publisher.
+        """Wire the runner to the session layer.
 
         Args:
             manager: The session-layer façade — the open experiment, the run
-                records, the store paths and the experiment context a spec is
-                built from.
-            publisher: The ELN publisher, duck-typed on
-                ``export_report(run_id, report, report_dir)`` and
-                ``park_facts_entry(run_id, warning)``. Never imported as a
-                type here, so a test can hand in a stand-in.
-            settings_source: Called for the current ``ElnSettings`` at the
-                moment each analysis starts, so a settings change reaches the
-                next run without re-wiring anything.
-            python: The interpreter the ``local`` sandbox starts the worker
-                with. Defaults to the running one, which is what makes the
-                worker see the same installed I2AS; the ``venv`` sandbox uses
-                its own configured interpreter instead.
+                records, the store paths, the experiment context a spec is
+                built from, and the one writer of the run's bundle selection.
+            settings_source: Called for the current ``AnalysisSettings`` at
+                the moment each analysis starts, so a settings change reaches
+                the next run without re-wiring anything.
+            sandbox_factory: Builds the sandbox one analysis runs in from the
+                ``analysis.sandbox`` settings. The default is the container;
+                tests pass one that returns a ``SubprocessSandbox``.
             parent: Qt parent, if any.
         """
         super().__init__(parent)
         self._manager = manager
-        self._publisher = publisher
         self._settings_source = settings_source
-        self._python = python
+        self._sandbox_factory = sandbox_factory
         self._queue: list[_Request] = []
         self._active: _Request | None = None
+        self._stop_command: tuple[str, ...] = ()
         self._process: QProcess | None = None
         self._failure: str = ""
         self._timer = QTimer(self)
@@ -214,6 +230,7 @@ class AnalysisRunner(QObject):
         data_path: str = "",
         recipe: str = "",
         options: Mapping[str, Any] | None = None,
+        actor: str = "",
     ) -> str:
         """Analyse one recorded run, later. Never blocks and never raises.
 
@@ -231,14 +248,22 @@ class AnalysisRunner(QObject):
             recipe: The recipe ``name`` to run. ``""`` falls back to the
                 settings' per-procedure preference, then to discovery.
             options: Free-form recipe options, passed through to the report.
+            actor: Who asked (an agent id, ``"operator"``), stamped into the
+                bundle; ``""`` for the automatic analysis of a finished run.
 
         Returns:
-            The report directory as a string, or ``""`` when the analysis
-            could not be started: no experiment open, no such run, or no data
-            file to read (all logged, never raised).
+            The new bundle's folder as a string (its name is the bundle id),
+            or ``""`` when the analysis could not be started: no experiment
+            open, no such run, or no data file to read (all logged, never
+            raised).
         """
         return self._enqueue(
-            run_id, manifest=manifest, data_path=data_path, recipe=recipe, options=options
+            run_id,
+            manifest=manifest,
+            data_path=data_path,
+            recipe=recipe,
+            options=options,
+            actor=actor,
         )
 
     def start_script(
@@ -247,12 +272,14 @@ class AnalysisRunner(QObject):
         script_id: str,
         script_path: str | Path,
         options: Mapping[str, Any] | None = None,
+        actor: str = "",
     ) -> str:
         """Run one **analysis script** over one recorded run, later. Never raises.
 
-        The script's folder (``script_path``'s parent) is its output folder:
-        its spec, report, figures and captured output are written there, and
-        the answer arrives on ``script_finished``. Nothing is parked.
+        The script's folder (``script_path``'s parent) is its output folder
+        and its bundle (``script-<script_id>``): its spec, report, figures and
+        captured output are written there, and the answer arrives on
+        ``script_finished``. Nothing is selected.
 
         Args:
             run_id: The run to analyse, in the open experiment.
@@ -260,6 +287,7 @@ class AnalysisRunner(QObject):
                 ``script_finished`` use.
             script_path: The script file, already written into its folder.
             options: Free-form options, passed through to the script.
+            actor: Who asked, stamped into the bundle.
 
         Returns:
             The script's output folder as a string, or ``""`` when nothing
@@ -272,6 +300,7 @@ class AnalysisRunner(QObject):
             script_id=script_id,
             script_path=path,
             output_dir=path.parent,
+            actor=actor,
         )
 
     def _enqueue(
@@ -285,6 +314,7 @@ class AnalysisRunner(QObject):
         script_id: str = "",
         script_path: Path | None = None,
         output_dir: Path | None = None,
+        actor: str = "",
     ) -> str:
         """Build, stage and write one spec, then queue its worker.
 
@@ -296,8 +326,9 @@ class AnalysisRunner(QObject):
             options: Options passed through.
             script_id: The script's id, or ``""`` for a recipe analysis.
             script_path: The script file, for a script analysis.
-            output_dir: Where the worker writes; ``None`` for the run's
-                report directory.
+            output_dir: Where the worker writes; ``None`` for a new bundle
+                folder under the run's analysis folder.
+            actor: Who asked.
 
         Returns:
             The output folder as a string, or ``""`` when nothing was queued.
@@ -318,11 +349,15 @@ class AnalysisRunner(QObject):
         settings = self._settings_source()
         facts = {**manifest_from_run(run), **dict(manifest or {})}
         chosen = "" if script_path is not None else (
-            recipe or settings.analysis.recipes.get(str(facts.get("procedure", "")), "")
+            recipe or settings.recipes.get(str(facts.get("procedure", "")), "")
         )
+        if script_path is not None:
+            bundle_id = script_bundle_id(script_id)
+        else:
+            bundle_id = new_bundle_id(chosen or "analysis")
         if output_dir is None:
-            output_dir = self._manager.store.report_dir(experiment.experiment_id, run_id)
-        sandbox = build_sandbox(settings.analysis.sandbox, default_python=self._python)
+            output_dir = self._manager.store.report_dir(experiment.experiment_id, run_id) / bundle_id
+        sandbox = self._sandbox_factory(settings.sandbox)
         spec = AnalysisSpec(
             run_id=run_id,
             data_path=resolved,
@@ -333,15 +368,16 @@ class AnalysisRunner(QObject):
             recipe_dirs=tuple(self.recipe_dirs()),
             output_dir=str(output_dir),
             options=dict(options or {}),
-            include_fact_tables=settings.analysis.include_fact_tables,
-            attach_data_file=settings.analysis.attach_data_file,
+            include_fact_tables=settings.include_fact_tables,
+            attach_data_file=settings.attach_data_file,
             script_path=str(script_path) if script_path is not None else "",
         )
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-            # A stale report from an earlier analysis of this run must never be
-            # mistaken for this one's answer.
+            # A stale report or seal in a reused folder (a script run twice)
+            # must never be mistaken for this analysis's answer.
             (output_dir / REPORT_FILENAME).unlink(missing_ok=True)
+            (output_dir / "bundle.json").unlink(missing_ok=True)
             spec = sandbox.prepare(spec)
             spec_path = output_dir / SPEC_FILENAME
             spec_path.write_text(
@@ -359,6 +395,16 @@ class AnalysisRunner(QObject):
                 output_dir=output_dir,
                 sandbox=sandbox,
                 script_id=script_id,
+                bundle_id=bundle_id,
+                experiment_id=experiment.experiment_id,
+                inputs=(
+                    BundleInput(
+                        run_id=run_id,
+                        data_file=str(getattr(run, "data_file", "") or ""),
+                        params_digest=str(getattr(run, "params_digest", "") or ""),
+                    ),
+                ),
+                actor=actor,
             )
         )
         self._start_next()
@@ -367,9 +413,8 @@ class AnalysisRunner(QObject):
     def cancel(self, run_id: str = "") -> None:
         """Stop an analysis: kill its worker, or drop it from the queue.
 
-        A cancelled analysis still ends in an entry — the facts-only one —
-        because a run whose analysis was abandoned must not be left with
-        nothing waiting for its human.
+        A cancelled analysis still ends in a (failed) bundle, so the run's
+        analysis folder says what happened to it.
 
         Args:
             run_id: The run to cancel. ``""`` cancels everything in flight.
@@ -420,11 +465,12 @@ class AnalysisRunner(QObject):
         """
         self._active = request
         self._failure = ""
+        self._stop_command = plan.stop_command
         process = QProcess(self)
         process.finished.connect(self._on_finished)
         process.errorOccurred.connect(self._on_error)
         self._process = process
-        timeout_s = max(float(self._settings_source().analysis.timeout_s), 1.0)
+        timeout_s = max(float(self._settings_source().timeout_s), 1.0)
         self._timer.start(int(timeout_s * 1000))
         if plan.environment is not None:
             environment = QProcessEnvironment()
@@ -446,8 +492,14 @@ class AnalysisRunner(QObject):
             self.analysis_started.emit(request.run_id)
 
     def _kill(self) -> None:
-        """Kill the running worker, if there is one. Never waits."""
+        """Kill the running worker, if there is one. Never waits.
+
+        A container worker is stopped by name as well: killing the engine's
+        ``run`` client does not always stop the container it started.
+        """
         if self._process is not None and self._process.state() != QProcess.ProcessState.NotRunning:
+            if self._stop_command:
+                QProcess.startDetached(self._stop_command[0], list(self._stop_command[1:]))
             self._process.kill()
 
     def _on_timeout(self) -> None:
@@ -455,7 +507,7 @@ class AnalysisRunner(QObject):
         request = self._active
         if request is None:
             return
-        timeout_s = max(float(self._settings_source().analysis.timeout_s), 1.0)
+        timeout_s = max(float(self._settings_source().timeout_s), 1.0)
         self._failure = f"analysis timed out after {timeout_s:.0f} s"
         logger.warning("Analysis of run %s timed out — killing the worker", request.run_id)
         self._kill()
@@ -488,6 +540,7 @@ class AnalysisRunner(QObject):
         self._timer.stop()
         stderr = self._drain_stderr()
         self._active = None
+        self._stop_command = ()
         process, self._process = self._process, None
         if process is not None:
             process.deleteLater()
@@ -503,49 +556,87 @@ class AnalysisRunner(QObject):
         self._start_next()
 
     def _finish(self, request: _Request, report: AnalysisReport) -> None:
-        """Hand one finished analysis to the publisher and announce it.
+        """Seal one finished analysis into its bundle and announce it.
 
-        A script's report is announced on ``script_finished`` and nothing
-        else: it is never parked.
+        A completed recipe bundle becomes the run's selected bundle; a
+        script's bundle is announced on ``script_finished`` and selects
+        nothing.
 
         Args:
             request: The analysis that ended.
             report: Its report — real or synthesized.
         """
+        bundle = self._seal(request, report)
         if request.script_id:
             self.script_finished.emit(request.run_id, request.script_id, report.to_dict())
-            return
-        if report.ok:
-            self._call_publisher(
-                "export_report", request.run_id, report, str(request.output_dir)
-            )
+        elif report.ok:
+            if bundle is not None:
+                self._select(request)
             self.analysis_finished.emit(request.run_id, report.to_dict())
-            return
-        first_line = report.error.strip().splitlines()[0] if report.error.strip() else "analysis failed"
-        self._call_publisher("park_facts_entry", request.run_id, warning=first_line)
-        logger.warning("Analysis of run %s failed: %s", request.run_id, first_line)
-        self.analysis_failed.emit(request.run_id, report.error)
+        else:
+            first_line = report.error.strip().splitlines()[0] if report.error.strip() else "analysis failed"
+            logger.warning("Analysis of run %s failed: %s", request.run_id, first_line)
+            self.analysis_failed.emit(request.run_id, report.error)
+        if bundle is not None:
+            self.bundle_ready.emit(request.run_id, request.bundle_id, bundle)
 
-    def _call_publisher(self, method: str, *args: Any, **kwargs: Any) -> None:
-        """Call one publisher method, containing every failure.
-
-        The runner sits on a Qt signal path: a publisher that raises must not
-        take the event loop down with it, and must not stop the next queued
-        analysis from starting.
+    def _seal(self, request: _Request, report: AnalysisReport) -> dict[str, Any] | None:
+        """Seal the request's folder as its bundle. Never raises.
 
         Args:
-            method: The publisher method's name.
-            *args: Positional arguments.
-            **kwargs: Keyword arguments.
+            request: The analysis that ended.
+            report: The parsed, capped report (or a synthesized failure).
+
+        Returns:
+            The sealed bundle as its JSON dict, or ``None`` when the folder
+            could not be sealed (logged).
         """
-        handler = getattr(self._publisher, method, None)
-        if handler is None:
-            logger.warning("The ELN publisher offers no %s() — nothing was parked", method)
+        if request.script_id:
+            producer = Producer(
+                kind=PRODUCER_SCRIPT,
+                name=request.script_id,
+                digest=report.recipe_digest,
+                actor=request.actor,
+            )
+        else:
+            producer = Producer(
+                kind=PRODUCER_RECIPE,
+                name=report.recipe or request.recipe,
+                digest=report.recipe_digest,
+                actor=request.actor,
+            )
+        try:
+            bundle = seal_bundle(
+                request.output_dir,
+                report.to_dict(),
+                bundle_id=request.bundle_id,
+                experiment_id=request.experiment_id,
+                run_ids=(request.run_id,),
+                producer=producer,
+                inputs=request.inputs,
+            )
+        except OSError as exc:
+            logger.error("Could not seal the bundle of run %s: %s", request.run_id, exc)
+            return None
+        return bundle.to_dict()
+
+    def _select(self, request: _Request) -> None:
+        """Make a completed recipe bundle the run's selection. Never raises.
+
+        Only in the experiment the analysis was started in: a bundle that
+        finishes after the physicist switched experiments stays on disk,
+        selectable by hand, without touching the wrong record.
+
+        Args:
+            request: The analysis that completed.
+        """
+        experiment = self._manager.current_experiment()
+        if experiment is None or experiment.experiment_id != request.experiment_id:
             return
         try:
-            handler(*args, **kwargs)
-        except Exception:  # noqa: BLE001 - a notebook must never break the runner
-            logger.exception("The ELN publisher raised in %s()", method)
+            self._manager.select_bundle(request.run_id, request.bundle_id)
+        except Exception:  # noqa: BLE001 - bookkeeping must never break the runner
+            logger.exception("Selecting bundle %s for run %s failed", request.bundle_id, request.run_id)
 
     # ------------------------------------------------------------------
     # Small helpers

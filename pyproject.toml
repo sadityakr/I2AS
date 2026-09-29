@@ -21,6 +21,9 @@ dependencies = [
     "numpy>=1.24",
     "pyvisa>=1.13",
     "pyserial>=3.5",
+    # API keys for notebook accounts and the drafting model are kept in the
+    # operating system's credential store (i2as/session/credentials.py).
+    "keyring>=24",
 ]
 
 [project.scripts]
@@ -30,7 +33,7 @@ i2as-doctor = "i2as.troubleshoot.cli:main"
 i2as-mcp = "i2as.mcp.__main__:main"
 
 [project.optional-dependencies]
-# LLM drafting of ELN entries (i2as/session/eln/drafting.py). Deliberately
+# LLM drafting of analysis summaries (i2as/session/drafting.py). Deliberately
 # OPTIONAL: the whole feature is off by default, the package is imported lazily
 # when a real draft client is constructed, and every test runs against
 # FakeDraftClient - so a setup that never drafts installs nothing extra, and a
@@ -67,6 +70,14 @@ markers = [
 
 [tool.setuptools.packages.find]
 include = ["i2as*"]
+
+# The analysis image's Dockerfile ships with the package, so "Build image"
+# works from an installed I2AS, not only from a checkout.
+[tool.setuptools.package-data]
+"i2as.analysis" = ["container/Dockerfile"]
+# The shipped blocks (the eLabFTW and simulated connectors, the default
+# renderer and profile) are loaded by path, not imported as packages.
+"i2as.blocks" = ["shipped/connectors/*.py", "shipped/renderers/*.py", "shipped/profiles/*.yaml"]
 
 # ── Ruff (linter) ─────────────────────────────────────────────────────────────
 # Conservative rule set: real errors only (pyflakes F, syntax errors E9).
@@ -590,4 +601,56 @@ forbidden_modules = [
     "i2as.core.trend_checks",
     "i2as.core.trend_check_runner",
     "i2as.core.capability_manifest",
+]
+
+[[tool.importlinter.contracts]]
+name = "C25: i2as.blocks is what a user block is written against — the standard library, ruamel.yaml and the bundle schema only; never the station, the session layer, the GUI or the rest of the analysis stage"
+type = "forbidden"
+# A block runs in a helper process (python -m i2as.blocks.host) that must be
+# able to import this package alone: nothing here may pull in Qt, the engine
+# or the experiment store, so a block can reach none of them by accident.
+source_modules = ["i2as.blocks"]
+forbidden_modules = [
+    "i2as.core",
+    "i2as.drivers",
+    "i2as.virtual_instruments",
+    "i2as.procedures",
+    "i2as.session",
+    "i2as.gui",
+    "i2as.main",
+    "i2as.troubleshoot",
+    "i2as.ctl",
+    "i2as.mcp",
+    "i2as.analysis.base",
+    "i2as.analysis.discovery",
+    "i2as.analysis.report",
+    "i2as.analysis.runner",
+    "i2as.analysis.scripts",
+    "i2as.analysis.recipes",
+]
+
+[[tool.importlinter.contracts]]
+name = "C26: the analysis layer knows no notebook — i2as.analysis and the session-side runner, trigger and sandbox never import the notebook bridge or the blocks"
+type = "forbidden"
+source_modules = [
+    "i2as.analysis",
+    "i2as.session.analysis_runner",
+    "i2as.session.analysis_trigger",
+    "i2as.session.analysis_sandbox",
+]
+forbidden_modules = ["i2as.session.eln", "i2as.blocks"]
+
+[[tool.importlinter.contracts]]
+name = "C27: the notebook bridge reads analysis only through the sealed bundle — i2as.session.eln never imports the recipe, report, runner or script machinery"
+type = "forbidden"
+source_modules = ["i2as.session.eln"]
+forbidden_modules = [
+    "i2as.analysis.base",
+    "i2as.analysis.discovery",
+    "i2as.analysis.report",
+    "i2as.analysis.runner",
+    "i2as.analysis.scripts",
+    "i2as.analysis.recipes",
+    "i2as.session.analysis_runner",
+    "i2as.session.analysis_sandbox",
 ]

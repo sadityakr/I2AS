@@ -1,12 +1,21 @@
 # An analysis agent for I2AS
 
 Status: **milestone 1 implemented** (the analyst role, sandboxed scripts, the
-tool surface and the magnetoresistance recipe), and **the uniform session
-layout implemented** (below). The embedded agent host (milestone 2), the
+tool surface and the magnetoresistance recipe), **the uniform session
+layout implemented** (below), and **the container sandbox implemented**
+(milestone 4's sandbox half: every analysis runs in Docker or Podman). The embedded agent host (milestone 2), the
 Analysis screen (milestone 3) and analysis across a whole session are
 planned here; none of them is built yet. The plan below was reviewed
 against the code by an independent agent. Its corrections are folded in,
 and "Findings from the review" lists them.
+
+**Since 2026-09-27 analysis and the notebook are separate layers**
+([eln-analysis-publishing.md](eln-analysis-publishing.md)): every analysis is
+sealed into an **analysis bundle**, a run is represented by its **selected
+bundle**, and nothing here parks or publishes a notebook entry. The agent's
+work ends at the bundle; the operator links the experiment's page and
+publishes. Where this plan still says "pending entry", "stage" or "eLab tab",
+read "selected bundle", `select_analysis_bundle` and "Analysis tab".
 
 ## The session layout: one tree an agent can walk
 
@@ -40,9 +49,8 @@ the **session folder**, and everything below it is fixed:
   never reused.
 - **App-owned records sit outside `analysis/`:** the journal and key
   results. A sandboxed script's working directory is its own folder under
-  `analysis/`, and under the `venv` backend it runs as the same user, so
-  nothing a script can reach by a relative path is ever treated as a
-  trusted record.
+  `analysis/`, mounted into its container, so nothing a script can reach by
+  a relative path is ever treated as a trusted record.
 
 ## The problem
 
@@ -89,14 +97,13 @@ the model behaving well:
 |---|---|---|
 | **Role**: `analyst` | The agent *asking* the station to do anything. Refused in `authorize()` before the engine sees it. | `session/gateway/roles.py` |
 | **Action class**: `analysis` | An analysis permission quietly including run control. `write_analysis_recipe` and `run_analysis` used to be `run_control`. | `session/gateway/action_classes.py` |
-| **Worker process** (C22) | Analysis code *importing* the Station, the engine or the notebook. | `pyproject.toml` import contracts |
-| **Sandbox**: `venv` | Analysis code seeing credentials, touching the recorded run file, or pulling this application's dependencies. | `session/analysis_sandbox.py` |
-| **Sandbox**: container (planned) | Analysis code reaching the spool or the socket at all: no network, only the analysis folder mounted. | a further `AnalysisSandbox` backend |
-| **Approval** | Anything reaching the notebook without a human. | `ExperimentManager.approve_eln_draft()` (unchanged) |
+| **Worker process** (C22, C26) | Analysis code *importing* the Station, the engine or the notebook. | `pyproject.toml` import contracts |
+| **Sandbox**: container | Analysis code reaching the spool, the socket, the settings files or the network at all, seeing credentials, or writing the recorded run file. | `session/analysis_sandbox.py` |
+| **No notebook tool** | An agent reaching the notebook at all. The `eln` action class is refused to every agent role; publishing is the operator's, approved once per experiment. | `session/gateway/roles.py`, `ExperimentManager.approve_eln_publishing()` |
 
-The `venv` backend does not change the operating-system user. That is stated
-in the code and here: it separates dependencies, credentials and data, and the
-container backend is the hard boundary.
+The container is the hard boundary: the spool, the gateway descriptor and the
+settings files are not in its filesystem, and it has no network to reach the
+socket over.
 
 ## Architecture
 
@@ -109,11 +116,12 @@ flowchart LR
     end
     subgraph app["I2AS application process"]
         GW["Gateway<br/>role check → tool"]
-        RUN["AnalysisRunner<br/>queue · timeout"]
-        PUB["ElnPublisher<br/>park pending entry"]
+        RUN["AnalysisRunner<br/>queue · timeout · seal"]
+        MGR["ExperimentManager<br/>selected bundle"]
+        PUB["ElnService<br/>operator publishes"]
         ENG["Orchestrator<br/>station"]
     end
-    subgraph sandbox["Analysis sandbox (local / venv / container)"]
+    subgraph sandbox["Analysis container (no network, three mounts)"]
         W["python -m i2as.analysis<br/>recipe or script"]
     end
     MCP --> GW
@@ -121,10 +129,12 @@ flowchart LR
     EMB --> GW
     GW -- "analysis tools" --> RUN
     GW -. "refused for analyst" .-x ENG
-    RUN -- "spec + staged run file" --> W
+    RUN -- "spec + read-only run file" --> W
     W -- "report.json · figures · stdout" --> RUN
-    GW -- "stage_analysis_result" --> PUB
-    PUB -- "human approves in eLab tab" --> ELN[(eLabFTW)]
+    RUN -- "sealed bundle" --> MGR
+    GW -- "select_analysis_bundle" --> MGR
+    MGR -- "bundles only" --> PUB
+    PUB -- "one page per experiment, appended" --> ELN[(eLabFTW)]
 ```
 
 The embedded agent is **a gateway client like any other**. It connects with
@@ -139,9 +149,10 @@ surface to use, not because two copies are kept in sync.
 | Step | Tool | Class | What happens |
 |---|---|---|---|
 | Look | `list_runs`, `read_run_columns`, `read_run_stats`, `read_run_slice`, `read_run_metadata` | read | Reads the run's columns and numbers. |
-| Try a standard analysis | `list_analysis_recipes`, `run_analysis` (e.g. `recipe="magnetoresistance"`), `read_analysis_report` | analysis / read | Runs a shipped recipe. Its report becomes the run's pending entry. |
-| Explore | `run_analysis_script`, `read_analysis_script_result` | analysis / read | Runs its own script in the worker and reads back the values, figure paths and printed output. **Parks nothing.** |
-| Decide | `stage_analysis_result` | analysis | Parks one script's report as the run's pending entry. A human approves or discards it in the eLab tab. |
+| Try a standard analysis | `list_analysis_recipes`, `run_analysis` (e.g. `recipe="magnetoresistance"`), `read_analysis_bundle` | analysis / read | Runs a shipped recipe. Its completed bundle becomes the run's selected bundle. |
+| Explore | `run_analysis_script`, `read_analysis_script_result` | analysis / read | Runs its own script in the worker and reads back the values, figure paths and printed output. **Selects nothing.** |
+| Summarise | `draft_analysis_summary` | analysis | Asks the drafting model for a summary of the run's facts, kept as a `draft` bundle. |
+| Decide | `list_analysis_bundles`, `select_analysis_bundle` | read / analysis | Chooses the bundle (a recipe's, a script's, a draft's) that represents the run. |
 | Keep | `save_analysis_script_as_recipe` | analysis | Saves the script as a `ScriptRecipe` in the experiment's `analysis/recipes`, where it is discovered, reviewed and runnable by procedure. |
 
 An analysis script is plain Python with `run`, `context`, `report`,
@@ -185,47 +196,73 @@ role that was only meant to analyse.
 
 To connect an MCP client with analysis rights only, set `I2AS_MCP_ROLE=analyst`
 in `.mcp.json`. To make analysis the most any agent connection can be granted,
-choose `analyst` in the Connections dialog's role ceiling.
+choose `analyst` as the role ceiling in Settings → Connections.
 
 ## The sandbox
 
-`analysis.sandbox` in the user settings file (`eln-settings.json` in the
-user config directory, or the path in `I2AS_ELN_SETTINGS`):
+Every recipe and every analysis script runs in a container. A container
+engine (Docker Desktop on Windows and macOS; Docker or Podman on Linux) is a
+dependency of **analysis**, not of I2AS: a setup that never analyses installs
+nothing, and switching analysis on (Settings → Analysis, or the Analysis
+tab's "Analyse finished runs") is refused, with the reason, until the engine is running and
+the image is built.
+
+`ContainerSandbox` starts each worker as:
+
+```
+docker run --rm --name i2as-analysis-<id> --pull never --network none   --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges   --memory 4g --cpus 2 --pids-limit 256   --mount type=bind,source=<analysis folder>,target=/work   --mount type=bind,source=<run file>,target=/input/<name>,readonly   --mount type=bind,source=<experiment recipes>,target=/recipes/0,readonly   i2as-analysis:latest python -m i2as.analysis run --spec /work/spec.json
+```
+
+- **No network**, so the gateway socket, the HTTP endpoint and any registry
+  are unreachable.
+- **Three mounts, nothing else.** The spec the worker reads names container
+  paths; the runner still reads `report.json` from the host folder.
+- **No environment from the application**: an ELN or LLM key in this
+  process's environment never reaches analysis code.
+- **Never pulled**: a missing image is a failed analysis naming it.
+- On a timeout or a cancel the runner kills the engine's client and runs
+  `docker kill i2as-analysis-<id>`, because killing the client alone can leave
+  the container running.
+
+**The image** is built locally from `i2as/analysis/container/Dockerfile`
+(Python 3.12 slim, numpy, h5py, matplotlib, scipy) over a build context
+holding only `i2as/analysis` and the three core modules C22 allows
+(`data_reader`, `events`, `exceptions`). The Station is not in the image at
+all. Build it from Settings → Analysis → **Build image**, or:
+
+```
+python -m i2as.session.analysis_sandbox check
+python -m i2as.session.analysis_sandbox build-image
+```
+
+A lab that needs more libraries (scikit-image, torch for image recognition)
+builds its own image `FROM i2as-analysis:latest` and names it in Settings →
+Analysis → Image.
+
+**Settings** live in the `analysis` section of the general settings file
+(`settings.json` in the user config directory, or the path in
+`I2AS_SETTINGS`), edited from Settings → Analysis:
 
 ```json
 {
   "analysis": {
     "enabled": true,
+    "timeout_s": 120,
     "recipes": {"Field Sweep": "magnetoresistance"},
     "sandbox": {
-      "backend": "venv",
-      "python": "C:/i2as-analysis/.venv/Scripts/python.exe",
-      "stage_inputs": true,
-      "env_passthrough": ["LAB_DATA_ROOT"]
+      "engine": "docker",
+      "image": "i2as-analysis:latest",
+      "memory": "4g",
+      "cpus": 2,
+      "pids_limit": 256
     }
   }
 }
 ```
 
-| Backend | Interpreter | Environment | Run file | Working dir |
-|---|---|---|---|---|
-| `local` (default) | this one | inherited | the recorded file | inherited |
-| `venv` | `sandbox.python` | allow-list, credentials dropped, `MPLBACKEND=Agg` | a copy in `<analysis>/input/` | the analysis folder |
-| container (planned) | the image's | the image's | the analysis folder mounted, nothing else | the mount |
-
-To set up the `venv` backend, create the environment and install the analysis
-stage plus whatever the lab's analysis needs, such as scipy, scikit-image or
-torch for image recognition. None of it goes into the application's own
-environment:
-
-```
-python -m venv C:/i2as-analysis/.venv
-C:/i2as-analysis/.venv/Scripts/pip install "i2as[analysis]" scipy scikit-image
-```
-
-A misconfigured sandbox, such as a missing interpreter or a file that cannot
-be staged, produces a **failed** report naming the cause, and a fallback entry
-is still left pending. It never fails silently.
+A sandbox that cannot run the worker (no engine, the engine not running, no
+image, an unmountable path) produces a **failed** report naming the cause,
+and a fallback entry is still left pending. It never fails silently.
 
 ## Milestone 2: the embedded analyst (designed, not built)
 
@@ -251,9 +288,10 @@ gateway:
   same checks as MCP. It stops at the end of the model's turn or at a budget
   limit. Polling for `read_analysis_script_result` answers `running` is done
   by the loop on a `QTimer`, never by sleeping on the GUI thread.
-- There are **two triggers**. First, automatically: `ElnPublisher`'s
-  `analysis_requested` for a procedure in `auto_procedures` starts a session
-  whose instruction is "analyse run X and stage what belongs in the notebook".
+- There are **two triggers**. First, automatically: the `AnalysisTrigger`
+  (`session/analysis_trigger.py`), for a procedure in `auto_procedures`,
+  starts a session whose instruction is "analyse run X and choose the bundle
+  that represents it".
   Second, on demand: the operator types an instruction in the Analysis
   screen's "Ask the analyst…" box.
 - Every tool call is already recorded in the agent feed by the gateway. The
@@ -261,8 +299,8 @@ gateway:
   `<analysis>/<run>/analyst/<session>.jsonl`, so why it staged what it staged
   can be reviewed.
 
-The agent never publishes. It stages, and the human approves in the eLab tab,
-exactly as today.
+The agent never publishes. It chooses a run's bundle; the operator publishes
+from the Analysis tab.
 
 ## Milestone 3: the Analysis screen (planned)
 
@@ -462,13 +500,11 @@ experiment.
    recorded on the timeline.
 6. **Milestone 2** plugs its console into the placeholder.
 
-## Milestone 4: the container sandbox and heavier models
+## Milestone 4: heavier models
 
-A `ContainerSandbox(AnalysisSandbox)` runs the worker with Docker or Podman:
-no network, the analysis folder as the only mount, and the lab's analysis
-image (GPU-enabled when image-recognition models need it). It follows the same
-`prepare()`/`launch()` interface, so the runner, the tools and the agent do
-not change.
+The container sandbox itself is built (see "The sandbox"). What remains is
+GPU access for image-recognition models: a `gpus` setting passed through as
+`--gpus all`, and a CUDA base image a lab builds its own image from.
 
 ## What milestone 1 changed
 
@@ -481,8 +517,9 @@ not change.
 - The worker gains a script mode (`AnalysisSpec.script_path`,
   `analysis/scripts.py`, `ScriptRecipe`), and the runner gains
   `start_script()` / `script_finished`. Script results are never parked.
-- `session/analysis_sandbox.py` with the `local` and `venv` backends, and
-  `analysis.sandbox` in the settings.
+- `session/analysis_sandbox.py` and `analysis.sandbox` in the settings
+  (first with `local`/`venv` backends; since replaced by the container
+  backend).
 - The `magnetoresistance` recipe fits R(B) = R0 + c1·B + c2·B² (or c2·|B|)
   and reports R0, the MR coefficient, the odd term and MR% at the largest
   field, with a fit-and-residuals figure. Current reversal is handled with a

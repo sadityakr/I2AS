@@ -3,15 +3,18 @@
 ## Purpose
 
 Turns one finished run into one **analysis report**: the prose, derived values,
-figures and small tables that belong in an electronic lab notebook, instead of
-the run's raw fact tables. Two kinds of code produce a report:
+figures and small tables worth keeping, instead of the run's raw fact tables.
+The application seals what the worker leaves into an **analysis bundle**
+(`bundle.py`): the manifest (`bundle.json`) every later reader uses, with every
+file hashed. This package knows no notebook; the notebook layer reads bundles.
+Two kinds of code produce a report:
 
 - a **recipe** (`base.AnalysisRecipe`), which is reviewed and reusable. It is
-  discovered, chosen by procedure, and its report becomes the run's pending
-  notebook entry;
+  discovered, chosen by procedure, and its completed bundle becomes the run's
+  selected bundle — the result that represents the run;
 - an **analysis script** (`scripts.py`), which is exploratory code that an agent or a
-  physicist runs once over one run to find out what the data says. Its report
-  is parked only when someone decides it should be (`stage_analysis_result`),
+  physicist runs once over one run to find out what the data says. Its bundle
+  represents the run only when someone chooses it (`select_analysis_bundle`),
   and a script that proved its worth is saved as a recipe (`ScriptRecipe`).
 
 ## Architecture layer
@@ -22,9 +25,11 @@ imports only `i2as.core.data_reader`, `i2as.core.events` and
 matplotlib (contract C22). Nothing below the session layer imports it (the
 mirror contract). All of its code runs in the **analysis worker**
 (`python -m i2as.analysis`), a separate process that the session layer starts
-in the configured **analysis sandbox** (`i2as/session/analysis_sandbox.py`).
-The worker can reach one run file and one output folder, and it cannot reach
-the Station, the engine or the notebook.
+in a container (the **analysis sandbox**, `i2as/session/analysis_sandbox.py`):
+no network, and only the run file, its output folder and the experiment's
+recipes mounted. The worker cannot reach the Station, the engine or the
+notebook. The image is built from `container/Dockerfile` here, over a context
+holding only this package and the three core modules above.
 
 ## Entry
 
@@ -37,8 +42,12 @@ the Station, the engine or the notebook.
 
 ## Exit
 
-- `report.json` in the spec's output folder: the `AnalysisReport`,
-  always written. A recipe or script that fails still produces a report, with
+- `report.json` in the spec's output folder: the `AnalysisReport` (the
+  worker's CLAIMS), always written. The application then seals the folder:
+  `bundle.json` (`bundle.Bundle`, schema `i2as.analysis-bundle` v1) lists every
+  file with its SHA-256 and carries the report's content, the producer, the
+  inputs and the status. Each analysis gets a folder of its own,
+  `analysis/<run>/<bundle_id>/`; a script's is `analysis/<run>/scripts/<id>/`. A recipe or script that fails still produces a report, with
   status `failed` and its traceback.
 - The figures the report names, saved beside it as PNG.
 - For a script, and for a `ScriptRecipe`: `stdout.txt`, with what it printed,
@@ -56,6 +65,9 @@ the Station, the engine or the notebook.
   A script may also bind `report` to an `AnalysisReport` of its own.
 - **Report standard** (`report.py`): frozen, JSON-safe and capped types that
   load tolerantly.
+- **Bundle standard** (`bundle.py`): the sealed hand-off out of this stage —
+  standard library only (contract C22 and C25), so the notebook layer and a
+  user's renderer read it without importing anything else here.
 - A failure is data: `run_spec()` never raises.
 
 ## How to add
@@ -76,6 +88,7 @@ the Station, the engine or the notebook.
 | `__init__.py` | The package's public names. |
 | `__main__.py` | The worker's command line: `run`, `new-recipe`, `list`. |
 | `base.py` | The recipe contract, `AnalysisContext`, the axis and column conventions. |
+| `bundle.py` | The analysis bundle: `Bundle`, `seal_bundle`, `read_bundle`, `verify_artifact`. |
 | `discovery.py` | Finding recipes in the package and in an experiment's folder; `recipe_for`. |
 | `report.py` | `AnalysisReport`, `AnalysisSpec` and the size caps. |
 | `runner.py` | `run_spec()`: one spec, one report, never raising. |

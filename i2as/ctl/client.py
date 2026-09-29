@@ -55,6 +55,7 @@ from i2as.core.procedure_catalog import (
     discover_run_catalog,
 )
 from i2as.core.station import Station, build_station
+from i2as.session.app_config import load_app_config
 from i2as.session.agent_feed import AgentFeed
 from i2as.session.gateway import Gateway, Role, ToolContext
 from i2as.session.gateway.tools import ToolError
@@ -452,7 +453,10 @@ class CtlClient:
             self.role,
             self.actor_id,
             tool_context=ToolContext(
-                experiments=self.experiments, run_catalog=self._run_catalog
+                experiments=self.experiments,
+                run_catalog=self._run_catalog,
+                analysis_settings=lambda: load_app_config().analysis,
+                settings_source=load_app_config,
             ),
             feed=feed,
         )

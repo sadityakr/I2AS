@@ -4,7 +4,7 @@
 #   (gui/agent_panel.py, gui/takeover_strip.py, and their home in
 #   MonitorWindow): the panel filters the event stream down to what the
 #   machines did, seeds itself from the Agent feed, renders a refusal as a
-#   refusal and a pending ELN draft as a question; the strip applies the kill
+#   refusal as a refusal; the strip applies the kill
 #   switch, reflects it back from the mirror, keeps attendance true in both
 #   places it lives, and never gates the human.
 # last_updated: 2026-09-03
@@ -34,7 +34,6 @@ from i2as.core.orchestrator import OrchestratorState
 from i2as.gui.agent_panel import (
     MAX_ROWS,
     NO_RUN_TEXT,
-    OUTCOME_PENDING,
     OUTCOME_REFUSED,
     OUTCOME_TAKEOVER,
     AgentAction,
@@ -523,72 +522,6 @@ def test_a_missing_feed_seeds_nothing_and_raises_nothing(
 
     assert panel.row_texts() == ()
     assert panel._empty_label.isVisible()
-
-
-# ── The pending ELN draft: the one row that asks a question ───────────────────
-
-
-@pytest.fixture
-def publisher(session_manager, orchestrator, tmp_path):
-    """A real ELN publisher over the simulated notebook, attached and armed."""
-    from i2as.session.eln.publisher import ElnPublisher
-    from i2as.session.eln.settings import ElnSettings
-    from i2as.session.eln.sim_eln import SimElnAdapter
-
-    experiment = session_manager.start_experiment("Sample A", "jdoe", {})
-    data_file = (
-        session_manager.store.data_dir(experiment.experiment_id) / "run-0001.h5"
-    )
-    data_file.parent.mkdir(parents=True, exist_ok=True)
-    data_file.write_bytes(b"\x89HDF\r\n\x1a\n")
-    session_manager._on_run_started(
-        {
-            "run_id": "run-0001",
-            "procedure": "Field Sweep",
-            "kind": "run",
-            "params": {"field_T": 1.5},
-            "data_file": str(data_file),
-            "started_utc": "2026-01-01T10:00:00+00:00",
-        }
-    )
-    settings = ElnSettings(
-        enabled=True,
-        backend="sim_eln",
-        base_url="https://sim.example",
-        api_key="k",
-        retry_base_s=0.0,
-        retry_max_s=0.0,
-    )
-    publisher = ElnPublisher(session_manager, settings, adapter=SimElnAdapter({}))
-    session_manager.attach_eln_publisher(publisher)
-    yield publisher
-    publisher.stop()
-
-
-def test_a_pending_draft_becomes_an_approve_row_that_queues_one_job(
-    window, panel, session_manager, publisher, qtbot
-):
-    """The approval gate, from the panel: one click, one queued job, row gone."""
-    from PyQt6.QtWidgets import QPushButton
-
-    session_manager.set_pending_eln_draft(
-        "run-0001", {"title": "Awaiting a human", "body_html": "<p>prose</p>"}
-    )
-
-    button = window.findChild(QPushButton, "agent_approve_run-0001")
-    assert button is not None, "a draft waiting on a human is a row with a button"
-    assert list(panel._draft_rows) == ["run-0001"]
-    label = panel._draft_rows["run-0001"].layout().itemAt(0).widget()
-    assert label.property("outcome") == OUTCOME_PENDING
-    assert publisher.pending_count() == 0, "a pending draft publishes nothing"
-
-    button.click()
-
-    assert publisher.pending_count() == 1
-    assert session_manager.pending_eln_draft("run-0001") == {}
-    assert panel._draft_rows == {}, "an approved draft stops asking"
-    qtbot.wait(10)  # the retired row is deleted on the next event-loop turn
-    assert window.findChild(QPushButton, "agent_approve_run-0001") is None
 
 
 # ── The row model itself ──────────────────────────────────────────────────────

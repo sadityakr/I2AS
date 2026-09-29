@@ -659,7 +659,7 @@ def test_the_two_log_tails_read_jsonl_and_tolerate_a_missing_file(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# The two ELN tools: drafting an entry, and the approval gate on publishing
+# Drafting a summary: an analysis product, never a notebook entry
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -667,29 +667,19 @@ DRAFTED = "TITLE: Field sweep at 1.5 T\nSUMMARY:\nThe sweep completed cleanly."
 
 
 @pytest.fixture
-def eln_gateway(qtbot, tmp_path):
-    """A gateway that can draft and publish: sim notebook, fake model, real records.
+def draft_gateway(qtbot, tmp_path):
+    """A gateway that can draft: a fake model and a real probe run's records.
 
-    The run is a real probe run over the sim station, written to a real HDF5
-    file, so the drafted body carries the statistics of columns that were
-    actually measured rather than of a fixture's invention.
-
-    Yields ``(build, manager, publisher, adapter, client, run_id)`` where
-    ``build(role)`` returns a gateway over the shared context, so one recorded
-    run serves every role and attendance combination.
+    Yields ``(build, manager, client, run_id)`` where ``build(role)`` returns a
+    gateway over the shared context.
     """
     from i2as.session.agent_feed import AgentFeed
-    from i2as.session.eln.drafting import FakeDraftClient
-    from i2as.session.eln.publisher import ElnPublisher
-    from i2as.session.eln.settings import AssistantSettings, ElnSettings
-    from i2as.session.eln.sim_eln import SimElnAdapter
+    from i2as.session.drafting import AssistantSettings, FakeDraftClient
 
     station = build_station(CONFIG_PATH)
     station.magnet_z._default_ramp_rate = 6000.0
     station.magnet_z._ramp_segments = []
-    orch = Orchestrator(
-        station, tick_interval_ms=10, run_catalog={"FieldSweep": FieldSweep}
-    )
+    orch = Orchestrator(station, tick_interval_ms=10, run_catalog={"FieldSweep": FieldSweep})
     roster = UserRoster(tmp_path / "users.json")
     roster.add(User(user_id="jdoe", name="J. Doe"))
     store = ExperimentStore(tmp_path / "experiments")
@@ -702,48 +692,26 @@ def eln_gateway(qtbot, tmp_path):
         run_catalog={"FieldSweep": FieldSweep},
     )
     experiment = manager.start_experiment("Notebook", "jdoe", dict(SAMPLE_INFO))
-
-    publisher = ElnPublisher(
-        manager,
-        ElnSettings(
-            enabled=True,
-            backend="sim_eln",
-            base_url="https://sim.example",
-            api_key="k",
-            tags=("i2as",),
-            retry_base_s=0.0,
-            retry_max_s=0.0,
-        ),
-        adapter=SimElnAdapter({}),
-    )
-    manager.attach_eln_publisher(publisher)
-    feed = AgentFeed(
-        store.agent_feed_path(experiment.experiment_id), experiment.experiment_id
-    )
+    feed = AgentFeed(store.agent_feed_path(experiment.experiment_id), experiment.experiment_id)
     client = FakeDraftClient(DRAFTED, model="m-1", input_tokens=2000, output_tokens=400)
     context = ToolContext(
         experiments=manager,
         run_catalog={"FieldSweep": FieldSweep},
         status_log_path=tmp_path / "status.jsonl",
         draft_client=client,
-        assistant_settings=AssistantSettings(
-            model="m-1", prices={"m-1": {"input": 5.0, "output": 25.0}}
-        ),
-        publisher=publisher,
+        assistant_settings=AssistantSettings(model="m-1", prices={"m-1": {"input": 5.0, "output": 25.0}}),
     )
 
-    def build(role=Role.SESSION):
+    def build(role=Role.SESSION, **overrides):
         return Gateway(
             orch,
             role,
             "runner-1",
             station_info=station.station_info,
-            tool_context=context,
+            tool_context=replace(context, **overrides) if overrides else context,
             feed=feed,
         )
 
-    # One real probe run, dispatched the way an agent would dispatch it, so the
-    # draft is written from a file the engine really wrote.
     orch.start_monitoring()
     assert build().call_tool(
         "probe_run",
@@ -759,218 +727,94 @@ def eln_gateway(qtbot, tmp_path):
     _tick_until(orch, lambda: manager.current_experiment().runs[-1].status == "done")
     run_id = manager.current_experiment().runs[-1].run_id
 
-    yield build, manager, publisher, publisher._adapter, client, run_id
-    publisher.stop()
+    yield build, manager, client, run_id
     orch.shutdown()
 
 
-def test_the_two_eln_tools_declare_their_class_and_their_recording(tools):
-    """Drafting changes nothing; publishing puts a record into the world."""
-    draft = tools["draft_eln_entry"]
-    publish = tools["publish_eln_entry"]
-
-    assert draft.action_class is ActionClass.READ
-    assert publish.action_class is ActionClass.RUN_CONTROL
-    assert draft.recorded is True and publish.recorded is True
-    assert draft.session_function == "draft_eln_entry"
+def test_no_tool_reaches_the_notebook(tools):
+    """The notebook is the operator's: nothing an agent can call links, reads or publishes it."""
+    assert not [name for name in tools if "eln" in name or "publish" in name or "notebook" in name]
     assert {tool.name for tool in tools.values() if tool.recorded} == {
-        "draft_eln_entry",
-        "publish_eln_entry",
         "write_analysis_recipe",
         "run_analysis",
         "run_analysis_script",
-        "stage_analysis_result",
+        "select_analysis_bundle",
+        "draft_analysis_summary",
         "save_analysis_script_as_recipe",
     }, "a tool an agent polls must not drown the accountability trail"
+    assert tools["draft_analysis_summary"].action_class is ActionClass.ANALYSIS
 
 
-def test_drafting_a_finished_run_returns_the_entry_as_data(eln_gateway):
-    """The headline: the facts of one run, drafted and returned, publishing nothing."""
-    build, manager, publisher, adapter, client, run_id = eln_gateway
-    gateway = build()
+def test_the_notebook_action_class_is_refused_to_every_agent_role():
+    """The slot exists so notebook tools can be opened later — and today it opens to no one."""
+    from i2as.session.gateway.roles import PERMISSION_MATRIX, Permission
 
-    answer = gateway.call_tool(
-        "draft_eln_entry", {"run_id": run_id, "note": "check the drift"}
-    )
+    assert set(PERMISSION_MATRIX[ActionClass.ELN].values()) == {Permission.REFUSED}
+
+
+def test_drafting_a_run_keeps_the_summary_as_a_bundle_and_selects_nothing(draft_gateway):
+    """The headline: the facts of one run, drafted, kept as analysis — nothing published."""
+    build, manager, client, run_id = draft_gateway
+
+    answer = build().call_tool("draft_analysis_summary", {"run_id": run_id, "note": "check the drift"})
 
     assert answer["ok"] is True, answer
-    draft = answer["result"]
-    assert draft["title"] == "Field sweep at 1.5 T"
-    for fact in ("The sweep completed cleanly.", "Field Sweep", "field_start", "-1.0"):
-        assert fact in draft["body_html"]
-    assert "voltage_V" in draft["body_html"], "the columns the run measured"
-    assert "sim_cryostat" in draft["body_html"], "the setup it ran on"
-    assert draft["model"] == "m-1"
-    assert draft["cost_usd"] > 0.0
-    assert len(draft["prompt_digest"]) == 64
+    result = answer["result"]
+    assert result["title"] == "Field sweep at 1.5 T" and result["summary"] == "The sweep completed cleanly."
+    assert result["model"] == "m-1" and result["cost_usd"] > 0.0 and len(result["prompt_digest"]) == 64
+    record = manager.current_experiment()
+    bundle = manager.store.read_bundle(record.experiment_id, run_id, result["bundle_id"])
+    assert bundle.sealed and bundle.producer.kind == "draft" and bundle.producer.actor == "runner-1"
+    assert bundle.summary == ("The sweep completed cleanly.",)
+    assert [a.path for a in bundle.artifacts] == ["summary.md"]
+    assert record.find_run(run_id).selected_bundle == "", "a draft represents the run only once chosen"
 
     prompt = client.calls[0][1]
-    assert "procedure: Field Sweep" in prompt
-    assert "setup: sim_cryostat" in prompt, "the station the run ran on"
-    assert "voltage_V: count=" in prompt, "the statistics of what was measured"
-    assert "check the drift" in prompt
-
-    assert publisher.pending_count() == 0, "drafting queues nothing"
-    assert not adapter.entries, "drafting publishes nothing"
-    assert manager.current_experiment().find_run(run_id).pending_eln_draft == {}
+    assert "procedure: Field Sweep" in prompt and "setup: sim_cryostat" in prompt
+    assert "voltage_V: count=" in prompt and "check the drift" in prompt
 
 
-def test_two_drafts_of_one_run_are_the_same_question(eln_gateway):
-    """A deterministic prompt means a reproducible digest."""
-    build, _manager, _publisher, _adapter, _client, run_id = eln_gateway
-    gateway = build()
-
-    first = gateway.call_tool("draft_eln_entry", {"run_id": run_id})
-    again = gateway.call_tool("draft_eln_entry", {"run_id": run_id})
-
+def test_two_drafts_of_one_run_are_the_same_question(draft_gateway):
+    build, _manager, _client, run_id = draft_gateway
+    first = build().call_tool("draft_analysis_summary", {"run_id": run_id})
+    again = build().call_tool("draft_analysis_summary", {"run_id": run_id})
     assert first["result"]["prompt_digest"] == again["result"]["prompt_digest"]
+    assert first["result"]["bundle_id"] != again["result"]["bundle_id"], "each draft is its own bundle"
 
 
-def test_a_draft_records_what_it_cost_in_the_agent_feed(eln_gateway):
-    """What an autonomous client spent, in the trail beside what it asked for."""
+def test_a_draft_records_what_it_cost_in_the_agent_feed(draft_gateway):
     from i2as.session.agent_feed import RECORD_TOOL, read_feed
 
-    build, _manager, _publisher, _adapter, _client, run_id = eln_gateway
+    build, _manager, _client, run_id = draft_gateway
     gateway = build()
+    gateway.call_tool("draft_analysis_summary", {"run_id": run_id})
 
-    gateway.call_tool("draft_eln_entry", {"run_id": run_id})
-
-    (record,) = [
-        entry
-        for entry in read_feed(gateway._feed.path)
-        if entry["record"] == RECORD_TOOL
-    ]
-    assert record["tool"] == "draft_eln_entry"
-    assert record["args"] == {"run_id": run_id}
-    assert record["actor"]["role"] == "session"
+    (record,) = [entry for entry in read_feed(gateway._feed.path) if entry["record"] == RECORD_TOOL]
+    assert record["tool"] == "draft_analysis_summary" and record["args"] == {"run_id": run_id}
     assert record["verdict"] == {"code": "OK", "reason": ""}
-    assert record["detail"]["model"] == "m-1"
-    assert record["detail"]["input_tokens"] == 2000
-    assert record["detail"]["output_tokens"] == 400
+    assert record["detail"]["model"] == "m-1" and record["detail"]["input_tokens"] == 2000
     assert record["detail"]["cost_usd"] > 0.0
 
 
-def test_an_attended_experiment_refuses_the_agent_and_parks_the_draft(eln_gateway):
-    """Attended: the human approves. The refusal leaves the work where they find it."""
-    build, manager, publisher, adapter, _client, run_id = eln_gateway
-    manager.set_attended(True)
-    gateway = build()
-    draft = gateway.call_tool("draft_eln_entry", {"run_id": run_id})["result"]
-
-    answer = gateway.call_tool(
-        "publish_eln_entry", {"run_id": run_id, "draft": draft}
-    )
-
-    assert answer["ok"] is False
-    assert answer["detail"]["rule"] == "approval_required"
-    assert answer["detail"]["attended"] is True
-    assert answer["detail"]["pending"] is True
-    assert publisher.pending_count() == 0 and not adapter.entries
-
-    pending = manager.pending_eln_draft(run_id)
-    assert pending["title"] == "Field sweep at 1.5 T"
-
-    job_id = manager.approve_eln_draft(run_id)
-
-    assert job_id == f"publish_run:{run_id}"
-    assert publisher.pending_count() == 1, "exactly one job, and only once approved"
-    assert manager.pending_eln_draft(run_id) == {}
+def test_drafting_is_analysis_work_an_analyst_may_do_and_a_debug_agent_may_not(draft_gateway):
+    build, _manager, _client, run_id = draft_gateway
+    assert build(Role.ANALYST).call_tool("draft_analysis_summary", {"run_id": run_id})["ok"] is True
+    refused = build(Role.DEBUG).call_tool("draft_analysis_summary", {"run_id": run_id})
+    assert refused["code"] == "BLOCKED_ROLE" and refused["detail"]["action_class"] == "analysis"
 
 
-def test_an_unattended_session_agent_publishes_straight_to_the_outbox(eln_gateway):
-    """Unattended, the session role is what the experiment is being run by."""
-    build, manager, publisher, adapter, _client, run_id = eln_gateway
-    manager.set_attended(False)
-    gateway = build(Role.SESSION)
-    draft = gateway.call_tool("draft_eln_entry", {"run_id": run_id})["result"]
-
-    answer = gateway.call_tool(
-        "publish_eln_entry", {"run_id": run_id, "draft": draft}
-    )
-
-    assert answer["ok"] is True, answer
-    assert answer["result"]["job_id"] == f"publish_run:{run_id}"
-    assert publisher.pending_count() == 1
-    assert manager.pending_eln_draft(run_id) == {}, "nothing waits on a human"
-
-    from i2as.session.eln.outbox import DRAIN_PUBLISHED
-
-    assert publisher.drain_once().state == DRAIN_PUBLISHED
-    (entry,) = adapter.entries.values()
-    assert entry["title"] == "Field sweep at 1.5 T"
-
-
-def test_publishing_is_refused_to_the_roles_that_do_not_run_the_experiment(
-    eln_gateway,
-):
-    """run_control is the session role's; a debug or observer agent reports instead."""
-    build, manager, publisher, _adapter, _client, run_id = eln_gateway
-    manager.set_attended(False)
-
-    for role in (Role.DEBUG, Role.OBSERVER):
-        gateway = build(role)
-        answer = gateway.call_tool(
-            "publish_eln_entry", {"run_id": run_id, "draft": {"title": "t"}}
-        )
-        assert answer["ok"] is False, role
-        assert answer["code"] == "BLOCKED_ROLE"
-        assert answer["detail"]["rule"] == "role_matrix"
-        assert answer["detail"]["action_class"] == "run_control"
-
-    assert publisher.pending_count() == 0
-
-
-def test_a_debug_agent_may_still_draft(eln_gateway):
-    """Drafting reads and changes nothing, so every role may ask for one."""
-    build, manager, _publisher, _adapter, _client, run_id = eln_gateway
-    manager.set_attended(False)
-
-    answer = build(Role.DEBUG).call_tool("draft_eln_entry", {"run_id": run_id})
-
-    assert answer["ok"] is True, answer
-
-
-def test_the_eln_tools_refuse_by_name_when_their_collaborator_is_absent(
-    station_info, tmp_path
-):
-    """A gateway wired without a model or a publisher says which one is missing."""
-    orch = Orchestrator(build_station(CONFIG_PATH), tick_interval_ms=10)
-    gateway = Gateway(orch, Role.SESSION, "runner-1", station_info=station_info)
-
-    for name, args in (
-        ("draft_eln_entry", {"run_id": "run-0001"}),
-        ("publish_eln_entry", {"run_id": "run-0001", "draft": {}}),
-    ):
-        answer = gateway.call_tool(name, args)
-        assert answer["ok"] is False
-        assert answer["detail"]["rule"] == "missing_collaborator"
-    orch.shutdown()
-
-
-def test_drafting_an_unknown_run_is_refused_by_name(eln_gateway):
-    """The run must be one this experiment recorded — no run, no draft."""
-    build, *_ = eln_gateway
-
-    answer = build().call_tool("draft_eln_entry", {"run_id": "ghost"})
-
-    assert answer["ok"] is False
-    assert answer["detail"]["rule"] == "unknown_run"
-
-
-def test_a_model_that_cannot_be_reached_is_one_named_refusal(eln_gateway):
-    """The draft client's one exception type becomes the tool's one refusal."""
-    build, _manager, _publisher, _adapter, client, run_id = eln_gateway
+def test_drafting_refuses_by_name(draft_gateway):
+    """No model wired, an unknown run, a model that cannot answer: each one named."""
+    build, _manager, client, run_id = draft_gateway
+    assert build(draft_client=None).call_tool("draft_analysis_summary", {"run_id": run_id})["detail"]["rule"] == "missing_collaborator"
+    assert build().call_tool("draft_analysis_summary", {"run_id": "ghost"})["detail"]["rule"] == "unknown_run"
     client.offline = True
-
-    answer = build().call_tool("draft_eln_entry", {"run_id": run_id})
-
-    assert answer["ok"] is False
-    assert answer["detail"]["rule"] == "draft_failed"
+    assert build().call_tool("draft_analysis_summary", {"run_id": run_id})["detail"]["rule"] == "draft_failed"
 
 
-def test_a_run_whose_file_cannot_be_read_is_still_drafted(eln_gateway):
+def test_a_run_whose_file_cannot_be_read_is_still_drafted(draft_gateway):
     """A corrupt file costs the draft its statistics, never the whole draft."""
-    build, manager, _publisher, _adapter, _client, _run_id = eln_gateway
+    build, manager, _client, _run_id = draft_gateway
     orch = manager._orchestrator
     broken = manager.current_data_dir() / "broken.h5"
     broken.write_bytes(b"not an HDF5 file")
@@ -983,14 +827,24 @@ def test_a_run_whose_file_cannot_be_read_is_still_drafted(eln_gateway):
         "started_utc": "2026-01-01T10:00:00+00:00",
     }
     orch.run_started.emit(started)
-    orch.run_finished.emit(
-        dict(started, finished_utc="2026-01-01T11:00:00+00:00", status="failed", reason="x")
-    )
+    orch.run_finished.emit(dict(started, finished_utc="2026-01-01T11:00:00+00:00", status="failed", reason="x"))
 
-    answer = build().call_tool("draft_eln_entry", {"run_id": "run-broken"})
+    answer = build().call_tool("draft_analysis_summary", {"run_id": "run-broken"})
 
     assert answer["ok"] is True, answer
-    assert "Field Sweep" in answer["result"]["body_html"]
+
+
+def test_the_settings_are_readable_and_hold_no_secret():
+    """read_settings answers the machine's settings file, the Settings dialog's view."""
+    from i2as.session.app_config import AppConfig
+    from i2as.session.gateway.tools import SESSION_TOOLS, ToolError, call_session_tool
+
+    spec = next(tool for tool in SESSION_TOOLS if tool.name == "read_settings")
+    answer = call_session_tool(spec, {}, ToolContext(settings_source=AppConfig))
+    assert set(answer) == {"connections", "analysis", "publishing"}
+    assert "api_key" not in json.dumps(answer) and "secret" not in json.dumps(answer)
+    with pytest.raises(ToolError):
+        call_session_tool(spec, {}, ToolContext())
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1106,11 +960,11 @@ class FakeAnalysisRunner:
         self.running: set = set()
         self.refuse = False
 
-    def start(self, run_id, recipe="", options=None):
+    def start(self, run_id, recipe="", options=None, actor=""):
         self.calls.append((run_id, recipe, dict(options or {})))
         return "" if self.refuse else str(self._report_dir(run_id))
 
-    def start_script(self, run_id, script_id, script_path, options=None):
+    def start_script(self, run_id, script_id, script_path, options=None, actor=""):
         self.script_calls.append((run_id, script_id, script_path, dict(options or {})))
         return "" if self.refuse else str(Path(script_path).parent)
 
@@ -1149,7 +1003,7 @@ def analysis_gateway(qtbot, tmp_path, monkeypatch, fake_discovery):
     experiment = manager.start_experiment("Analysis", "jdoe", dict(SAMPLE_INFO))
     experiment_id = experiment.experiment_id
 
-    record = store.load(experiment_id)
+    record = manager.current_experiment()
     record.runs.append(
         RunRecord(
             run_id=RUN_ID,
@@ -1213,13 +1067,9 @@ def analysis_gateway(qtbot, tmp_path, monkeypatch, fake_discovery):
     orch.shutdown()
 
 
-def _preference_publisher(**recipes):
-    """A publisher-shaped stub carrying only the per-procedure recipe preference."""
-    return types.SimpleNamespace(
-        settings=types.SimpleNamespace(
-            analysis=types.SimpleNamespace(recipes=dict(recipes))
-        )
-    )
+def _preferences(**recipes):
+    """The analysis-settings source, carrying only the per-procedure recipe preference."""
+    return lambda: types.SimpleNamespace(recipes=dict(recipes))
 
 
 def test_the_analysis_tools_are_rendered_with_their_class(tools):
@@ -1227,14 +1077,16 @@ def test_the_analysis_tools_are_rendered_with_their_class(tools):
     read_only = {
         "list_analysis_recipes",
         "read_analysis_recipe",
-        "read_analysis_report",
+        "list_analysis_bundles",
+        "read_analysis_bundle",
         "read_analysis_script_result",
     }
     controls = {
         "write_analysis_recipe",
         "run_analysis",
         "run_analysis_script",
-        "stage_analysis_result",
+        "select_analysis_bundle",
+        "draft_analysis_summary",
         "save_analysis_script_as_recipe",
     }
 
@@ -1274,12 +1126,12 @@ def test_listing_recipes_answers_the_package_and_the_experiments_own(
     assert result["selected"] == {"Field Sweep": "drift"}
 
 
-def test_the_notebook_settings_preference_decides_which_recipe_is_selected(
+def test_the_analysis_settings_preference_decides_which_recipe_is_selected(
     analysis_gateway,
 ):
-    """A preference in the eLab settings outranks the recipe's own declaration."""
+    """A preference in the analysis settings outranks the recipe's own declaration."""
     gateway = analysis_gateway.build(
-        publisher=_preference_publisher(**{"Field Sweep": "generic_sweep"})
+        analysis_settings=_preferences(**{"Field Sweep": "generic_sweep"})
     )
     analysis_gateway.recipes_dir.mkdir(parents=True, exist_ok=True)
     (analysis_gateway.recipes_dir / "drift.py").write_text(
@@ -1426,7 +1278,7 @@ def test_an_existing_recipe_is_refused_unless_overwrite_is_asked_for(
 def test_run_analysis_starts_the_worker_and_says_where_the_report_will_be(
     analysis_gateway,
 ):
-    """The headline run: started now, answered later through read_analysis_report."""
+    """The headline run: started now, answered later through read_analysis_bundle."""
     gateway = analysis_gateway.build()
 
     answer = gateway.call_tool(
@@ -1438,6 +1290,7 @@ def test_run_analysis_starts_the_worker_and_says_where_the_report_will_be(
     assert answer["result"] == {
         "run_id": RUN_ID,
         "started": True,
+        "bundle_id": analysis_gateway.report_dir.name,
         "report_path": str(analysis_gateway.report_dir / "report.json"),
         "recipe": "drift",
     }
@@ -1483,49 +1336,49 @@ def test_run_analysis_refuses_an_unknown_run_and_a_missing_runner(analysis_gatew
     }
 
 
-def test_reading_a_report_answers_running_then_none_then_the_report(
-    analysis_gateway,
-):
+def _seal(folder, bundle_id, **claims):
+    """Seal one bundle folder the way the runner would."""
+    from i2as.analysis.bundle import Producer, seal_bundle
+
+    folder.mkdir(parents=True, exist_ok=True)
+    return seal_bundle(
+        folder,
+        {"status": "ok", **claims},
+        bundle_id=bundle_id,
+        experiment_id="x",
+        run_ids=(RUN_ID,),
+        producer=Producer(kind="recipe", name="drift"),
+    )
+
+
+def test_reading_a_bundle_answers_running_then_none_then_the_bundle(analysis_gateway):
     """The three states of an analysis, in the order an agent polling meets them."""
     gateway = analysis_gateway.build()
     analysis_gateway.runner.running.add(RUN_ID)
-    running = gateway.call_tool("read_analysis_report", {"run_id": RUN_ID})
-
+    running = gateway.call_tool("read_analysis_bundle", {"run_id": RUN_ID})
     analysis_gateway.runner.running.clear()
-    none = gateway.call_tool("read_analysis_report", {"run_id": RUN_ID})
+    none = gateway.call_tool("read_analysis_bundle", {"run_id": RUN_ID})
 
-    analysis_gateway.report_dir.mkdir(parents=True, exist_ok=True)
-    (analysis_gateway.report_dir / "report.json").write_text(
-        json.dumps(
-            {
-                "run_id": RUN_ID,
-                "recipe": "drift",
-                "status": "ok",
-                "summary": ["The sweep drifted by 2 mK."],
-                "warnings": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-    done = gateway.call_tool("read_analysis_report", {"run_id": RUN_ID})
+    folder = analysis_gateway.report_dir / "b-1"
+    (folder).mkdir(parents=True)
+    (folder / "fit.png").write_bytes(b"PNG")
+    _seal(folder, "b-1", summary=["The sweep drifted by 2 mK."], figures=[{"file": "fit.png", "caption": "fit"}])
+    done = gateway.call_tool("read_analysis_bundle", {"run_id": RUN_ID})
+    listed = gateway.call_tool("list_analysis_bundles", {"run_id": RUN_ID})
 
     assert running["result"] == {"status": "running", "run_id": RUN_ID}
     assert none["result"] == {"status": "none", "run_id": RUN_ID}
-    assert done["result"]["status"] == "ok"
-    assert done["result"]["recipe"] == "drift"
-    assert done["result"]["summary"] == ["The sweep drifted by 2 mK."]
-    assert done["result"]["report_path"] == str(
-        analysis_gateway.report_dir / "report.json"
-    )
+    assert done["result"]["bundle_id"] == "b-1" and done["result"]["summary"] == ["The sweep drifted by 2 mK."]
+    assert done["result"]["figure_paths"] == [str((folder / "fit.png").resolve())]
+    assert listed["result"]["bundles"][0]["bundle_id"] == "b-1" and listed["result"]["selected"] == ""
 
 
-def test_reading_a_report_of_an_unknown_run_is_refused_by_name(analysis_gateway):
-    """A report is read through the run record, never through a supplied path."""
-    answer = analysis_gateway.build().call_tool(
-        "read_analysis_report", {"run_id": "no-such-run"}
-    )
-
-    assert answer["detail"]["rule"] == "unknown_run"
+def test_reading_a_bundle_of_an_unknown_run_or_a_path_is_refused(analysis_gateway):
+    """A bundle is read through the run record, never through a supplied path."""
+    gateway = analysis_gateway.build()
+    assert gateway.call_tool("read_analysis_bundle", {"run_id": "no-such-run"})["detail"]["rule"] == "unknown_run"
+    bad = gateway.call_tool("read_analysis_bundle", {"run_id": RUN_ID, "bundle_id": "../../x"})
+    assert bad["detail"]["rule"] == "unknown_bundle"
 
 
 def test_the_analysis_reads_are_open_to_an_observer(analysis_gateway):
@@ -1534,7 +1387,8 @@ def test_the_analysis_reads_are_open_to_an_observer(analysis_gateway):
 
     for name, args in (
         ("list_analysis_recipes", {}),
-        ("read_analysis_report", {"run_id": RUN_ID}),
+        ("read_analysis_bundle", {"run_id": RUN_ID}),
+        ("list_analysis_bundles", {"run_id": RUN_ID}),
     ):
         answer = gateway.call_tool(name, args)
         assert answer["ok"] is True, (name, answer)
@@ -1657,18 +1511,6 @@ def test_the_analysis_tools_refuse_by_name_without_the_analysis_package(
 SCRIPT_SOURCE = 'report.value("n", run.n_points)\nprint("points:", run.n_points)\n'
 
 
-class FakeReportPublisher:
-    """A publisher stand-in recording what ``stage_analysis_result`` parks."""
-
-    def __init__(self, parks=True):
-        self.parked: list[tuple] = []
-        self._parks = parks
-
-    def export_report(self, run_id, report, report_dir):
-        self.parked.append((run_id, report, report_dir))
-        return self._parks
-
-
 def _script_result(folder: Path, **report) -> None:
     """Write what the worker would leave in one script's folder."""
     from i2as.analysis.report import AnalysisReport, FigureRef
@@ -1718,12 +1560,12 @@ def test_an_analyst_may_analyse_but_never_touch_the_station(analysis_gateway):
 
 
 def test_the_script_tools_are_refused_to_the_roles_without_analysis(analysis_gateway):
-    """Observer and debug read results; they neither run nor stage nor save scripts."""
+    """Observer and debug read results; they neither run nor choose nor save scripts."""
     for role in (Role.OBSERVER, Role.DEBUG):
         gateway = analysis_gateway.build(role)
         for name, args in (
             ("run_analysis_script", {"run_id": RUN_ID, "source": SCRIPT_SOURCE}),
-            ("stage_analysis_result", {"run_id": RUN_ID, "script_id": "probe_1"}),
+            ("select_analysis_bundle", {"run_id": RUN_ID, "bundle_id": "script-probe_1"}),
             (
                 "save_analysis_script_as_recipe",
                 {"run_id": RUN_ID, "script_id": "probe_1", "name": "kept"},
@@ -1835,45 +1677,38 @@ def test_a_script_id_is_never_a_path(analysis_gateway):
     assert answer["detail"]["rule"] == "unknown_script"
 
 
-def test_staging_parks_a_scripts_report_as_the_runs_pending_entry(analysis_gateway):
-    """The deciding step: the report goes to the publisher, for a human to approve."""
-    publisher = FakeReportPublisher()
-    gateway = analysis_gateway.build(Role.ANALYST, publisher=publisher)
+def test_choosing_a_scripts_bundle_makes_it_represent_the_run(analysis_gateway):
+    """The deciding step: the analysis layer's own choice, involving no notebook."""
+    from i2as.analysis.report import AnalysisReport
+
+    gateway = analysis_gateway.build(Role.ANALYST)
     folder = analysis_gateway.report_dir / "scripts" / "probe_1"
     _script_result(folder, summary=("R0 = 100 ohm",))
+    claims = AnalysisReport.from_dict(json.loads((folder / "report.json").read_text())).to_dict()
+    _seal(folder, "script-probe_1", **{k: v for k, v in claims.items() if k != "status"})
 
-    answer = gateway.call_tool(
-        "stage_analysis_result", {"run_id": RUN_ID, "script_id": "probe_1"}
-    )
+    answer = gateway.call_tool("select_analysis_bundle", {"run_id": RUN_ID, "bundle_id": "script-probe_1"})
 
     assert answer["ok"] is True, answer
-    assert answer["result"]["parked"] is True
-    [(run_id, report, report_dir)] = publisher.parked
-    assert run_id == RUN_ID
-    assert report.summary == ("R0 = 100 ohm",)
-    assert report_dir == str(folder)
+    assert analysis_gateway.manager.current_experiment().find_run(RUN_ID).selected_bundle == "script-probe_1"
+    cleared = gateway.call_tool("select_analysis_bundle", {"run_id": RUN_ID, "bundle_id": ""})
+    assert cleared["ok"] is True
+    assert analysis_gateway.manager.current_experiment().find_run(RUN_ID).selected_bundle == ""
 
 
-def test_staging_refuses_a_missing_or_failed_result(analysis_gateway):
-    """Only a finished, successful script result becomes an entry."""
+def test_choosing_refuses_a_missing_failed_or_unsealed_result(analysis_gateway):
+    """Only a completed bundle the application sealed can represent a run."""
     from i2as.analysis.report import REPORT_FAILED
 
-    publisher = FakeReportPublisher()
-    gateway = analysis_gateway.build(publisher=publisher)
-    args = {"run_id": RUN_ID, "script_id": "probe_1"}
-
-    assert gateway.call_tool("stage_analysis_result", args)["detail"]["rule"] == "no_result"
-    _script_result(
-        analysis_gateway.report_dir / "scripts" / "probe_1",
-        status=REPORT_FAILED,
-        error="ValueError: bad",
-    )
-    assert gateway.call_tool("stage_analysis_result", args)["detail"]["rule"] == "failed_report"
-    assert publisher.parked == []
-
-    _script_result(analysis_gateway.report_dir / "scripts" / "probe_1")
-    refusing = analysis_gateway.build(publisher=FakeReportPublisher(parks=False))
-    assert refusing.call_tool("stage_analysis_result", args)["detail"]["rule"] == "not_parked"
+    gateway = analysis_gateway.build()
+    args = {"run_id": RUN_ID, "bundle_id": "script-probe_1"}
+    assert gateway.call_tool("select_analysis_bundle", args)["detail"]["rule"] == "not_selected"
+    folder = analysis_gateway.report_dir / "scripts" / "probe_1"
+    _script_result(folder)
+    assert gateway.call_tool("select_analysis_bundle", args)["detail"]["rule"] == "not_selected", "unsealed claims"
+    _script_result(folder, status=REPORT_FAILED, error="ValueError: bad")
+    _seal(folder, "script-probe_1", status=REPORT_FAILED, error="ValueError: bad")
+    assert gateway.call_tool("select_analysis_bundle", args)["detail"]["rule"] == "not_selected"
 
 
 def test_saving_a_script_keeps_it_as_an_ordinary_recipe(analysis_gateway):

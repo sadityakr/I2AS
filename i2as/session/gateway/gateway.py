@@ -84,7 +84,7 @@ from i2as.session.gateway.tools import (
     validate_tool_args,
 )
 from i2as.session.agent_feed import AgentFeed
-from i2as.session.eln.drafting import cost_line
+from i2as.session.drafting import cost_line
 
 logger = logging.getLogger(__name__)
 

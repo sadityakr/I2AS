@@ -40,9 +40,6 @@ from i2as.core.station import build_station
 from i2as.gui.monitor_window import MonitorWindow
 from i2as.gui.procedure_window import ProcedureWindow
 from i2as.procedures.field_sweep import FieldSweep
-from i2as.session.eln.publisher import ElnPublisher
-from i2as.session.eln.settings import ElnSettings
-from i2as.session.eln.sim_eln import SimElnAdapter
 from i2as.session.gateway import Gateway, Role, ToolContext, authorize_spooled
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import User
@@ -1069,81 +1066,53 @@ def _run_one_field_sweep(station, orchestrator, session_manager, qtbot) -> str:
     orchestrator.run_procedure(procedure)
     qtbot.waitUntil(lambda: orchestrator.state == "IDLE", timeout=15000)
     settled(orchestrator)
+    # The run record is completed by the engine's run_finished, which crosses
+    # the thread bridge; wait for it rather than for the engine's state.
+    qtbot.waitUntil(lambda: session_manager.current_experiment().runs[-1].status != "running", timeout=5000)
     return session_manager.current_experiment().runs[-1].run_id
 
 
-def test_a_finished_run_produces_one_outbox_job_and_one_eln_entry(
-    station, orchestrator, session_manager, qtbot
+from tests.notebook_support import notebook_service as _notebook_service
+
+
+def test_a_finished_run_is_published_to_the_experiment_page_as_one_section(
+    station, orchestrator, session_manager, qtbot, tmp_path
 ):
-    """With the sim ELN adapter configured, a finished run auto-publishes exactly once."""
+    """Link at start, approve once, publish: the run lands on the ONE page, appended."""
     session_manager.start_experiment("Sample A", "jdoe", {})
     settled(orchestrator)
-
-    settings = ElnSettings(
-        enabled=True,
-        backend="sim_eln",
-        base_url="https://sim.example",
-        api_key="k",
-        retry_base_s=0.0,
-        retry_max_s=0.0,
-        drain_interval_s=0.05,
-    )
-    publisher = ElnPublisher(session_manager, settings, adapter=SimElnAdapter({}))
-    orchestrator.run_finished.connect(publisher.on_run_finished)
-    session_manager.attach_eln_publisher(publisher)
-    publisher.start()
+    service, notebook = _notebook_service(session_manager, tmp_path)
     try:
-        _run_one_field_sweep(station, orchestrator, session_manager, qtbot)
+        service.link_experiment("lab")
+        session_manager.approve_eln_publishing("jdoe")
+        run_id = _run_one_field_sweep(station, orchestrator, session_manager, qtbot)
 
-        qtbot.waitUntil(lambda: publisher._adapter.entries != {}, timeout=5000)
-        assert len(publisher._adapter.entries) == 1, "exactly one outbox job, one entry"
-        (entry,) = publisher._adapter.entries.values()
-        assert "Field Sweep" in entry["title"]
+        publish_id = service.publish()
+
+        (page,) = notebook()["entries"].values()
+        assert page["title"] == "Sample A", "one page per experiment, named after it"
+        assert page["body"].count("<h2>I2AS") == 1 and publish_id in page["body"]
+        assert run_id in page["body"] and "FieldSweep" in page["body"]
+        assert session_manager.current_experiment().find_run(run_id).published
     finally:
-        publisher.stop()
+        service.stop()
 
 
-def test_an_attended_agents_eln_draft_needs_approval_then_the_approve_button_queues_it(
-    monitor_win, station, orchestrator, session_manager, qtbot
+def test_an_agent_drafts_and_chooses_a_summary_but_never_reaches_the_notebook(
+    station, orchestrator, session_manager, qtbot, tmp_path
 ):
-    """Attended: draft_eln_entry then publish_eln_entry is refused; Approve queues it once.
+    """The agent's work is analysis only; the operator's publish carries it to the page."""
+    from i2as.session.drafting import FakeDraftClient
 
-    Auto-publish is off here so the finished run produces no outbox job of
-    its own — the only queuer in this test is the operator's Approve click,
-    which is what "enqueues exactly one job" means.
-    """
     session_manager.start_experiment("Sample A", "jdoe", {})
     settled(orchestrator)
-
-    settings = ElnSettings(
-        enabled=True,
-        backend="sim_eln",
-        base_url="https://sim.example",
-        api_key="k",
-        retry_base_s=0.0,
-        retry_max_s=0.0,
-        drain_interval_s=0.05,
-        auto_publish=False,
-    )
-    publisher = ElnPublisher(session_manager, settings, adapter=SimElnAdapter({}))
-    orchestrator.run_finished.connect(publisher.on_run_finished)
-    session_manager.attach_eln_publisher(publisher)
-    publisher.start()
+    service, notebook = _notebook_service(session_manager, tmp_path)
     try:
         run_id = _run_one_field_sweep(station, orchestrator, session_manager, qtbot)
-        assert publisher.pending_count() == 0
-        assert publisher._adapter.entries == {}, "auto-publish is off: nothing queued yet"
-
-        # Attended: drafting is fine but publishing is refused, and the draft
-        # is parked on the run record for a human to approve.
-        session_manager.set_attended(True)
-        from i2as.session.eln.drafting import FakeDraftClient
-
         context = ToolContext(
             experiments=session_manager,
             run_catalog={"FieldSweep": FieldSweep},
-            publisher=publisher,
-            draft_client=FakeDraftClient("The sweep completed cleanly."),
+            draft_client=FakeDraftClient("TITLE: Sweep\nSUMMARY:\nThe sweep completed cleanly."),
         )
         gateway = Gateway(
             engine_of(orchestrator),
@@ -1152,28 +1121,21 @@ def test_an_attended_agents_eln_draft_needs_approval_then_the_approve_button_que
             station_info=station.station_info,
             tool_context=context,
         )
-        draft = gateway.call_tool("draft_eln_entry", {"run_id": run_id})
+        names = {tool.name for tool in gateway.tools()}
+        assert not any("eln" in name or "publish" in name for name in names), "no tool reaches the notebook"
+
+        draft = gateway.call_tool("draft_analysis_summary", {"run_id": run_id})
         assert draft["ok"] is True, draft
-        answer = gateway.call_tool(
-            "publish_eln_entry", {"run_id": run_id, "draft": draft["result"]}
-        )
-        assert answer["ok"] is False
-        assert answer["detail"]["rule"] == "approval_required"
+        chosen = gateway.call_tool("select_analysis_bundle", {"run_id": run_id, "bundle_id": draft["result"]["bundle_id"]})
+        assert chosen["ok"] is True, chosen
 
-        button = monitor_win.findChild(QPushButton, f"agent_approve_{run_id}")
-        assert button is not None, "a pending draft is a row with an Approve button"
-        assert publisher.pending_count() == 0
-
-        button.click()
-
-        assert publisher.pending_count() == 1, "exactly one job, queued by the Approve click"
-        assert session_manager.pending_eln_draft(run_id) == {}
-        qtbot.waitUntil(lambda: publisher.pending_count() == 0, timeout=5000)
-        assert len(publisher._adapter.entries) == 1
-        (entry,) = publisher._adapter.entries.values()
-        assert "sweep completed cleanly" in entry["body_html"]
+        service.link_experiment("lab")
+        session_manager.approve_eln_publishing("jdoe")
+        service.publish()
+        (page,) = notebook()["entries"].values()
+        assert "The sweep completed cleanly." in page["body"]
     finally:
-        publisher.stop()
+        service.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════

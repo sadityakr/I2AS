@@ -1,16 +1,17 @@
-"""The **Connections dialog** — the Agent gateway, and its reach, from the GUI.
+"""The **Connections page** — the Agent gateway, and its reach, from the GUI.
 
-One modal form over a ``GatewayController`` (``i2as/session/gateway/controller.py``),
-opened from the Monitor window's Connections menu. Unlike the eLab setup
-dialog it sits beside, this one has a live side effect on Save: the gateway
-is actually started or stopped right there, not merely written to a
-settings file for the next launch to pick up — though it IS also written to
-``i2as/gui/app_settings.py`` (``gateway_enabled`` / ``gateway_max_role``) so
-the choice survives a restart too.
+One form over a ``GatewayController`` (``i2as/session/gateway/controller.py``),
+shown as the Connections page of the Settings dialog
+(``i2as/gui/settings_dialog.py``). Unlike the eLab setup dialog, this page
+has a live side effect on Save: the gateway is actually started or stopped
+right there, not merely written to a settings file for the next launch to
+pick up — though it IS also written to the ``connections`` section of the
+general settings file (through ``i2as/gui/app_settings.py``) so the choice
+survives a restart too.
 
 **The role selector never shows more than the ceiling.** ``controller.allowed_roles()``
 is monitor.yaml's ``gateway_max_role`` filtered down by
-``role_within_ceiling()`` — this dialog cannot construct a choice the
+``role_within_ceiling()`` — this page cannot construct a choice the
 controller would refuse, so Save never fails for exceeding the ceiling.
 
 **Remote access is a second group on the same form.** It turns the **HTTP
@@ -34,7 +35,6 @@ from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -56,10 +56,10 @@ from i2as.gui.theme import BTN_CLASS_DANGER, BTN_CLASS_PRIMARY, BTN_CLASS_SECOND
 
 logger = logging.getLogger(__name__)
 
-#: How often the connected-agents list refreshes while the dialog is open.
+#: How often the connected-agents list refreshes while the page is open.
 _REFRESH_INTERVAL_MS = 2000
 
-#: The bind addresses the dialog offers, label → address.
+#: The bind addresses the page offers, label → address.
 BIND_CHOICES: tuple[tuple[str, str], ...] = (
     ("This computer only (127.0.0.1)", "127.0.0.1"),
     ("Every network interface (0.0.0.0)", "0.0.0.0"),
@@ -120,16 +120,16 @@ def render_client_config(client: str, url: str, key: str = KEY_PLACEHOLDER) -> s
     return f"URL:     {base}\nHeader:  Authorization: Bearer {key}"
 
 
-class ConnectionsDialog(QDialog):
-    """The Connections dialog: on/off and role ceiling for the Agent gateway,
+class ConnectionsPage(QWidget):
+    """The Connections page: on/off and role ceiling for the Agent gateway,
     plus the HTTP endpoint and its access keys.
 
     Named widgets (``findChild`` objectNames are API): the enabled toggle
     ``connections_enabled_checkbox``, the role selector
     ``connections_role_combo``, the read-only descriptor line
     ``connections_descriptor_label``, the connected-agents list
-    ``connections_list``, the ``connections_save_btn`` /
-    ``connections_close_btn`` buttons and the ``connections_status_label``.
+    ``connections_list``, the ``connections_save_btn`` button and the
+    ``connections_status_label``.
     Remote access adds ``connections_remote_checkbox``,
     ``connections_bind_combo``, ``connections_port_spin``,
     ``connections_public_url_edit``, ``connections_local_url_label``,
@@ -138,22 +138,21 @@ class ConnectionsDialog(QDialog):
     ``connections_client_config``.
 
     Args:
-        controller: The ``GatewayController`` this dialog edits and reads
+        controller: The ``GatewayController`` this page edits and reads
             live connection state from.
         parent: Optional Qt parent widget.
     """
 
     def __init__(self, controller: Any, *, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Connections")
-        self.setObjectName("connections_dialog")
-        self.setMinimumWidth(560)
+        self.setObjectName("connections_page")
         self._controller = controller
-        #: The secret of the key created most recently in THIS dialog, so
+        #: The secret of the key created most recently on THIS page, so
         #: the config box can render it once; never persisted.
         self._last_secret: str | None = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
         root.addWidget(self._build_gateway_group())
         root.addWidget(self._build_remote_group())
@@ -314,12 +313,6 @@ class ConnectionsDialog(QDialog):
     def _build_buttons(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.addStretch(1)
-
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("connections_close_btn")
-        close_btn.setProperty("class", BTN_CLASS_SECONDARY)
-        close_btn.clicked.connect(self.reject)
-        row.addWidget(close_btn)
 
         save_btn = QPushButton("Save")
         save_btn.setObjectName("connections_save_btn")
@@ -491,7 +484,7 @@ class ConnectionsDialog(QDialog):
             else:
                 self._controller.stop()
         except ValueError as error:
-            logger.exception("Connections dialog could not apply the Gateway settings")
+            logger.exception("Connections page could not apply the Gateway settings")
             self._status_label.setText(f"Could not apply: {error}")
             return
 
@@ -506,7 +499,7 @@ class ConnectionsDialog(QDialog):
             else:
                 self._controller.stop_http()
         except (OSError, RuntimeError) as error:
-            logger.exception("Connections dialog could not apply the remote-access settings")
+            logger.exception("Connections page could not apply the remote-access settings")
             remote_note = f" Remote access could not start: {error}"
             remote = False
         app_settings.set_remote_access_enabled(remote)

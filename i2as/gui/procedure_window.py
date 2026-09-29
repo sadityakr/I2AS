@@ -49,7 +49,6 @@ from i2as.core.procedure import BaseProcedure
 from i2as.core.run_builder import PROCEDURE_BUILD_ERRORS, build_procedure
 from i2as.gui import window_geometry
 from i2as.gui.analysis_panel import AnalysisPanel
-from i2as.gui.eln_settings_dialog import ElnSettingsDialog, persist_eln_settings
 from i2as.gui.live_plot_panel import LivePlotPanel
 from i2as.gui.notification_banner import NotificationBanner
 from i2as.gui.form_autosave import FormAutosaveState
@@ -124,14 +123,16 @@ class ProcedureWindow(QMainWindow):
         mirror: The status mirror every read in this window is answered from
             (the status-mirror standard, ``gui/README.md``). Built from the
             proxy when none is given (the inline construction path).
-        session_manager: The L6 ``ExperimentManager`` the **eLab tab** reads
-            the open experiment's runs and pending entries from, and approves
-            through. ``None`` (unit tests, no session layer) leaves that tab
-            in its not-wired state.
-        eln_publisher: The ``ElnPublisher``, for the eLab tab's publish-state
-            chip and the analysis setting. ``None`` leaves both inert.
-        analysis_runner: The ``AnalysisRunner`` the eLab tab's "Run analysis"
-            submits to. ``None`` disables that button.
+        session_manager: The L6 ``ExperimentManager`` the **Analysis tab**
+            reads the open experiment's runs and bundles from. ``None`` (unit
+            tests, no session layer) leaves that tab in its not-wired state.
+        eln_service: The ``ElnService`` behind the Analysis tab's notebook
+            strip. ``None`` leaves the strip inert.
+        analysis_runner: The ``AnalysisRunner`` the Analysis tab's "Run
+            analysis" submits to. ``None`` disables that button.
+        open_notebook_settings: Opens the Settings dialog on its notebook
+            page (the Analysis tab's "Notebook settings…"). ``None`` disables
+            that button.
     """
 
     def __init__(
@@ -146,8 +147,9 @@ class ProcedureWindow(QMainWindow):
         queue_host: RunQueueHost | None = None,
         mirror: StatusMirror | None = None,
         session_manager: Any | None = None,
-        eln_publisher: Any | None = None,
+        eln_service: Any | None = None,
         analysis_runner: Any | None = None,
+        open_notebook_settings: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._station = station
@@ -165,11 +167,12 @@ class ProcedureWindow(QMainWindow):
         # means "no experiment": procedures get an empty context.
         self._get_experiment_info = get_experiment_info
         self._queue_host = queue_host
-        # The eLab tab's three collaborators, all optional: with none of them
+        # The Analysis tab's collaborators, all optional: with none of them
         # the tab still builds and says in one line that nothing is wired.
         self._session_manager = session_manager
-        self._eln_publisher = eln_publisher
+        self._eln_service = eln_service
         self._analysis_runner = analysis_runner
+        self._open_notebook_settings = open_notebook_settings
 
         # Active procedure reference (set on run)
         self._active_procedure: BaseProcedure | None = None
@@ -270,15 +273,15 @@ class ProcedureWindow(QMainWindow):
         root.addLayout(self._build_control_buttons())
 
     def _build_queue_quadrant(self) -> QWidget:
-        """Build the top-right quadrant: the two tabs "Queue" and "eLab".
+        """Build the top-right quadrant: the two tabs "Queue" and "Analysis".
 
         The quadrant is a ``QTabWidget`` (``right_tabs``) over two pages.
         "Queue" is exactly what this quadrant always was — the QueuePanel over
-        the concise Status log, in a draggable vertical splitter. "eLab" is
+        the concise Status log, in a draggable vertical splitter. "Analysis" is
         the :class:`AnalysisPanel`: analyse a finished run and approve the
         entry it produced. Tabs rather than a third split because the two are
         read at different moments — the queue while a run is being set up,
-        the eLab tab once one has finished — and neither is worth halving the
+        the Analysis tab once one has finished — and neither is worth halving the
         other's height.
 
         Returns:
@@ -295,11 +298,11 @@ class ProcedureWindow(QMainWindow):
         self._right_tabs.addTab(self._build_queue_tab(), "Queue")
         self._analysis_panel = AnalysisPanel(
             session_manager=self._session_manager,
-            eln_publisher=self._eln_publisher,
+            eln_service=self._eln_service,
             analysis_runner=self._analysis_runner,
-            open_settings=self.open_eln_settings,
+            open_settings=self._open_notebook_settings,
         )
-        self._right_tabs.addTab(self._analysis_panel, "eLab")
+        self._right_tabs.addTab(self._analysis_panel, "Analysis")
         outer.addWidget(self._right_tabs)
         return widget
 
@@ -461,7 +464,7 @@ class ProcedureWindow(QMainWindow):
         # rule, gui/README.md), like every other per-tick stream here.
         self._mirror.status_updated.connect(self._on_status_snapshot)
 
-        # A finished run is the eLab tab's boundary: it is the moment a run
+        # A finished run is the Analysis tab's boundary: it is the moment a run
         # becomes something to analyse. Connected to a WINDOW slot (the
         # destruction-order rule, gui/README.md) rather than to the panel.
         self._orchestrator.run_finished.connect(self._on_run_finished)
@@ -481,11 +484,11 @@ class ProcedureWindow(QMainWindow):
         self._params_panel.structure_changed.connect(self._populate_axis_selectors)
 
     # ------------------------------------------------------------------
-    # The eLab tab
+    # The Analysis tab
     # ------------------------------------------------------------------
 
     def _on_run_finished(self, manifest: dict) -> None:
-        """Point the eLab tab at the run that just finished.
+        """Point the Analysis tab at the run that just finished.
 
         Args:
             manifest: The run manifest the Orchestrator emitted.
@@ -494,39 +497,8 @@ class ProcedureWindow(QMainWindow):
         self._params_panel.note_run_finished(manifest)
 
     def reload_analysis_panel(self) -> None:
-        """Re-read the **eLab tab** (the settings behind it just changed).
-
-        Called by the Monitor window after its own "eLab notebook…" save, so
-        both entry points to the same dialog leave the same tab up to date.
-        """
+        """Re-read the **Analysis tab** (the settings behind it just changed)."""
         self._analysis_panel.reload()
-
-    def open_eln_settings(self) -> None:
-        """Open the **eLab setup dialog** over the publisher's settings.
-
-        The panel's "eLab setup…" button and the Monitor window's User menu
-        open the same dialog over the same record; saving writes the
-        user-level settings file, hands the new record to the publisher, and
-        refreshes the tab.
-        """
-        settings = getattr(self._eln_publisher, "settings", None)
-        if settings is None:
-            self._banner.show_message(
-                "No electronic lab notebook is wired into this session",
-                BANNER_SEVERITY_WARNING,
-            )
-            return
-
-        def _save(edited: Any) -> None:
-            """Write the edited settings, reload the publisher and the tab.
-
-            Args:
-                edited: The ``ElnSettings`` the dialog's form produced.
-            """
-            persist_eln_settings(edited, self._eln_publisher)
-            self._analysis_panel.reload()
-
-        ElnSettingsDialog(settings, on_save=_save, parent=self).exec()
 
     # ------------------------------------------------------------------
     # Slot handlers

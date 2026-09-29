@@ -17,12 +17,12 @@ What the framework provides, so a setup does not have to:
 - **Safety.** Every action, from any client, is a command checked against the setup's limits, the session envelope, attendance, a kill switch, and run ownership before it reaches hardware. Emergency standby is never refused to anyone.
 - **Constant monitoring.** One tick loop polls every instrument, tracks ramps, detects stalls, records trends, and degrades to a safe state on an unhandled error rather than vanishing with the magnet ramping.
 - **Procedure orchestration.** Runs are validated when they are queued, started by the engine, paused and resumed at safe boundaries, and answered with a verdict at every step.
-- **Metadata and records.** One HDF5 file per run with the sample, the parameters, and the instrument declarations; an append-only log of every agent action; an analysis stage that turns a finished run into a notebook entry.
+- **Metadata and records.** One HDF5 file per run with the sample, the parameters, and the instrument declarations; an append-only log of every agent action; an analysis stage that seals what it derives from a run into an analysis bundle; and one electronic-lab-notebook page per experiment, which finished runs are appended to.
 - **Four surfaces from one declaration.** GUI, MCP, Python, and CLI all see the same instruments, actions, units, and bounds, and are seen doing the same things.
 
 ## Architecture: independent layers
 
-I2AS is built as six layers, and each layer is blind to the ones above it. Drivers know nothing about Virtual Instruments. Virtual Instruments never import a driver; the Station injects one at build time. Procedures never import a driver or a Virtual Instrument; they name the roles they need and receive whatever the rack has. The GUI never imports a driver. The engine never imports the session layer. These are not conventions. Eighteen import contracts are checked in CI, and a change that violates one fails the build.
+I2AS is built as six layers, and each layer is blind to the ones above it. Drivers know nothing about Virtual Instruments. Virtual Instruments never import a driver; the Station injects one at build time. Procedures never import a driver or a Virtual Instrument; they name the roles they need and receive whatever the rack has. The GUI never imports a driver. The engine never imports the session layer. These are not conventions. Twenty-seven import contracts are checked in CI, and a change that violates one fails the build.
 
 The independence buys three things. A vendor driver can be swapped without touching a procedure. Every driver has a simulated twin, so the entire stack above it runs and is tested without a cryostat in the room. And each layer can be reasoned about, and tested, on its own.
 
@@ -44,7 +44,7 @@ Read the middle column bottom-up for **information**, top-down for **actions**.
 
 Every action from every client, whether a button click, an MCP tool call, or a spooled file, becomes one `Command` that names its actor (kind, id, role) and enters the engine through one door, `submit()`. The engine checks the kill switch, attendance, run ownership, and the session envelope, then answers with exactly one `Verdict` on the one stream every client sees. The physicist's window therefore shows the agent being obeyed or refused exactly as it shows itself.
 
-What comes back is more than the verdict. The agent's commands and their answers are appended to `agent_actions.jsonl` inside the experiment folder. Each finished run is an HDF5 file the analysis worker reads in its own process. An analysis report becomes a notebook entry, queued in an outbox and published only when the setup opts in. Copy the experiment folder and you copy the evidence.
+What comes back is more than the verdict. The agent's commands and their answers are appended to `agent_actions.jsonl` inside the experiment folder. Each finished run is an HDF5 file the analysis worker reads in its own process, and what it derives is sealed into an analysis bundle beside it. The notebook layer reads only those bundles and appends them to the experiment's page, through an outbox, once a human has approved publishing for that experiment. Copy the experiment folder and you copy the evidence.
 
 ### Reflection: every surface shows what the others did
 
@@ -71,15 +71,15 @@ GUI panels, the capability manifest, and the MCP tool schemas are all rendered f
 
 An agent declares a role, and one permission table says which action classes that role may take. Each role is a column of that table; nothing is decided by a branch in code.
 
-| Role | read | recovery | run_control | envelope | analysis |
-|---|---|---|---|---|---|
-| `observer` (default) | yes | no | no | no | no |
-| `analyst` | yes | no | no | no | yes |
-| `debug` | yes | unattended only | no | no | no |
-| `session` | yes | yes | yes | no | yes |
-| operator (human) | yes | yes | yes | yes | yes |
+| Role | read | recovery | run_control | envelope | analysis | eln |
+|---|---|---|---|---|---|---|
+| `observer` (default) | yes | no | no | no | no | no |
+| `analyst` | yes | no | no | no | yes | no |
+| `debug` | yes | unattended only | no | no | no | no |
+| `session` | yes | yes | yes | no | yes | no |
+| operator (human) | yes | yes | yes | yes | yes | yes |
 
-`analysis` covers writing and running analysis recipes and scripts over finished runs in the analysis worker, and parking their results for a human to approve. The `analyst` role gets that and nothing that touches the station, so an agent, whether embedded or connected over MCP, can be trusted to analyse without being trusted to measure. See [docs/analysis-agent.md](docs/analysis-agent.md) for the agent's analysis loop, the analysis sandbox and the plan for the embedded analyst.
+`analysis` covers writing and running analysis recipes and scripts over finished runs in the analysis worker, drafting a summary with a model, and choosing which analysis bundle represents a run. `eln` is the notebook (linking a page, reading it, publishing to it): it is the operator's, refused to every agent role, and exists as a column so it can be opened to a role later by changing one cell. The `analyst` role gets that and nothing that touches the station, so an agent, whether embedded or connected over MCP, can be trusted to analyse without being trusted to measure. See [docs/analysis-agent.md](docs/analysis-agent.md) for the agent's analysis loop, the analysis sandbox and the plan for the embedded analyst.
 
 Three mechanisms can only ever subtract from that table. Each door has a ceiling (`gateway_max_role`, `spool_max_role`, both `observer` by default) that caps what a connection may claim. The kill switch, set by the human, narrows every agent to read-only or to nothing at all. And run ownership means an agent may abort only the run it started, unless it declares a takeover with a written reason.
 
@@ -140,7 +140,7 @@ The `.mcp.json` in this repository registers that MCP server for Claude Code wit
 
 ### Remote access: the same tools at a URL
 
-`python -m i2as.mcp` serves MCP on stdio, which means the client has to launch it, on this machine. A client on the web (ChatGPT, Open WebUI, a hosted agent) cannot. For those the running app can also serve the gateway over MCP's Streamable HTTP transport, from the Monitor window's **Connections → Gateway Settings…** dialog:
+`python -m i2as.mcp` serves MCP on stdio, which means the client has to launch it, on this machine. A client on the web (ChatGPT, Open WebUI, a hosted agent) cannot. For those the running app can also serve the gateway over MCP's Streamable HTTP transport, from the Monitor window's **Settings → Connections…** page:
 
 1. Turn the gateway on, then tick **Serve the gateway over HTTP**. The app listens on `http://127.0.0.1:8765/mcp` (the port and the bind address are yours to change).
 2. Press **New key…** to issue an access key. A key *is* an agent: it names the actor id stamped on everything that connection does and the role it connects with, capped by the setup's ceiling like any other client. The secret is shown once; only its digest is kept, and a key is revoked by name.
@@ -148,6 +148,18 @@ The `.mcp.json` in this repository registers that MCP server for Claude Code wit
 4. Pick the client in **Client config** and copy the text. Claude Code takes the URL plus an `Authorization: Bearer <key>` header; Open WebUI takes the URL with the key as its bearer token; ChatGPT's connectors cannot send a header, so for them the key travels in the URL as `…/mcp/<key>` with authentication set to none — treat that URL as the password it is.
 
 The endpoint is the stdlib and nothing else: one `POST` per JSON-RPC message, a `GET` that streams the app's events as server-sent events, a `DELETE` that ends a session. Every key holds exactly one connection to the local-socket gateway server, opened on first use, so a web client is seen by the physicist's window exactly as the stdio adapter is: the same `hello`, the same verdicts, the same Agents panel. A request without a valid key is `401`; a browser origin that is neither local nor the published public URL is `403`.
+
+### Settings, and analysis in a container
+
+The Monitor window's **Settings** menu opens one dialog with a page per concern: **Connections** (the gateway and remote access above) and **Analysis** edit the machine's `settings.json` (per-user config directory, `%APPDATA%\I2AS` on Windows); **Electronic notebook** edits the logged-in user's own profile (`users/<user>/profile.yaml` there: their notebook account, the profile a new experiment uses, their session list). No settings file holds a secret: API keys are in the operating system's keyring.
+
+Analysing finished runs automatically needs a container engine: every recipe and analysis script runs in Docker (or Podman) with no network and only the run file, its output folder and the experiment's recipes mounted. Install Docker Desktop, then in **Settings → Analysis** press **Build image**, then switch analysis on. The switch refuses, and says why, while the engine is not running or the image is missing. A setup that never analyses needs no engine. Details: [docs/analysis-agent.md](docs/analysis-agent.md#the-sandbox).
+
+### The notebook: one page per experiment, and blocks you write yourself
+
+When an experiment is started, it is linked to ONE page of your electronic lab notebook: an existing page you search for, or a new one created from your template (queued, so it works offline), with the samples it uses linked to it. Fields can be read back from the page and its samples into the sample metadata every later run stamps into its file. Once a human approves publishing for the experiment, **Publish new runs** in the procedure window's Analysis tab appends one timestamped section per publish, covering each finished run and the analysis bundle that represents it; earlier sections and anything people wrote on the page are never touched, and the page's fields are overwritten with the latest values.
+
+I2AS ships and maintains one notebook **connector**, for eLabFTW. Everything notebook-specific is a **block** you can write or have a coding agent write: a connector for another notebook, a **renderer** that lays out the section differently, a YAML **profile** that maps fields. Blocks live in `<user config>/blocks/`, are checked with `python -m i2as.blocks check <file>`, and run in a helper process with only what they need, never inside the station, so a block that fails costs a retry, never the experiment. See [docs/eln-analysis-publishing.md](docs/eln-analysis-publishing.md).
 
 ## Layout
 
@@ -157,10 +169,11 @@ The endpoint is the stdlib and nothing else: one `POST` per JSON-RPC message, a 
 | `i2as/virtual_instruments` | L1 — Virtual Instruments with `@monitored` / `@control` declarations |
 | `i2as/core` | L2–L5 — Station, Orchestrator, procedure base, data manager, control contract |
 | `i2as/procedures` | L4 — measurement procedures (field sweep, temperature sweep, imaging, time series) |
-| `i2as/session` | L6 — experiment manager, run queue, agent gateway, agent feed, ELN |
+| `i2as/session` | L6 — experiment manager, run queue, agent gateway, agent feed, per-user profiles and keys, the notebook bridge (`session/eln`) |
 | `i2as/gui` | the operator's window |
 | `i2as/mcp`, `i2as/ctl` | agent transports: MCP adapter (stdio and HTTP), access keys, and the command-line client |
-| `i2as/analysis` | analysis recipes, analysis scripts and the analysis worker |
+| `i2as/analysis` | analysis recipes, analysis scripts, the analysis worker, and the bundle schema its results are sealed in |
+| `i2as/blocks` | what a user block is written against — the connector and renderer contracts, safe markup, the helper-process host, the checker — and the shipped blocks |
 | `i2as/troubleshoot` | `i2as-doctor`, an offline toolbox for drivers and configs |
 
-Eighteen import contracts, checked in CI by `make contracts`, keep each layer blind to the ones above it.
+Twenty-seven import contracts, checked in CI by `make contracts`, keep each layer blind to the ones above it.

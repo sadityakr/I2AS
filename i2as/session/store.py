@@ -15,9 +15,17 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
+from i2as.analysis.bundle import (
+    LEGACY_BUNDLE_ID,
+    SCRIPT_BUNDLE_PREFIX,
+    Bundle,
+    is_bundle_id,
+    read_bundle,
+)
 from i2as.analysis.report import RECIPES_DIRNAME, SCRIPTS_DIRNAME
 from i2as.session.models import SCHEMA_VERSION, ExperimentRecord, Session, User
 
@@ -49,6 +57,7 @@ DEFAULT_SESSIONS_DIRNAME = "sessions"
 #: How many recently active sessions the registry remembers.
 MAX_RECENT_SESSIONS = 10
 _ANALYSIS_DIRNAME = "analysis"
+_ELN_DIRNAME = "eln"
 
 
 def is_plain_name(name: object) -> bool:
@@ -130,7 +139,9 @@ class ExperimentStore:
                 agent_actions.jsonl         # the Agent feed
                 analysis/                   # the analysis stage's own folder
                     recipes/                # this experiment's recipe scripts
-                    <run_id>/               # one run's report.json + figures
+                    <run_id>/<bundle_id>/   # one analysis bundle (bundle.json + files)
+                    <run_id>/scripts/<id>/  # one analysis script's bundle
+                eln/                        # the experiment's notebook link: profile copy, ledger
                 data/                       # HDF5 files; sub-folders allowed
                     <sub-folders>/
 
@@ -375,6 +386,102 @@ class ExperimentStore:
         """
         return self.report_dir(experiment_id, run_id) / SCRIPTS_DIRNAME / script_id
 
+    def bundle_dir(self, experiment_id: str, run_id: str, bundle_id: str) -> Path:
+        """Return the folder of one **analysis bundle** of one run.
+
+        A recipe's bundle is ``analysis/<run_id>/<bundle_id>``; an analysis
+        script's is its own folder, ``scripts/<script_id>``, known by the id
+        ``script-<script_id>``; the ``legacy`` id names the run folder itself,
+        where a report written before bundles existed lives.
+
+        Args:
+            experiment_id: The store key.
+            run_id: The run.
+            bundle_id: The bundle's id.
+
+        Returns:
+            The folder (may not exist).
+
+        Raises:
+            ValueError: ``bundle_id`` is not a plain bundle id, so it can never
+                name a folder outside the run's own analysis folder.
+        """
+        if not is_bundle_id(bundle_id) or not is_plain_name(run_id):
+            raise ValueError(f"not a bundle id: {bundle_id!r}")
+        run_dir = self.report_dir(experiment_id, run_id)
+        if bundle_id == LEGACY_BUNDLE_ID:
+            return run_dir
+        if bundle_id.startswith(SCRIPT_BUNDLE_PREFIX):
+            return self.script_dir(experiment_id, run_id, bundle_id[len(SCRIPT_BUNDLE_PREFIX):])
+        return run_dir / bundle_id
+
+    def read_bundle(self, experiment_id: str, run_id: str, bundle_id: str) -> Bundle | None:
+        """Read one bundle of one run, or ``None`` when there is none.
+
+        Args:
+            experiment_id: The store key.
+            run_id: The run.
+            bundle_id: The bundle's id.
+
+        Returns:
+            The bundle (sealed, or a legacy report read as one), or ``None``
+            for an unknown id, a missing folder or an unreadable manifest.
+        """
+        try:
+            folder = self.bundle_dir(experiment_id, run_id, bundle_id)
+        except ValueError:
+            return None
+        return read_bundle(folder, bundle_id=bundle_id)
+
+    def list_bundles(self, experiment_id: str, run_id: str) -> list[Bundle]:
+        """Return every bundle of one run, oldest first.
+
+        Args:
+            experiment_id: The store key.
+            run_id: The run.
+
+        Returns:
+            The run's recipe bundles, its script bundles and — when a report
+            predating bundles sits in the run folder — that one as
+            ``legacy``, ordered by the time each was sealed. Unreadable
+            folders are skipped.
+        """
+        if not is_plain_name(run_id):
+            return []
+        run_dir = self.report_dir(experiment_id, run_id)
+        found: list[Bundle] = []
+        legacy = read_bundle(run_dir, bundle_id=LEGACY_BUNDLE_ID)
+        if legacy is not None and not (run_dir / "bundle.json").exists():
+            found.append(legacy)
+        candidates: list[tuple[str, Path]] = []
+        try:
+            for child in run_dir.iterdir():
+                if child.is_dir() and child.name != SCRIPTS_DIRNAME and is_bundle_id(child.name):
+                    candidates.append((child.name, child))
+            scripts = run_dir / SCRIPTS_DIRNAME
+            if scripts.is_dir():
+                for child in scripts.iterdir():
+                    if child.is_dir() and is_bundle_id(child.name):
+                        candidates.append((SCRIPT_BUNDLE_PREFIX + child.name, child))
+        except OSError:
+            candidates = []
+        for bundle_id, folder in candidates:
+            bundle = read_bundle(folder, bundle_id=bundle_id)
+            if bundle is not None:
+                found.append(bundle)
+        return sorted(found, key=lambda b: (b.created_utc, b.bundle_id))
+
+    def eln_dir(self, experiment_id: str) -> Path:
+        """Return the experiment's notebook folder (profile copy, publish ledger).
+
+        Args:
+            experiment_id: The store key.
+
+        Returns:
+            ``<root>/<experiment_id>/eln`` (may not exist yet).
+        """
+        return self.experiment_dir(experiment_id) / _ELN_DIRNAME
+
     def relativize_data_file(self, experiment_id: str, path: str | Path) -> str:
         """Return ``path`` relative to the experiment's session folder, when inside it.
 
@@ -496,14 +603,25 @@ class SessionStore:
     **Session**). The store creates nothing on construction.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        registry: tuple[Callable[[], dict[str, object]], Callable[[dict[str, object]], None]] | None = None,
+    ) -> None:
         """Remember the registry's folder without touching the filesystem.
 
         Args:
             root: The measurement root; ``sessions.json`` is read and written
-                here.
+                here, and sessions nobody chose a folder for are created here.
+            registry: ``(read, write)`` for the active/recent list, when it
+                lives somewhere other than ``sessions.json`` — the running
+                user's own profile (``i2as.session.user_profile``). ``None``
+                keeps it in ``sessions.json``. Either way ``sessions.json``
+                keeps naming the last active session, which is what
+                ``i2as-ctl`` reads.
         """
         self._root = Path(root)
+        self._registry_io = registry
 
     @property
     def root(self) -> Path:
@@ -634,7 +752,10 @@ class SessionStore:
         _write_json_atomic(Path(folder) / _SESSION_FILENAME, session.to_dict())
 
     def _registry(self) -> dict[str, object]:
-        data = _read_json(self.registry_path)
+        if self._registry_io is not None:
+            data: object = self._registry_io[0]()
+        else:
+            data = _read_json(self.registry_path)
         return data if isinstance(data, dict) else {}
 
     def get_active(self) -> Path | None:
@@ -668,14 +789,22 @@ class SessionStore:
         recent = [str(path)] + [
             entry for entry in self._recent_entries() if entry != str(path)
         ]
-        _write_json_atomic(
-            self.registry_path,
-            {
-                "active": str(path),
-                "recent": recent[:MAX_RECENT_SESSIONS],
-                "schema_version": SCHEMA_VERSION,
-            },
-        )
+        registry: dict[str, object] = {
+            "active": str(path),
+            "recent": recent[:MAX_RECENT_SESSIONS],
+            "schema_version": SCHEMA_VERSION,
+        }
+        if self._registry_io is not None:
+            self._registry_io[1](registry)
+            # The machine file keeps naming the last active session, for the
+            # command-line client, which has no notion of who is logged in.
+            machine = _read_json(self.registry_path)
+            machine = dict(machine) if isinstance(machine, dict) else {}
+            machine.update({"active": str(path), "schema_version": SCHEMA_VERSION})
+            machine.setdefault("recent", [])
+            _write_json_atomic(self.registry_path, machine)
+            return
+        _write_json_atomic(self.registry_path, registry)
 
     def resolve_active(self, user_id: str) -> Path:
         """Return the active session folder, creating one on first launch.

@@ -20,7 +20,6 @@ import pytest
 from i2as.analysis.report import (
     MAX_REPORT_BYTES,
     AnalysisReport,
-    FigureRef,
     output_file,
     read_report_file,
 )
@@ -80,18 +79,35 @@ def test_a_report_file_is_read_within_its_limit(tmp_path):
     assert read_report_file(tmp_path / "absent.json") is None
 
 
-def test_the_publisher_attaches_only_safe_figures(report_dir, tmp_path):
-    from i2as.session.eln.publisher import ElnPublisher
+def test_publishing_attaches_only_sealed_figures_inside_their_bundle(tmp_path):
+    """A figure a worker names is attached only if it is a sealed file in its own bundle."""
+    from i2as.analysis.bundle import Producer, seal_bundle
+    from i2as.session.eln.publishing import plan_publish
+    from i2as.blocks.profile import Profile
+    from i2as.session.models import ExperimentRecord, RunRecord
 
     secret = tmp_path / "eln-settings.json"
     secret.write_text("{}", encoding="utf-8")
-    report = AnalysisReport(
-        figures=(FigureRef(file="fit.png", caption="fit"), FigureRef(file=str(secret))),
+    folder = tmp_path / "b1"
+    folder.mkdir()
+    (folder / "fit.png").write_bytes(b"PNG")
+    bundle = seal_bundle(
+        folder,
+        {"status": "ok", "figures": [{"file": "fit.png", "caption": "fit"}, {"file": str(secret)}]},
+        bundle_id="b1",
+        experiment_id="001_x",
+        run_ids=("r1",),
+        producer=Producer(),
     )
-
-    attachments = ElnPublisher._figure_attachments(report, report_dir)
-
-    assert attachments == [{"path": str((report_dir / "fit.png").resolve()), "comment": "fit"}]
+    run = RunRecord(run_id="r1", status="done", selected_bundle="b1")
+    plan = plan_publish(
+        ExperimentRecord(experiment_id="001_x", runs=[run]),
+        [run],
+        read_bundle=lambda *_: bundle,
+        bundle_dir=lambda *_: folder,
+        profile=Profile(),
+    )
+    assert [(a.path, a.caption) for a in plan.attachments] == [(str((folder / "fit.png").resolve()), "fit")]
 
 
 @pytest.mark.parametrize(
@@ -125,14 +141,14 @@ def test_the_store_never_leaves_its_root(tmp_path):
 
 
 def test_the_gateway_is_handed_the_analysis_collaborators():
-    """Every agent connection gets the runner and publisher the GUI uses."""
+    """Every agent connection gets the runner the GUI uses — and nothing of the notebook."""
     from i2as.main import gateway_tool_context
 
-    manager, runner, publisher = object(), types.SimpleNamespace(), types.SimpleNamespace()
+    manager, runner = object(), types.SimpleNamespace()
 
-    context = gateway_tool_context(manager, {"X": object}, publisher, runner)
+    context = gateway_tool_context(manager, {"X": object}, runner)
 
     assert context.experiments is manager
     assert context.analysis_runner is runner
-    assert context.publisher is publisher
+    assert not hasattr(context, "publisher") and not hasattr(context, "eln_service")
     assert set(context.run_catalog) == {"X"}

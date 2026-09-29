@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import qtawesome as qta
@@ -33,7 +34,7 @@ from i2as.gui.form_autosave import FormAutosaveState
 from i2as.gui.theme import TEXT_PRIMARY
 from i2as.session.manager import ExperimentManager
 
-_ELN_NOT_CONFIGURED_TEXT = "eLab publishing is not configured yet"
+_ELN_NOT_CONFIGURED_TEXT = "No notebook page linked yet"
 _OUTSIDE_SESSION_NOTE_TEXT = "saving outside the current session folder"
 
 
@@ -57,9 +58,13 @@ class ExperimentInfoPanel(QWidget):
         self,
         parent: QWidget | None = None,
         session_manager: ExperimentManager | None = None,
+        after_start: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._session_manager = session_manager
+        # Called once an experiment has been started from this panel — the
+        # Monitor window offers to link it to its notebook page there.
+        self._after_start = after_start
         # Data Dir transition tracking (rule 3): _last_experiment_id
         # detects an actual open/switch transition (vs. a same-experiment
         # experiment_changed re-emit from e.g. an attendance/findings edit);
@@ -319,6 +324,9 @@ class ExperimentInfoPanel(QWidget):
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Could not start experiment", str(exc))
+            return
+        if self._after_start is not None:
+            self._after_start()
 
     def _run_close_dialog(self) -> None:
         assert self._session_manager is not None
@@ -372,11 +380,14 @@ class ExperimentInfoPanel(QWidget):
         self._attended_checkbox.setChecked(attended)
         self._attended_checkbox.blockSignals(False)
 
-        eln_link = record.get("eln_link") or {}
-        if eln_link.get("url"):
-            self._eln_status_label.setText(f"Published: {eln_link['url']}")
+        binding = record.get("eln") or {}
+        entry = binding.get("entry") or {}
+        if entry.get("url") or entry.get("entry_id"):
+            self._eln_status_label.setText(f"Notebook page: {entry.get('url') or entry.get('entry_id')}")
+        elif binding.get("create_pending"):
+            self._eln_status_label.setText("Notebook page being created…")
         else:
-            self._eln_status_label.setText(f"Not published yet — {_ELN_NOT_CONFIGURED_TEXT}")
+            self._eln_status_label.setText(_ELN_NOT_CONFIGURED_TEXT)
 
         self._force_data_dir_on_open(record.get("experiment_id", ""))
 

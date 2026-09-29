@@ -7,7 +7,7 @@ authority this setup will EVER hand an out-of-process client — that stays a
 setup decision, made once, in the file, exactly as every safety limit is.
 What used to require an edit and a restart is only *whether the door is open
 at all* and *which role, up to that ceiling, walks through it*: this
-controller is what the Monitor window's Connections menu drives to change
+controller is what the Settings dialog's Connections page drives to change
 either, without touching ``monitor.yaml`` or restarting the app.
 
 **Restart, not reconfigure, on a role change.** Changing the ceiling a

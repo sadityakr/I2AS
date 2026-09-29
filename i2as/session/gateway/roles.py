@@ -115,8 +115,8 @@ class Role(str, Enum):
         DEBUG: Reads, and — only while the experiment is UNATTENDED — takes
             recovery actions to keep a run alive.
         ANALYST: Reads, and analyses finished runs — writes and runs
-            analysis code in the analysis worker and parks its results for a
-            human — but takes no action on the station at all.
+            analysis code in the analysis worker and chooses which bundle
+            represents a run — but takes no action on the station at all.
         SESSION: Runs the experiment: recovery and run control both, within
             the session envelope the human set.
     """
@@ -175,6 +175,14 @@ PERMISSION_MATRIX: dict[ActionClass, dict[Role, Permission]] = {
         Role.ANALYST: Permission.PERMITTED,
         Role.DEBUG: Permission.REFUSED,
         Role.SESSION: Permission.PERMITTED,
+    },
+    # The notebook is the operator's for now: no agent role reaches it. Open
+    # it to a role by changing its cell here — nothing else needs to move.
+    ActionClass.ELN: {
+        Role.OBSERVER: Permission.REFUSED,
+        Role.ANALYST: Permission.REFUSED,
+        Role.DEBUG: Permission.REFUSED,
+        Role.SESSION: Permission.REFUSED,
     },
 }
 
