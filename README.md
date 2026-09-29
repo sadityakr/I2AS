@@ -20,6 +20,19 @@ What the framework provides, so a setup does not have to:
 - **Metadata and records.** One HDF5 file per run with the sample, the parameters, and the instrument declarations; an append-only log of every agent action; an analysis stage that seals what it derives from a run into an analysis bundle; and one electronic-lab-notebook page per experiment, which finished runs are appended to.
 - **Four surfaces from one declaration.** GUI, MCP, Python, and CLI all see the same instruments, actions, units, and bounds, and are seen doing the same things.
 
+### A robust core, and code at different levels of trust
+
+Anyone can now write code with an agent, but not everyone can vibe-code a robust system. I2AS supplies the parts that are hard to get right, and everything specific to one lab is a small block the user writes, often with a coding agent, and improves over time. The price of that freedom is one rule: **no user or agent code may ever affect a running experiment, or the operator's ability to run one.** Code runs at different levels of trust, and the less trusted it is, the further from the instrument thread it runs:
+
+| Tier | Code | Who writes it | Where it runs | What its failure may cost |
+|---|---|---|---|---|
+| 0 Core | Engine, safety checks, session layer, gateway, outbox | This repository | Instrument thread (engine), GUI thread (clients) | Nothing; the core degrades to a safe state |
+| 1 Certified | Drivers, Virtual Instruments, procedures | The user, certified by the conformance suite | The instrument thread (they need the hardware in real time) | Caught by the conformance tests before it touches hardware |
+| 2 User blocks | ELN connectors, renderers, profiles | The user, often vibe-coded | A helper process with only the files, network and one key it needs; killed if it hangs | A visible error and a retry |
+| 3 Agent code | Analysis recipes and scripts | Agents at runtime, or the user | A container with no network and three mounts | A failed analysis bundle |
+
+A block's tier is fixed by what it is, never earned. Every kind of block comes with a contract, a scaffold, a checker, and a skill that teaches a coding agent to write one.
+
 ## Architecture: independent layers
 
 I2AS is built as six layers, and each layer is blind to the ones above it. Drivers know nothing about Virtual Instruments. Virtual Instruments never import a driver; the Station injects one at build time. Procedures never import a driver or a Virtual Instrument; they name the roles they need and receive whatever the rack has. The GUI never imports a driver. The engine never imports the session layer. These are not conventions. Twenty-seven import contracts are checked in CI, and a change that violates one fails the build.
