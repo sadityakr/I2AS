@@ -887,7 +887,7 @@ class SessionStore:
             except OSError:
                 return None
             if age < _UNREADABLE_LOCK_GRACE_S:
-                return {"pid": None, "host": "unknown", "since": "just now"}
+                return {"unreadable": True}
             return None
         pid = data.get("pid")
         host = data.get("host")
@@ -919,6 +919,11 @@ class SessionStore:
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
                 holder = self.lock_holder(folder)
+                if holder is not None and holder.get("unreadable"):
+                    raise SessionLockedError(
+                        f"{folder} is being opened by another application right now "
+                        f"(its lock file {path} is being written). Try again in a few seconds."
+                    ) from None
                 if holder is not None:
                     raise SessionLockedError(
                         f"{folder} is in use by process {holder.get('pid')} on "

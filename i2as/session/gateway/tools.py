@@ -1830,8 +1830,16 @@ class ToolContext:
             The experiment id.
 
         Raises:
-            ToolError: If none was given and no experiment is open.
+            ToolError: If none was given and no experiment is open, or the
+                session is held by another running station (its experiments
+                are not this station's to read or write).
         """
+        held = getattr(self.experiments, "runs_held_reason", None)
+        if callable(held) and held():
+            raise ToolError(
+                f"{tool_name}: this session is held — {held()}",
+                {"rule": "session_held"},
+            )
         if requested:
             if not is_plain_name(requested):
                 raise ToolError(

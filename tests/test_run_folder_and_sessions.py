@@ -525,3 +525,48 @@ def test_a_lock_being_written_counts_as_held(tmp_path):
     old = os.path.getmtime(folder / SESSION_LOCK_FILENAME) - 60
     os.utime(folder / SESSION_LOCK_FILENAME, (old, old))
     store.acquire_lock(folder)  # debris: taken over
+
+
+def test_a_held_session_gives_agents_no_experiment(tmp_path, roster, engine):
+    from i2as.session.gateway.tools import ToolContext, ToolError
+
+    orchestrator, _verdicts = engine
+    manager = ExperimentManager(
+        store=ExperimentStore(tmp_path / "S"), roster=roster, orchestrator=orchestrator,
+        runs_held="in use by station 2",
+    )
+    context = ToolContext(experiments=manager)
+    with pytest.raises(ToolError, match="held"):
+        context.experiment_id("write_analysis_recipe", "001_shared")
+
+
+def test_a_held_session_adopts_and_drains_no_notebook_outbox(tmp_path, roster, engine):
+    from types import SimpleNamespace
+
+    from i2as.session.eln.service import ElnService
+
+    orchestrator, _verdicts = engine
+    store = ExperimentStore(tmp_path / "S")
+    store.save(ExperimentRecord(experiment_id="001_shared", status="open"))
+    outbox = store.eln_dir("001_shared") / "outbox.jsonl"
+    outbox.parent.mkdir(parents=True, exist_ok=True)
+    outbox.write_text("")
+    manager = ExperimentManager(
+        store=store, roster=roster, orchestrator=orchestrator, runs_held="in use by station 2",
+    )
+    service = ElnService.__new__(ElnService)
+    service._manager = manager
+    service._outboxes = {}
+    service._drain_queued = SimpleNamespace(is_set=lambda: False, set=lambda: pytest.fail("drained"))
+    service._adopt_outboxes()
+    assert service._outboxes == {}
+    service.drain_soon()
+
+
+def test_an_unreadable_lock_explains_itself(tmp_path):
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "S"
+    store.create_session(folder, "S", "jdoe")
+    (folder / SESSION_LOCK_FILENAME).write_text("")
+    with pytest.raises(SessionLockedError, match="being opened by another application"):
+        store.acquire_lock(folder)

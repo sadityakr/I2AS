@@ -166,3 +166,13 @@ Deferred, with reason:
 | minor | Lock file created but not yet written read as free | An unreadable lock counts as held for 10 s, then as debris. |
 | minor | `_drain_again` skipped when the old drain failed | Re-drain happens before the error return. |
 | minor | `session_about_to_change` save unguarded | Guarded. |
+
+### Final re-audit
+
+| # | Finding | Response |
+|---|---|---|
+| MAJOR | The notebook service adopted and drained a held session's outboxes (the other station's jobs — duplicate entries) | A held session's outboxes are neither adopted nor drained. |
+| minor | Agent tools could still write files (recipes) into a held session's experiments | `ToolContext.experiment_id` refuses every experiment tool while the session is held (`rule: session_held`). |
+| minor | Unreadable-lock refusal named "process None on unknown" | Says the session is being opened by another application, try again in a few seconds. |
+
+Everything else in the re-audit was verified OK by the reviewer.

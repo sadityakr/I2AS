@@ -543,8 +543,15 @@ class ElnService(QObject):
         else:
             self.drain_soon()
 
+    def _session_held(self) -> bool:
+        """Whether the open session is held by another running station (its outboxes are not ours)."""
+        held = getattr(self._manager, "runs_held_reason", None)
+        return bool(callable(held) and held())
+
     def _adopt_outboxes(self) -> None:
         """Pick up journals left by an earlier run of the application."""
+        if self._session_held():
+            return  # the other station drains them; draining here would duplicate entries
         try:
             experiment_ids = self._manager.store.list_experiments()
         except OSError:
@@ -570,7 +577,7 @@ class ElnService(QObject):
         loaded while the drain runs can never receive another session's
         notebook outcomes (experiment ids repeat across sessions).
         """
-        if self._drain_queued.is_set():
+        if self._drain_queued.is_set() or self._session_held():
             return
         self._drain_queued.set()
         store = self._manager.store
