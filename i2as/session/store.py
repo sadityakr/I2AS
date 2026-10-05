@@ -883,25 +883,46 @@ class SessionStore:
         return dict(data)
 
     def acquire_lock(self, folder: str | Path) -> None:
-        """Mark *folder* as in use by this process.
+        """Mark *folder* as in use by this process — atomically.
+
+        The lock file is created exclusively (``O_CREAT | O_EXCL``), so two
+        stations racing for the same folder cannot both win. A lock this
+        process already holds is kept; one left by a process on this host
+        that is no longer running is taken over.
 
         Args:
             folder: A session folder.
 
         Raises:
-            SessionLockedError: If another live process holds it.
+            SessionLockedError: If another live process (or another host)
+                holds it.
             OSError: If the lock cannot be written.
         """
-        holder = self.lock_holder(folder)
-        if holder is not None:
-            raise SessionLockedError(
-                f"{folder} is in use by process {holder.get('pid')} on "
-                f"{holder.get('host')} since {holder.get('since')}"
-            )
-        _write_json_atomic(
-            Path(folder) / SESSION_LOCK_FILENAME,
-            {"pid": os.getpid(), "host": _HOSTNAME, "since": _utc_now_iso()},
-        )
+        path = Path(folder) / SESSION_LOCK_FILENAME
+        payload = json.dumps({"pid": os.getpid(), "host": _HOSTNAME, "since": _utc_now_iso()})
+        for _attempt in range(2):
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                holder = self.lock_holder(folder)
+                if holder is not None:
+                    raise SessionLockedError(
+                        f"{folder} is in use by process {holder.get('pid')} on "
+                        f"{holder.get('host')} since {holder.get('since')}. If that "
+                        f"station is no longer running, delete {path} and try again."
+                    ) from None
+                data = _read_json(path)
+                if isinstance(data, dict) and data.get("pid") == os.getpid() and data.get("host") == _HOSTNAME:
+                    return  # already ours
+                try:
+                    path.unlink()  # stale: its process is gone
+                except FileNotFoundError:
+                    pass
+                continue
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            return
+        raise SessionLockedError(f"{folder}: another process took the lock while it was being replaced")
 
     def release_lock(self, folder: str | Path) -> None:
         """Drop this process's lock on *folder*, if it holds one (never raises).

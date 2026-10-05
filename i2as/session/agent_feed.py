@@ -314,9 +314,6 @@ class AgentFeed:
             self._path,
         )
 
-    # ── Recording ─────────────────────────────────────────────────────
-
-
     def detach(self, engine: _Engine) -> None:
         """Stop recording an engine's streams (the reverse of ``attach``). Never raises.
 
@@ -336,6 +333,9 @@ class AgentFeed:
             except (TypeError, RuntimeError, AttributeError):
                 pass
         logger.info("Agent feed detached for experiment %r", self.experiment_id)
+
+    # ── Recording ─────────────────────────────────────────────────────
+
     def record_command(self, command: Command) -> None:
         """Record one command submitted by a non-operator actor.
 

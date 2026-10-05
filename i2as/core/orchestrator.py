@@ -18,12 +18,14 @@ import functools
 import inspect
 import json
 import logging
+import os
 from dataclasses import field, replace
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
@@ -44,7 +46,13 @@ from i2as.core.plan import (
 )
 from i2as.core.ramps import RampRecord, build_ramp_records
 from i2as.core.request_spool import RequestSpool
-from i2as.core.run_naming import RunPlacement, normalize_run_subfolder, place_run
+from i2as.core.run_naming import (
+    RunPlacement,
+    normalize_run_subfolder,
+    place_run,
+    record_issued,
+    run_target_folder,
+)
 from i2as.core.run_builder import build_procedure
 from i2as.core.stall_detection import (
     StallConfig,
@@ -1256,6 +1264,8 @@ class Orchestrator(QObject):
                 return
         try:
             normalized = normalize_run_subfolder(subfolder) if data_directory else ""
+            if data_directory:
+                run_target_folder(data_directory, normalized)  # refuses an escape now
         except ValueError as exc:
             self._action_blocked(f"Run subfolder refused: {exc}", detail={"rule": "run_subfolder"})
             return
@@ -1282,6 +1292,25 @@ class Orchestrator(QObject):
         if self._state not in (OrchestratorState.IDLE, OrchestratorState.ERROR):
             return f"The station is busy ({self._state.value})"
         return ""
+
+    def _run_folder_refusal(self) -> bool:
+        """Refuse the run in flight when the run subfolder leads outside the experiment.
+
+        Checked before any side effect (a manual ramp cancelled, monitoring
+        started, a queued run taken off the queue), so a refusal changes
+        nothing.
+
+        Returns:
+            ``True`` when the run was refused (the verdict is already out).
+        """
+        if not self._run_folder:
+            return False
+        try:
+            run_target_folder(self._run_folder, self._run_subfolder)
+        except ValueError as exc:
+            self._action_blocked(f"Run refused: {exc}", detail={"rule": "run_folder"})
+            return True
+        return False
 
     def _no_experiment_refusal(self) -> bool:
         """Refuse the run in flight when the session layer says no experiment is open.
@@ -1384,7 +1413,7 @@ class Orchestrator(QObject):
         stopped) and the Orchestrator degrades to ERROR instead of crashing
         the application.
         """
-        if self._no_experiment_refusal():
+        if self._no_experiment_refusal() or self._run_folder_refusal():
             return
         manual_ramping = (
             self._state == OrchestratorState.RAMPING and self._procedure is None
@@ -1433,7 +1462,7 @@ class Orchestrator(QObject):
             return None
         floor = max(
             self._run_number_floor,
-            self._last_issued_run_number.get(self._run_folder, 0) + 1,
+            self._last_issued_run_number.get(_folder_key(self._run_folder), 0) + 1,
         )
         return place_run(
             self._run_folder,
@@ -1461,9 +1490,9 @@ class Orchestrator(QObject):
         procedure.place_data_file(placement.data_directory, placement.file_name)
         number = int(placement.run_id.rsplit("-", 1)[-1])
         assert self._run_folder is not None
-        self._last_issued_run_number[self._run_folder] = max(
-            number, self._last_issued_run_number.get(self._run_folder, 0)
-        )
+        key = _folder_key(self._run_folder)
+        self._last_issued_run_number[key] = max(number, self._last_issued_run_number.get(key, 0))
+        record_issued(self._run_folder, number)
         logger.info("Run placed: %s → %s", placement.run_id, placement.file_name)
         return placement
 
@@ -1703,6 +1732,9 @@ class Orchestrator(QObject):
             procedure = self._take_queued(self._procedure_queue)
             self._emit_queue_changed()
             self.run_procedure(procedure)
+            return
+        # Refused BEFORE a run is taken off the queue, so it stays queued.
+        if self._no_experiment_refusal() or self._run_folder_refusal():
             return
         run = self._pull_next_run()
         if run is None:
@@ -4624,3 +4656,11 @@ class Orchestrator(QObject):
             severity="error",
             log_level=logging.CRITICAL,
         )
+
+
+def _folder_key(folder: str) -> str:
+    """Return one key per folder however its path is spelled (resolved, case per the OS)."""
+    try:
+        return os.path.normcase(str(Path(folder).resolve()))
+    except OSError:
+        return os.path.normcase(folder)

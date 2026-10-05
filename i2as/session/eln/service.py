@@ -145,6 +145,9 @@ class ElnService(QObject):
         self._connectors: dict[tuple[str, str], tuple[BlockRunner, str, str]] = {}
         self._confirmed_entries: dict[str, ElnEntryRef] = {}
         self._outboxes: dict[str, Outbox] = {}
+        # A drain for the NEW session is due once the one bound to the old
+        # session (queued before a session switch) has finished.
+        self._drain_again = False
         self._drain_queued = threading.Event()
         self._last_detail = ""
         self._offline = False
@@ -533,7 +536,12 @@ class ElnService(QObject):
         self._confirmed_entries = {}
         self._adopt_outboxes()
         self._emit_status()
-        self.drain_soon()
+        if self._drain_queued.is_set():
+            # The queued drain is bound to the old session: drain the new
+            # one as soon as it has finished.
+            self._drain_again = True
+        else:
+            self.drain_soon()
 
     def _adopt_outboxes(self) -> None:
         """Pick up journals left by an earlier run of the application."""
@@ -621,6 +629,9 @@ class ElnService(QObject):
             self._last_detail = str(result)
             self._emit_status()
             return
+        if self._drain_again:
+            self._drain_again = False
+            self.drain_soon()
         store, outcomes = result
         session_root = store.root
         current = session_root == self._manager.store.root
@@ -639,10 +650,9 @@ class ElnService(QObject):
                     published["published_utc"],
                     session_root=session_root,
                 )
-                if not current:
-                    continue
-                entry = self._confirmed_entries.get(experiment_id) or self._entry_for(experiment_id)
-                self.publish_finished.emit({**published, "experiment_id": experiment_id, "url": entry.url if entry else ""})
+                if current:
+                    entry = self._confirmed_entries.get(experiment_id) or self._entry_for(experiment_id)
+                    self.publish_finished.emit({**published, "experiment_id": experiment_id, "url": entry.url if entry else ""})
             if outcome.job.state == STATE_PENDING and outcome.job.last_error and not outcome.waiting:
                 self._offline = True
                 self._last_detail = outcome.job.last_error

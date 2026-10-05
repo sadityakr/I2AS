@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from i2as.core.events import OPERATOR, Actor, Command, CommandName, RunStarted, VerdictCode
 from i2as.core.orchestrator_proxy import OrchestratorProxy
@@ -78,6 +78,9 @@ class ExperimentManager(QObject):
     store_health_changed = pyqtSignal(dict)
     #: The folder every run is now written to (``""`` when none is open).
     run_folder_changed = pyqtSignal(str)
+    #: A live session switch is about to re-root: save what belongs to the
+    #: session being left (emitted once the engine has released the run folder).
+    session_about_to_change = pyqtSignal()
     #: A live session switch completed: the new session folder.
     session_changed = pyqtSignal(str)
     #: A live session switch was refused or failed: the reason, for the operator.
@@ -152,6 +155,10 @@ class ExperimentManager(QObject):
         # the engine's verdict on releasing the run folder.
         self._busy_checks: list[Callable[[], str]] = []
         self._pending_switch: tuple[str, Path, ExperimentStore] | None = None
+        # Why every run is held off in this session ("" = not held): set when
+        # the session folder is in use by another running application, so two
+        # stations never write the same experiment records.
+        self._runs_held = ""
 
         orchestrator.run_started.connect(self._on_run_started)
         orchestrator.run_finished.connect(self._on_run_finished)
@@ -590,6 +597,24 @@ class ExperimentManager(QObject):
     # Loading another session while running
     # ------------------------------------------------------------------
 
+    def hold_runs(self, reason: str) -> None:
+        """Refuse every run in this session until another session is loaded.
+
+        Used when the session folder is in use by another running
+        application: both would otherwise save the same experiment records,
+        and the last save would silently drop the other's runs.
+
+        Args:
+            reason: Shown to the operator.
+        """
+        self._runs_held = reason
+        logger.error("Runs held in this session: %s", reason)
+        self._install_run_folder(None)
+
+    def runs_held_reason(self) -> str:
+        """Why runs are held in this session, or ``""`` when they are not."""
+        return self._runs_held
+
     def add_busy_check(self, check: Callable[[], str]) -> None:
         """Register a "still in flight?" check consulted before a switch.
 
@@ -675,12 +700,35 @@ class ExperimentManager(QObject):
             args={"data_directory": "", "require_idle": True},
         )
         self._pending_switch = (command.request_id, target, ExperimentStore(target))
+        # A verdict that never comes (an engine wedged on a read) must not
+        # leave every later switch refused: give up after a while.
+        QTimer.singleShot(
+            SWITCH_VERDICT_TIMEOUT_MS, lambda rid=command.request_id: self._abandon_switch(rid)
+        )
         try:
             self._orchestrator.submit(command)
         except Exception:
             self._pending_switch = None
             self._session_store.release_lock(target)
             raise
+
+    def _abandon_switch(self, request_id: str) -> None:
+        """Give up a switch whose verdict never arrived; the session stays as it was."""
+        pending = self._pending_switch
+        if pending is None or pending[0] != request_id:
+            return
+        self._pending_switch = None
+        assert self._session_store is not None
+        self._session_store.release_lock(pending[1])
+        self._reinstall_current_run_folder()
+        self.session_switch_failed.emit(
+            "Cannot load another session now: the station did not answer in time"
+        )
+
+    def _reinstall_current_run_folder(self) -> None:
+        """Hand the engine this session's run folder again (after a refused or abandoned switch)."""
+        current = self._experiment
+        self._install_run_folder(current.experiment_id if current is not None else None)
 
     def _on_verdict(self, verdict: object) -> None:
         """Complete or abandon a pending session switch on the engine's verdict."""
@@ -692,6 +740,7 @@ class ExperimentManager(QObject):
         assert self._session_store is not None
         if getattr(verdict, "code", None) != VerdictCode.OK:
             self._session_store.release_lock(target)
+            self._reinstall_current_run_folder()
             reason = getattr(verdict, "reason", "") or "the engine refused"
             logger.info("Session switch to %s refused: %s", target, reason)
             self.session_switch_failed.emit(f"Cannot load another session now: {reason}")
@@ -700,6 +749,7 @@ class ExperimentManager(QObject):
             self._complete_session_switch(target, new_store)
         except Exception as exc:
             logger.exception("Session switch to %s failed", target)
+            self._reinstall_current_run_folder()
             self.session_switch_failed.emit(f"Could not load {target}: {exc}")
 
     def _complete_session_switch(self, target: Path, new_store: ExperimentStore) -> None:
@@ -710,17 +760,19 @@ class ExperimentManager(QObject):
         """
         assert self._session_store is not None
         old_root = self._store.root
-        old_experiment = self._experiment
+        # Last chance for the session being left to save what is its own
+        # (the GUI's fields and queue, edited while the release was pending).
+        self.session_about_to_change.emit()
         try:
             self._session_store.set_active(target)
         except (OSError, ValueError):
             self._session_store.release_lock(target)
-            self._install_run_folder(old_experiment.experiment_id if old_experiment else None)
             raise
         # Parked, not lost: the GUI saved it with its experiment.
         self._queue_host.clear()
         self._store = new_store
         self._experiment = None
+        self._runs_held = ""  # the new session's lock is ours
         self._orchestrator.set_experiment_envelope(None)
         self._session_store.release_lock(old_root)
         logger.info("Session loaded: %s", target)
@@ -1432,7 +1484,12 @@ class ExperimentManager(QObject):
         setter = getattr(self._orchestrator, "set_run_folder", None)
         if not callable(setter):
             return
-        if experiment_id is None:
+        if self._pending_switch is not None:
+            # The engine is releasing the folder for a session switch: nothing
+            # may hand it a folder again until the switch completes (the new
+            # session installs its own) or fails (this one is re-installed).
+            return
+        if experiment_id is None or self._runs_held:
             setter("")
             self.run_folder_changed.emit("")
             return
@@ -1603,6 +1660,10 @@ class ExperimentManager(QObject):
         self._install_run_folder(record.experiment_id)
         logger.info("Resumed experiment %s (%d runs)", record.experiment_id, len(record.runs))
         self.experiment_changed.emit(record.to_dict())
+
+
+#: How long a session switch waits for the engine to release the run folder.
+SWITCH_VERDICT_TIMEOUT_MS = 15000
 
 
 def _same_path(a: str | Path, b: str | Path) -> bool:

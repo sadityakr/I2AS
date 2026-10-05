@@ -30,6 +30,7 @@ starts (``Orchestrator._start_run``) and the data manager creates the file.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,9 +67,18 @@ class RunPlacement:
 #: The deepest a run subfolder may nest below ``data/``.
 MAX_SUBFOLDER_DEPTH = 3
 
-#: The longest a run's absolute file path may be (Windows' 260-character
-#: limit, with room for the HDF5 library's own temporary names).
+#: The longest a run's absolute file path may be on Windows (its
+#: 260-character limit, with room for the HDF5 library's own temporary
+#: names). Not applied on other systems.
 MAX_RUN_PATH_CHARS = 240
+
+#: The file in an experiment's ``data/`` that remembers the highest run
+#: number ever issued there, so a number is never reissued in a sibling
+#: subfolder even when its run's record was never written.
+LAST_RUN_MARKER = ".last_run_number"
+
+#: Whether the path-length limit applies (it is a Windows limit).
+_ON_WINDOWS = os.name == "nt"
 
 #: One part of a run subfolder: starts with a letter or digit, then letters,
 #: digits, ``.``, ``_``, ``-`` or spaces; at most 64 characters.
@@ -232,10 +242,10 @@ def place_run(
             ``MAX_RUN_PATH_CHARS``.
     """
     target = run_target_folder(folder, subfolder)
-    number = next_run_number(target, floor, folder)
+    number = next_run_number(target, max(int(floor), last_issued(folder) + 1), folder)
     file_name = run_file_name(number, procedure, label, kind)
-    full = str(target.resolve() / file_name)
-    if len(full) > MAX_RUN_PATH_CHARS:
+    full = os.path.abspath(target / file_name)
+    if _ON_WINDOWS and len(full) > MAX_RUN_PATH_CHARS:
         raise ValueError(
             f"run file path is {len(full)} characters, over {MAX_RUN_PATH_CHARS}: {full}"
         )
@@ -244,6 +254,33 @@ def place_run(
         data_directory=str(target),
         file_name=file_name,
     )
+
+
+def last_issued(folder: str | Path) -> int:
+    """Return the highest run number recorded in *folder*'s marker (0 when none)."""
+    try:
+        return int((Path(folder) / LAST_RUN_MARKER).read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def record_issued(folder: str | Path, number: int) -> None:
+    """Remember that run *number* was issued in *folder* (best effort, never raises).
+
+    Args:
+        folder: The experiment's ``data/`` folder.
+        number: The run number just issued.
+    """
+    if number <= last_issued(folder):
+        return
+    path = Path(folder) / LAST_RUN_MARKER
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(str(number), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
 
 
 def run_number_of(run_id: str) -> int | None:
@@ -259,8 +296,11 @@ __all__ = [
     "RUN_ID_PREFIX",
     "RUN_NUMBER_DIGITS",
     "RunPlacement",
+    "LAST_RUN_MARKER",
+    "last_issued",
     "next_run_number",
     "normalize_run_subfolder",
+    "record_issued",
     "place_run",
     "run_file_name",
     "run_id_for",

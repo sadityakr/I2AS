@@ -180,6 +180,29 @@ def _ensure_guest_user_registered(roster: UserRoster) -> None:
         roster.add(User(user_id=GUEST_USER_ID, name=GUEST_USER_NAME))
 
 
+def _guarded(what: str, slot: Callable[[Any], object]) -> Callable[[Any], None]:
+    """Wrap a signal listener so an exception is logged instead of escaping into Qt.
+
+    An exception escaping a slot can abort a PyQt6 application; a listener
+    reacting to a session change must cost at most its own job.
+
+    Args:
+        what: The listener's job, for the log line.
+        slot: The listener.
+
+    Returns:
+        The guarded listener.
+    """
+
+    def run(value: Any) -> None:
+        try:
+            slot(value)
+        except Exception:
+            logger.exception("%s failed (the session change itself stands)", what)
+
+    return run
+
+
 def _resolve_active_session(store: SessionStore) -> Path:
     """Return the active session folder, creating one on first launch.
 
@@ -618,9 +641,12 @@ def main(
     # another station (or a second copy of the app) cannot load it live. A
     # lock held by a live process elsewhere is reported, never fatal — the
     # app must always start (GLOSSARY.md's **Session**).
+    session_lock_conflict = ""
     try:
         session_store.acquire_lock(session_folder)
-    except (SessionLockedError, OSError) as exc:
+    except SessionLockedError as exc:
+        session_lock_conflict = str(exc)
+    except OSError as exc:
         logger.warning("Session folder lock not taken: %s", exc)
     app.aboutToQuit.connect(
         lambda: session_store.release_lock(session_manager.store.root)
@@ -635,6 +661,12 @@ def main(
         station=station,
         run_catalog=run_catalog,
     )
+
+    if session_lock_conflict:
+        # Another running station holds this session: the app still starts
+        # (it always does), but no run may write into records the other
+        # station is also saving — until the operator loads another session.
+        session_manager.hold_runs(session_lock_conflict)
 
     # The pull seam (GLOSSARY.md's **Run queue**): the engine ASKS the session
     # layer's queue for the next run rather than holding one of its own, and
@@ -780,11 +812,24 @@ def main(
     # feeds and connections are dropped (experiment ids repeat across
     # sessions, and a connection resolves bare run ids against the open
     # experiment); an analysis still in flight refuses the switch.
-    session_manager.experiment_changed.connect(lambda _record: app.experiment_feeds.reset())
-    session_manager.session_changed.connect(lambda _folder: app.experiment_feeds.reset(keep_open=False))
-    session_manager.session_changed.connect(lambda _folder: app.eln_service.reset_session())
+    # Each listener is guarded: they run after the store was re-rooted, and
+    # one failing (a socket, a file) must cost only its own job, never the app.
+    session_manager.experiment_changed.connect(
+        _guarded("agent feed reset", lambda _record: app.experiment_feeds.reset())
+    )
     session_manager.session_changed.connect(
-        lambda folder: app.gateway_controller.drop_connections(f"the station loaded session {folder}")
+        _guarded("agent feed reset", lambda _folder: app.experiment_feeds.reset(keep_open=False))
+    )
+    session_manager.session_changed.connect(
+        _guarded("notebook reset", lambda _folder: app.eln_service.reset_session())
+    )
+    session_manager.session_changed.connect(
+        _guarded(
+            "agent disconnect",
+            lambda folder: app.gateway_controller.drop_connections(
+                f"the station loaded session {folder}"
+            ),
+        )
     )
     if app.analysis_runner is not None:
         runner = app.analysis_runner

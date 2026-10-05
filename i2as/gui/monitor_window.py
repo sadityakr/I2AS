@@ -292,6 +292,18 @@ class MonitorWindow(QMainWindow):
         # Surface a startup config fallback (a bad active config was skipped)
         # and instruments that failed to connect (degraded build) — each its
         # own alert, so neither can hide the other.
+        held = getattr(self._session_manager, "runs_held_reason", None)
+        if callable(held) and held():
+            # Another running station holds this session folder: no run may
+            # start here until another session is loaded (User → Session
+            # Folder…), which resolves this alert.
+            self._alerts.raise_alert(
+                "session_lock",
+                SEVERITY_ERROR,
+                "session",
+                f"Runs are held: {held()}",
+                dismissible=False,
+            )
         if self._startup_warning:
             self._alerts.raise_alert(
                 "startup:config",
@@ -1262,14 +1274,23 @@ class MonitorWindow(QMainWindow):
         Args:
             folder: The new session folder.
         """
-        self._last_session_experiment_id = None
-        self._session_info.reset_session_tracking()
-        self._session = form_autosave.FormAutosaveState()
-        self._session_info.apply_session(self._session)
-        if self._procedure_window is not None:
-            self._procedure_window.reset_session()
-        self._sync_context()
-        self._status_bar.showMessage(f"Session loaded: {folder}", 8000)
+        try:
+            self._last_session_experiment_id = None
+            self._session_info.reset_session_tracking()
+            # The logged-in user's own fields until the new session's
+            # experiment (if any) brings its gui_state — never a blank state
+            # that would later be saved over the user's autosave.
+            self._session = form_autosave.load(
+                app_settings.autosave_file_path(self._current_user_id)
+            )
+            self._session_info.apply_session(self._session)
+            if self._procedure_window is not None:
+                self._procedure_window.reset_session()
+            self._alerts.resolve("session_lock")
+            self._sync_context()
+            self._status_bar.showMessage(f"Session loaded: {folder}", 8000)
+        except Exception:
+            logger.exception("MonitorWindow: could not refresh after loading %s", folder)
 
     def _on_session_switch_failed(self, reason: str) -> None:
         """Tell the operator why the session could not be loaded.
@@ -1468,6 +1489,9 @@ class MonitorWindow(QMainWindow):
             )
             session_changed = getattr(self._session_manager, "session_changed", None)
             if session_changed is not None:
+                # Fields and queue edited while the switch waited for the
+                # engine still belong to the session being left.
+                self._session_manager.session_about_to_change.connect(self._save_session)
                 session_changed.connect(self._on_session_changed)
                 self._session_manager.session_switch_failed.connect(
                     self._on_session_switch_failed

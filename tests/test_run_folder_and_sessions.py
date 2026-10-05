@@ -100,10 +100,25 @@ def test_numbers_count_the_data_folder_and_the_target_and_respect_the_floor(tmp_
     assert next_run_number(data / "cooldown2", 12, data) == 12
 
 
-def test_a_path_too_long_is_refused(tmp_path):
+def test_a_path_too_long_is_refused_on_windows_only(tmp_path, monkeypatch):
+    from i2as.core import run_naming
+
     deep = "x" * 60
+    long_name = "P" * MAX_RUN_PATH_CHARS
+    place_run(tmp_path, long_name, subfolder=deep)  # fine on this OS
+    monkeypatch.setattr(run_naming, "_ON_WINDOWS", True)
     with pytest.raises(ValueError, match="characters"):
-        place_run(tmp_path, "P" * MAX_RUN_PATH_CHARS, subfolder=f"{deep}/{deep}/{deep}")
+        place_run(tmp_path, long_name, subfolder=deep)
+
+
+def test_a_number_issued_in_a_sibling_subfolder_is_never_reissued(tmp_path):
+    from i2as.core.run_naming import record_issued
+
+    data = tmp_path / "data"
+    first = place_run(data, "P", subfolder="a")
+    record_issued(data, int(first.run_id[-4:]))
+    # run-0001 lives in data/a (or was never written); data/b must not reuse it.
+    assert place_run(data, "P", subfolder="b").run_id == "run-0002"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
@@ -369,3 +384,104 @@ def test_an_agent_feed_detaches(engine, tmp_path):
     feed.record_verdict = recorded.append  # type: ignore[method-assign]
     orchestrator.submit(ev.Command(name=ev.CommandName.START_MONITORING))
     assert recorded == []
+
+
+
+# ----------------------------------------------------------------------
+# Implementation-audit follow-ups
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_an_escaping_subfolder_refuses_the_run_before_any_side_effect(engine, tmp_path):
+    orchestrator, verdicts = engine
+    data = tmp_path / "data"
+    data.mkdir()
+    _set_run_folder(orchestrator, data_directory=str(data), subfolder="escape")
+    assert verdicts[-1].code is ev.VerdictCode.OK
+    # The folder is swapped for a link to elsewhere after it was installed.
+    (data / "escape").symlink_to(tmp_path)
+    _set_run_folder(orchestrator, data_directory=str(data), subfolder="escape")
+    assert verdicts[-1].code is not ev.VerdictCode.OK, "an escape is refused at install"
+    assert not orchestrator._monitoring
+    orchestrator.run_procedure(Placeable())
+    assert orchestrator._procedure is None
+    assert not orchestrator._monitoring, "a refused run starts nothing"
+
+
+def test_nothing_reinstalls_the_folder_while_a_switch_is_pending(sessions, engine):
+    manager, store, _a, b = sessions
+    orchestrator, _verdicts = engine
+    manager.start_experiment("In A", "jdoe", SAMPLE)
+    failures: list[str] = []
+    manager.session_switch_failed.connect(failures.append)
+    # The engine has released the folder; its verdict has not arrived yet.
+    _set_run_folder(orchestrator, data_directory="", require_idle=True)
+    manager._pending_switch = ("rid", b.resolve(), ExperimentStore(b))
+    store.acquire_lock(b)
+
+    manager.set_run_subfolder("cd2")
+    assert orchestrator._run_folder == "", "no run may start in the session being left"
+
+    manager._abandon_switch("rid")  # the verdict never came
+    assert failures and "did not answer" in failures[0]
+    assert orchestrator._run_folder == str(manager.current_data_dir())
+    assert orchestrator._run_subfolder == "cd2"
+    assert not (b / SESSION_LOCK_FILENAME).exists()
+    assert manager.session_busy_reason() == ""
+
+
+def test_a_registry_write_failure_rolls_back(sessions, engine, monkeypatch):
+    manager, store, a, b = sessions
+    orchestrator, _verdicts = engine
+    manager.start_experiment("In A", "jdoe", SAMPLE)
+    failures: list[str] = []
+    manager.session_switch_failed.connect(failures.append)
+
+    def broken(_folder):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "set_active", broken)
+    manager.request_session_switch(b)
+
+    assert failures and "disk full" in failures[0]
+    assert manager.store.root.resolve() == a.resolve()
+    assert orchestrator._run_folder == str(manager.current_data_dir())
+    assert not (b / SESSION_LOCK_FILENAME).exists()
+
+
+def test_held_runs_refuse_every_run_until_another_session_loads(sessions, engine):
+    manager, _store, _a, b = sessions
+    orchestrator, _verdicts = engine
+    manager.start_experiment("In A", "jdoe", SAMPLE)
+    manager.hold_runs("in use by the other station")
+    assert orchestrator._run_folder == ""
+    manager.set_run_subfolder("cd2")
+    assert orchestrator._run_folder == "", "held means held"
+
+    manager.request_session_switch(b)
+    assert manager.runs_held_reason() == ""
+
+
+def test_the_lock_is_atomic_and_explains_a_foreign_holder(tmp_path):
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "S"
+    store.create_session(folder, "S", "jdoe")
+    store.acquire_lock(folder)
+    store.acquire_lock(folder)  # ours already: kept
+    (folder / SESSION_LOCK_FILENAME).write_text(
+        '{"pid": 4242, "host": "another-station", "since": "2026-10-05T10:00:00Z"}'
+    )
+    with pytest.raises(SessionLockedError, match="delete"):
+        store.acquire_lock(folder)
+
+
+def test_a_failing_session_listener_is_contained(caplog):
+    from i2as.main import _guarded
+
+    def boom(_value):
+        raise RuntimeError("socket gone")
+
+    with caplog.at_level("ERROR"):
+        _guarded("agent disconnect", boom)("folder")
+    assert "agent disconnect failed" in caplog.text

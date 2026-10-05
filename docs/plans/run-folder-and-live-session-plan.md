@@ -126,3 +126,33 @@ Verdict: **approve with changes** — §3 sound with the numbering/validation ch
 2. Agent connections: **disconnect** on session switch (and reset feeds on experiment switch).
 3. Agents setting the subfolder: **no**; `set_run_folder` stays an ENVELOPE-class action; agents read it via `read_experiment`.
 4. Depth 3 and the name rule above.
+
+## 9. Implementation audit and response
+
+Verdict on commit `04315c5`: **changes required, no blocker**. Addressed in the
+follow-up commit:
+
+| # | Finding | Response |
+|---|---|---|
+| M1 | Between release and verdict, start/close experiment or Subfolder… could re-install a folder, so a run could start in the session being left | `_install_run_folder` installs nothing while a switch is pending; a refused/failed/abandoned switch re-installs the current folder. Test covers it. |
+| M2 | Startup lock only advisory; check-then-write race | Lock created with `O_CREAT\|O_EXCL`, stale same-host lock taken over. If another live station holds the session at startup, the app still starts, but **runs are held** (engine folder `""`) with a non-dismissible alert until another session is loaded. |
+| M3 | Listener exceptions after the re-root could abort the app | Each `main.py` listener wrapped by `_guarded`; `MonitorWindow._on_session_changed` guarded. Test covers `_guarded`. |
+| 4 | Notebook drain for the new session suppressed by a queued old-session drain; offline bookkeeping skipped | `_drain_again` re-drains once the old drain finishes; bookkeeping runs for every session. |
+| 5 | Path-length limit on every OS, measured after `resolve()` | Windows only, measured with `abspath` as written. |
+| 6 | Sibling-subfolder uniqueness rested on the record | `data/.last_run_number` marker records the highest number issued; placement reads it. |
+| 7 | Placement refusal after side effects / after a queued run was popped | Containment refused in `run_procedure` and `run_queue` before any side effect, and at `set_run_folder` install. |
+| 9 | Foreign-host lock never expires | Refusal message names the lock file to delete; verdict timeout (15 s) releases a stuck switch and its lock. |
+| 11 | Edits during the pending window lost; blank state saved over the user's autosave | `session_about_to_change` saves the GUI before re-root; after a switch the user's own autosave is loaded, never a blank state. |
+| nit | Feed `detach` placement; counter key by raw path | Fixed; key normalised with `normcase(resolve())`. |
+
+Deferred, with reason:
+
+* **8: `switch_experiment` does not park the queue.** Each experiment's GUI
+  state already carries its own queue and the engine enforces the target
+  experiment's envelope; parking would change long-standing experiment-switch
+  behaviour beyond this request.
+* **10: the HTTP MCP endpoint reconnects silently.** The local socket clients
+  get `session/changed`; giving web clients an explicit error belongs in the
+  HTTP adapter's session model and is a separate change.
+* **Windows CI.** Junctions and long paths are covered by the rule and
+  `_ON_WINDOWS` tests here; a Windows CI job is recommended but out of scope.
