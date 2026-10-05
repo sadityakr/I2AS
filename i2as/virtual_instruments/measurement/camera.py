@@ -336,6 +336,49 @@ class CameraMeasurementVI(MeasurementInstrumentBase):
             return None
         return float(self._last_reading["roi_std"])
 
+    # Array fields (the monitored-kind standard): the last manual read's
+    # frame and its row profile through the ROI centre, for the Monitor's
+    # image and waterfall panels. Both answer from the cached reading — no
+    # exposure is ever taken by the monitor — so they cost nothing on the
+    # instrument thread and can never disturb an armed acquisition.
+    @monitored(
+        unit="counts",
+        description="Averaged frame of the last manual read",
+        kind="image",
+        shape=(FRAME_HEIGHT_PX, FRAME_WIDTH_PX),
+        period_s=1.0,
+    )
+    def last_frame(self) -> np.ndarray | None:
+        """Return the frame of the last ``read_now()``, or None.
+
+        Returns:
+            The ``(128, 128)`` frame in counts, or ``None`` before the first
+            manual read.
+        """
+        if self._last_reading is None:
+            return None
+        return self._last_reading["frame"]
+
+    @monitored(
+        unit="counts",
+        description="Row profile through the ROI centre of the last manual read",
+        kind="trace",
+        shape=(FRAME_WIDTH_PX,),
+        period_s=1.0,
+        axis=(0.0, float(FRAME_WIDTH_PX - 1), "px"),
+    )
+    def last_row_profile(self) -> np.ndarray | None:
+        """Return the sensor row through the ROI centre of the last ``read_now()``.
+
+        Returns:
+            The ``(128,)`` row in counts, or ``None`` before the first
+            manual read.
+        """
+        if self._last_reading is None:
+            return None
+        _x0, y0, _width, height = self._roi
+        return self._last_reading["frame"][y0 + height // 2]
+
     # panel=False: a bench check belongs in the instrument front panel, not
     # on the compact monitor card. action_class="read": it observes at the
     # settings already armed and commands nothing new.

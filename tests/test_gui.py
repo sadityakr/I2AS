@@ -2833,6 +2833,13 @@ def test_procedure_window_on_the_imaging_station_ignores_the_image_column(qtbot)
         orchestrator.measurement_ready.emit(datapoint)
         assert len(win._datapoints) == 1
         assert win._datapoints[0]["roi_mean"] == 2580.0
+
+        # ...but it IS what an Image-kind plot panel draws.
+        win._plot2.set_kind("image")
+        assert win._plot2.selected_kind() == "image"
+        assert win._plot2._image_selector.currentText() == "frame"
+        frame = win._plot2._image_view.frame()
+        assert frame is not None and frame.shape == (128, 128)
     finally:
         shutdown_host(host)
 
@@ -2881,8 +2888,8 @@ def test_monitor_fixed_quadrants_exist_with_expected_content(monitor_win):
 
 def test_monitor_default_trend_panels_exist_and_gridded(monitor_win):
     """Two trend panels exist by default, each placed in the trends QGridLayout."""
-    assert len(monitor_win._trends._trend_panels) == 2
-    for panel in monitor_win._trends._trend_panels.values():
+    assert len(monitor_win._trends._panels) == 2
+    for panel in monitor_win._trends._panels.values():
         assert monitor_win._trends._trends_grid.indexOf(panel) != -1
 
 
@@ -2899,9 +2906,9 @@ def test_monitor_has_no_view_menu(monitor_win):
 
 def test_monitor_trends_grid_arranges_in_ceil_sqrt_grid(monitor_win):
     """Adding trend plots up to the cap of 4 arranges them in a 2x2 grid, not a stack."""
-    monitor_win._trends._add_trend_panel()  # 3rd panel: ceil(sqrt(3)) = 2 columns
-    monitor_win._trends._add_trend_panel()  # 4th panel: ceil(sqrt(4)) = 2 columns
-    assert len(monitor_win._trends._trend_panels) == 4
+    monitor_win._trends._add_panel("trend")  # 3rd panel: ceil(sqrt(3)) = 2 columns
+    monitor_win._trends._add_panel("trend")  # 4th panel: ceil(sqrt(4)) = 2 columns
+    assert len(monitor_win._trends._panels) == 4
 
     positions = {
         monitor_win._trends._trends_grid.getItemPosition(i)[:2]
@@ -2912,31 +2919,31 @@ def test_monitor_trends_grid_arranges_in_ceil_sqrt_grid(monitor_win):
 
 def test_monitor_add_trend_plot_button_caps_at_four(monitor_win):
     """The Trends quadrant's Add button adds panels up to 4, then disables and stays inert."""
-    assert len(monitor_win._trends._trend_panels) == 2
+    assert len(monitor_win._trends._panels) == 2
     assert monitor_win._trends._add_trend_btn.isEnabled()
 
     monitor_win._trends._add_trend_btn.click()
-    assert len(monitor_win._trends._trend_panels) == 3
+    assert len(monitor_win._trends._panels) == 3
     monitor_win._trends._add_trend_btn.click()
-    assert len(monitor_win._trends._trend_panels) == 4
+    assert len(monitor_win._trends._panels) == 4
     assert not monitor_win._trends._add_trend_btn.isEnabled()
 
     monitor_win._trends._add_trend_btn.click()
-    assert len(monitor_win._trends._trend_panels) == 4
+    assert len(monitor_win._trends._panels) == 4
 
 
 def test_monitor_trend_remove_button_drops_panel_never_below_one(monitor_win):
     """The panel's own remove button destroys the panel, stopping at a floor of 1."""
-    assert len(monitor_win._trends._trend_panels) == 2
-    first_id = next(iter(monitor_win._trends._trend_panels))
+    assert len(monitor_win._trends._panels) == 2
+    first_id = next(iter(monitor_win._trends._panels))
 
-    monitor_win._trends._on_trend_remove_requested(first_id)
-    assert len(monitor_win._trends._trend_panels) == 1
-    assert first_id not in monitor_win._trends._trend_panels
+    monitor_win._trends._on_remove_requested(first_id)
+    assert len(monitor_win._trends._panels) == 1
+    assert first_id not in monitor_win._trends._panels
 
-    remaining_id = next(iter(monitor_win._trends._trend_panels))
-    monitor_win._trends._on_trend_remove_requested(remaining_id)
-    assert len(monitor_win._trends._trend_panels) == 1  # floor holds
+    remaining_id = next(iter(monitor_win._trends._panels))
+    monitor_win._trends._on_remove_requested(remaining_id)
+    assert len(monitor_win._trends._panels) == 1  # floor holds
 
     assert monitor_win._trends._add_trend_btn.isEnabled()
 
@@ -2985,7 +2992,7 @@ def test_monitor_default_trend_key_hints_prefer_readings_over_settings(monitor_w
     }
     orchestrator.states_updated.emit(fake_state)
 
-    trend_0 = monitor_win._trends._trend_panels["trend_0"]
+    trend_0 = monitor_win._trends._panels["trend_0"]
     assert trend_0.selected_key().endswith("_temperature")
 
     # The picker itself, over a key list this test owns: the VI-name prefix
@@ -3020,8 +3027,8 @@ def test_monitor_persistence_roundtrip_splitters_and_trends(
     qtbot.addWidget(win1)
     win1.show()
 
-    third_id = win1._trends._add_trend_panel()
-    third_panel = win1._trends._trend_panels[third_id]
+    third_id = win1._trends._add_panel("trend")
+    third_panel = win1._trends._panels[third_id]
 
     # Feed history AFTER the third panel exists so its refresh() (triggered by
     # this emit) populates its Y combo with a real key to select.
@@ -3030,7 +3037,7 @@ def test_monitor_persistence_roundtrip_splitters_and_trends(
     third_panel.set_selected_key("magnet_z_magnet_field_T")
     third_panel.set_selected_window_s(21600.0)  # "6 h"
 
-    assert len(win1._trends._trend_panels) == 3
+    assert len(win1._trends._panels) == 3
 
     win1._main_splitter.setSizes([300, 900])
     win1.close()  # persists geometry + splitter state via closeEvent
@@ -3039,7 +3046,7 @@ def test_monitor_persistence_roundtrip_splitters_and_trends(
     qtbot.addWidget(win2)
     win2.show()
 
-    assert len(win2._trends._trend_panels) == 3
+    assert len(win2._trends._panels) == 3
     # Splitter proportions were restored, not left at the [600, 600] default.
     assert win2._main_splitter.sizes() != [600, 600]
 
@@ -3047,15 +3054,15 @@ def test_monitor_persistence_roundtrip_splitters_and_trends(
     # selection, held pending, can actually be applied.
     orchestrator.states_updated.emit(fake_state)
 
-    third_id_2 = list(win2._trends._trend_panels.keys())[2]
-    third_panel_2 = win2._trends._trend_panels[third_id_2]
+    third_id_2 = list(win2._trends._panels.keys())[2]
+    third_panel_2 = win2._trends._panels[third_id_2]
     assert third_panel_2.selected_key() == "magnet_z_magnet_field_T"
     assert third_panel_2.selected_window_s() == 21600.0
 
 
 def test_monitor_default_layout_when_settings_empty(monitor_win, station):
     """With no saved splitter state (fresh isolated settings), the DEFAULT layout stands."""
-    assert len(monitor_win._trends._trend_panels) == 2
+    assert len(monitor_win._trends._panels) == 2
     # One card per VI — system and measurement cards alike.
     assert len(monitor_win._panels) == len(station.get_vi_names())
     # setSizes([600, 600]) is a proportional hint, not exact pixels once shown

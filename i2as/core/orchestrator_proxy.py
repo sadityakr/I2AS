@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 #: declares, which the proxy must match exactly or a connected slot breaks.
 _PASSTHROUGH_SIGNALS: tuple[str, ...] = (
     "states_updated",
+    "monitored_arrays_updated",
     "monitoring_changed",
     "state_changed",
     "procedure_progress",
@@ -176,6 +177,7 @@ class OrchestratorProxy(QObject):
 
     # ── The engine's per-purpose signals, re-declared with its signatures ──
     states_updated = pyqtSignal(dict)
+    monitored_arrays_updated = pyqtSignal(dict)
     monitoring_changed = pyqtSignal(bool)
     state_changed = pyqtSignal(str)
     procedure_progress = pyqtSignal(float)

@@ -1,21 +1,45 @@
-"""LivePlotPanel — reusable live X/Y plot panel for ProcedureWindow."""
+"""LivePlotPanel — reusable live plot panel for ProcedureWindow: XY or image.
+
+A panel has a **kind**, picked per panel with its kind selector:
+
+* ``"xy"`` — one scalar column against another, over the run's datapoints
+  (the panel as it always was);
+* ``"image"`` — one frame of an image block (the image-block standard,
+  ``core/plan.py``'s ``ImageBlock``), for the latest datapoint or any
+  earlier one picked with the Point selector.
+
+Both kinds share the Loop selectors: an XY plot indexes each scalar
+column's ``(n_loop1, n_loop2)`` grid with them, an image plot picks the
+frame of that reading. The image is drawn by the same
+:class:`~i2as.gui.image_view.ImageView` the Monitor's image panels use.
+"""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from i2as.core.data_reader import select_frame
+from i2as.gui.image_view import ImageView
+
 logger = logging.getLogger(__name__)
+
+#: The plot kinds a LivePlotPanel offers, ``(data, label)`` in selector order.
+PLOT_KINDS: tuple[tuple[str, str], ...] = (("xy", "XY"), ("image", "Image"))
 
 
 def _to_float(raw: Any) -> float:
@@ -39,7 +63,13 @@ def _to_float(raw: Any) -> float:
 
 
 class LivePlotPanel(QGroupBox):
-    """A live X/Y plot panel: axis selectors, per-slot Loop selectors, and a themed pyqtgraph curve.
+    """A live plot panel: a kind selector, per-kind selectors, Loop selectors, and the plot.
+
+    In ``"xy"`` mode it shows X/Y axis selectors and a themed pyqtgraph
+    curve; in ``"image"`` mode an image-block selector, a Point selector
+    (``latest`` follows the run) and an :class:`ImageView`. The Image kind
+    is offered only while the selected procedure records image blocks (see
+    ``set_available_image_blocks``).
 
     This is a *widget extraction* — the pattern of pulling a repeated block of
     UI (here, ProcedureWindow's near-identical Plot 1 / Plot 2) into one
@@ -84,20 +114,52 @@ class LivePlotPanel(QGroupBox):
         # against this without the parent re-supplying it.
         self._datapoints: list[dict] = []
 
+        # Declared image blocks of the selected procedure: {name: unit}.
+        self._image_blocks: dict[str, str] = {}
+
         vlay = QVBoxLayout(self)
 
         axis_row = QHBoxLayout()
-        axis_row.addWidget(QLabel("X axis:"))
+        self._kind_selector = QComboBox()
+        self._kind_selector.setObjectName(f"{plot_object_name}_kind_selector")
+        self._kind_selector.setToolTip("What this panel plots")
+        for kind, label in PLOT_KINDS:
+            self._kind_selector.addItem(label, kind)
+        self._kind_selector.currentIndexChanged.connect(self._on_kind_changed)
+        axis_row.addWidget(self._kind_selector)
+
+        # XY-mode selectors.
+        self._x_label = QLabel("X axis:")
+        axis_row.addWidget(self._x_label)
         self._x_selector = QComboBox()
         self._x_selector.setObjectName(x_selector_name)
         self._x_selector.currentTextChanged.connect(self._redraw)
         axis_row.addWidget(self._x_selector)
 
-        axis_row.addWidget(QLabel("Y axis:"))
+        self._y_label = QLabel("Y axis:")
+        axis_row.addWidget(self._y_label)
         self._y_selector = QComboBox()
         self._y_selector.setObjectName(y_selector_name)
         self._y_selector.currentTextChanged.connect(self._redraw)
         axis_row.addWidget(self._y_selector)
+
+        # Image-mode selectors: which block, and which datapoint (0 = the
+        # latest, followed as the run goes on; k = the k-th point).
+        self._image_label = QLabel("Image:")
+        axis_row.addWidget(self._image_label)
+        self._image_selector = QComboBox()
+        self._image_selector.setObjectName(f"{plot_object_name}_image_selector")
+        self._image_selector.currentTextChanged.connect(self._redraw)
+        axis_row.addWidget(self._image_selector)
+        self._point_label = QLabel("Point:")
+        axis_row.addWidget(self._point_label)
+        self._point_selector = QSpinBox()
+        self._point_selector.setObjectName(f"{plot_object_name}_point_selector")
+        self._point_selector.setSpecialValueText("latest")
+        self._point_selector.setRange(0, 0)
+        self._point_selector.setToolTip("Which datapoint's frame to show; 'latest' follows the run")
+        self._point_selector.valueChanged.connect(self._redraw)
+        axis_row.addWidget(self._point_selector)
 
         # Reading-loop selectors, one per loop slot: each picks WHICH reading
         # of the datapoint is plotted (slot 1 labels A1, A2, ...; slot 2
@@ -123,6 +185,7 @@ class LivePlotPanel(QGroupBox):
         axis_row.addStretch()
         vlay.addLayout(axis_row)
 
+        self._stack = QStackedWidget()
         self._plot_widget = pg.PlotWidget()
         self._plot_widget.setObjectName(plot_object_name)
         self._plot_widget.setMinimumHeight(150)
@@ -134,7 +197,13 @@ class LivePlotPanel(QGroupBox):
             [], [], pen=pen, symbol="o", symbolSize=5,
             symbolBrush=series_color, symbolPen=series_color,
         )
-        vlay.addWidget(self._plot_widget)
+        self._stack.addWidget(self._plot_widget)
+        self._image_view = ImageView(object_name=f"{plot_object_name}_image")
+        self._stack.addWidget(self._image_view)
+        vlay.addWidget(self._stack)
+
+        self._apply_kind_visibility()
+        self._refresh_kind_availability()
 
     # ------------------------------------------------------------------
     # Public API
@@ -177,6 +246,43 @@ class LivePlotPanel(QGroupBox):
             and default_y in keys
         ):
             self._y_selector.setCurrentText(default_y)
+
+    def set_available_image_blocks(self, blocks: Mapping[str, str]) -> None:
+        """Set the image blocks the Image kind can draw, preserving a still-valid choice.
+
+        With no blocks the Image kind is disabled and a panel in Image mode
+        falls back to XY, so a procedure that records no frames never shows
+        an empty image panel.
+
+        Args:
+            blocks: ``{block_name: pixel_unit}`` — the selected procedure's
+                ``live_plot_image_blocks()``.
+        """
+        self._image_blocks = dict(blocks)
+        prev = self._image_selector.currentText()
+        self._image_selector.blockSignals(True)
+        self._image_selector.clear()
+        self._image_selector.addItems(list(self._image_blocks))
+        if prev in self._image_blocks:
+            self._image_selector.setCurrentText(prev)
+        self._image_selector.blockSignals(False)
+        self._refresh_kind_availability()
+        self._redraw()
+
+    def selected_kind(self) -> str:
+        """Return the panel's current kind, ``"xy"`` or ``"image"``."""
+        return str(self._kind_selector.currentData())
+
+    def set_kind(self, kind: str) -> None:
+        """Switch the panel's kind; a no-op for an unknown or unavailable kind.
+
+        Args:
+            kind: ``"xy"`` or ``"image"``.
+        """
+        index = self._kind_selector.findData(kind)
+        if index < 0 or not self._kind_item_enabled(index):
+            return
+        self._kind_selector.setCurrentIndex(index)
 
     def set_available_loop_labels(
         self, label_maps: tuple[dict[int, str] | None, dict[int, str] | None]
@@ -221,31 +327,65 @@ class LivePlotPanel(QGroupBox):
         self._redraw()
 
     def redraw(self, datapoints: list[dict]) -> None:
-        """Store the datapoint history and redraw the curve from it.
+        """Store the datapoint history and redraw from it.
 
         Args:
             datapoints: Full datapoint history (each entry an enriched dict).
         """
         self._datapoints = datapoints
+        # The Point selector ranges over the points so far; 0 stays "latest".
+        self._point_selector.blockSignals(True)
+        self._point_selector.setMaximum(len(datapoints))
+        self._point_selector.blockSignals(False)
         self._redraw()
 
     def clear(self) -> None:
-        """Empty the curve (does not touch the selectors)."""
+        """Empty the curve and the image (does not touch the selectors)."""
         self._datapoints = []
         self._curve.setData([], [])
+        self._image_view.clear()
+        self._point_selector.blockSignals(True)
+        self._point_selector.setRange(0, 0)
+        self._point_selector.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _redraw(self) -> None:
-        """Redraw the curve from the stored datapoint history and relabel axes."""
-        x_key = self._x_selector.currentText()
-        y_key = self._y_selector.currentText()
+    def _kind_item_enabled(self, index: int) -> bool:
+        item = self._kind_selector.model().item(index)  # type: ignore[attr-defined]
+        return bool(item.isEnabled())
 
-        # Selected axis index per loop slot (0 — the trivial index into a
-        # length-1 axis — when that slot is inactive/not picked). Also
-        # collect the display text of any active pick, for the axis label.
+    def _refresh_kind_availability(self) -> None:
+        """Enable the Image kind only while there is an image block to draw."""
+        index = self._kind_selector.findData("image")
+        item = self._kind_selector.model().item(index)  # type: ignore[attr-defined]
+        item.setEnabled(bool(self._image_blocks))
+        if not self._image_blocks and self.selected_kind() == "image":
+            self._kind_selector.setCurrentIndex(self._kind_selector.findData("xy"))
+
+    def _on_kind_changed(self, _index: int) -> None:
+        self._apply_kind_visibility()
+        self._redraw()
+
+    def _apply_kind_visibility(self) -> None:
+        """Show the selectors and the view of the current kind only."""
+        image = self.selected_kind() == "image"
+        for widget in (self._x_label, self._x_selector, self._y_label, self._y_selector):
+            widget.setVisible(not image)
+        for widget in (
+            self._image_label, self._image_selector, self._point_label, self._point_selector,
+        ):
+            widget.setVisible(image)
+        self._stack.setCurrentWidget(self._image_view if image else self._plot_widget)
+
+    def _loop_indices(self) -> tuple[int, int, list[str]]:
+        """Return the selected index per loop slot, and the display text of any pick.
+
+        Returns:
+            ``(i1, i2, qualifiers)`` — each index 0 (the trivial index into
+            a length-1 axis) when that slot is inactive or not picked.
+        """
         indices: list[int] = []
         qualifiers: list[str] = []
         for selector in self._loop_selectors:
@@ -258,7 +398,43 @@ class LivePlotPanel(QGroupBox):
                 qualifiers.append(selector.currentText())
             else:
                 indices.append(0)
-        i1, i2 = indices
+        return indices[0], indices[1], qualifiers
+
+    def _redraw(self) -> None:
+        """Redraw the current kind from the stored datapoint history."""
+        if self.selected_kind() == "image":
+            self._redraw_image()
+        else:
+            self._redraw_xy()
+
+    def _redraw_image(self) -> None:
+        """Draw the selected image block's frame for the selected point and reading."""
+        block = self._image_selector.currentText()
+        unit = self._image_blocks.get(block, "")
+        i1, i2, _qualifiers = self._loop_indices()
+        self._image_view.set_labels("column (px)", "row (px)", unit)
+        if not block or not self._datapoints:
+            self._image_view.clear()
+            return
+        point = self._point_selector.value()
+        datapoint = self._datapoints[-1] if point == 0 else self._datapoints[point - 1]
+        raw = datapoint.get(block)
+        if raw is None:
+            self._image_view.clear()
+            return
+        try:
+            frame = select_frame(np.asarray(raw, dtype=np.float64), i1, i2)
+        except (IndexError, ValueError):
+            logger.debug("LivePlotPanel: no frame for %r at loop (%d, %d)", block, i1, i2)
+            self._image_view.clear()
+            return
+        self._image_view.set_frame(frame)
+
+    def _redraw_xy(self) -> None:
+        """Redraw the curve from the stored datapoint history and relabel axes."""
+        x_key = self._x_selector.currentText()
+        y_key = self._y_selector.currentText()
+        i1, i2, qualifiers = self._loop_indices()
 
         def _lookup(dp: dict, key: str):
             # Every measurement column is a real (n_loop1, n_loop2) grid;

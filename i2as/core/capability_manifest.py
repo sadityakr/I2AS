@@ -326,7 +326,10 @@ MANIFEST_SCHEMA: dict[str, Any] = {
         "monitored": {
             "type": "object",
             "description": "One @monitored reading.",
-            "required": ["name", "unit", "description", "group", "returns"],
+            "required": [
+                "name", "unit", "description", "group", "returns",
+                "kind", "shape", "period_s", "axis",
+            ],
             "additionalProperties": False,
             "properties": {
                 "name": {"type": "string"},
@@ -337,6 +340,28 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 "description": {"type": "string"},
                 "group": {"type": "string"},
                 "returns": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["scalar", "image", "trace"],
+                    "description": (
+                        "Value kind. Only a scalar appears in readings; an "
+                        "image or trace is polled on its own period for the "
+                        "GUI's plot panels."
+                    ),
+                },
+                "shape": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Array shape; [] for a scalar.",
+                },
+                "period_s": {
+                    "type": ["number", "null"],
+                    "description": "Array poll period in seconds; null for a scalar.",
+                },
+                "axis": {
+                    "type": ["array", "null"],
+                    "description": "A trace's x axis as [start, stop, unit], or null.",
+                },
             },
         },
         "control": {

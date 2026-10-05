@@ -10,7 +10,9 @@ widget never talks to the Orchestrator directly.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pyqtgraph as pg
 import qtawesome as qta
@@ -88,6 +90,10 @@ class TrendPlotPanel(QGroupBox):
             it via ``i2as.core.paths.log_directory()``; tests
             pass an explicit ``tmp_path`` instead.
     """
+
+    #: The panel kind's registry key in ``TrendsQuadrant`` (the plot-panel
+    #: protocol, see ``gui/array_plot_panels.py``).
+    kind: ClassVar[str] = "trend"
 
     remove_requested = pyqtSignal(str)
 
@@ -184,6 +190,32 @@ class TrendPlotPanel(QGroupBox):
                 self._y_selector.setCurrentIndex(0)
             self._y_selector.blockSignals(False)
         self._redraw()
+
+    @property
+    def panel_id(self) -> str:
+        """The host-assigned identifier of this panel."""
+        return self._panel_id
+
+    def settings_entry(self) -> dict[str, Any]:
+        """Return the JSON-safe dict the host persists for this panel."""
+        return {"kind": self.kind, "key": self.selected_key(), "window_s": self.selected_window_s()}
+
+    def apply_settings_entry(self, entry: Mapping[str, Any]) -> None:
+        """Restore the window and (if already selectable) the key from a persisted entry.
+
+        The key may not be selectable yet — the Y combo fills on the first
+        ``states_updated`` tick — so the host retries ``set_selected_key()``
+        until it sticks.
+
+        Args:
+            entry: A dict as produced by ``settings_entry()``.
+        """
+        window_s = entry.get("window_s")
+        if isinstance(window_s, (int, float)) and not isinstance(window_s, bool):
+            self.set_selected_window_s(float(window_s))
+        key = entry.get("key")
+        if isinstance(key, str) and key:
+            self.set_selected_key(key)
 
     def selected_key(self) -> str | None:
         """Return the currently selected Y-variable key.

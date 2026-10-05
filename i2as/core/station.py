@@ -27,7 +27,13 @@ from i2as.core.decorators import (
     get_control_panel,
     get_control_scope,
     get_control_specs,
+    ARRAY_KINDS,
+    get_monitored_axis,
     get_monitored_description,
+    get_monitored_kind,
+    get_monitored_methods,
+    get_monitored_period_s,
+    get_monitored_shape,
     get_monitored_unit,
     get_ui_group,
 )
@@ -251,6 +257,12 @@ class Station:
         # report a wedged instrument (see `polling_vi()`).
         self._polling_vi: str | None = None
         self._max_errors: int = 3
+        # The array poll's schedule (the monitored-kind standard): when each
+        # (vi_name, field) image/trace was last read, on the monotonic clock,
+        # and the fields already reported as declaration-breaking, so a bad
+        # VI logs its error once rather than every period.
+        self._array_last_read: dict[tuple[str, str], float] = {}
+        self._array_faults_logged: set[tuple[str, str]] = set()
         # Degraded-build support: VIs whose hardware failed to connect at
         # build time, plus the build recipes and live driver instances that
         # connect_instrument() needs to bring one back without a restart.
@@ -1169,6 +1181,66 @@ class Station:
                 self._polling_vi = None
 
         return full_state
+
+    def poll_monitored_arrays(self, now: float | None = None) -> dict[str, dict]:
+        """Read every array @monitored field whose period has elapsed.
+
+        The array half of the monitor cycle (the monitored-kind standard,
+        ``core/decorators.py``): images and traces are read here, each on
+        its own declared ``period_s``, never in ``get_state()``. Called by
+        the Orchestrator on its tick, after the scalar poll, so a slow frame
+        read only ever delays the NEXT tick, never this tick's safety
+        readings.
+
+        An array read is display-only, so it never affects instrument
+        health: a VI the scalar poll currently reports stale or
+        disconnected is skipped (its scalar poll owns the fault and its
+        recovery), a communication error here is logged and skipped without
+        touching the error counters, any other failure — a value that breaks
+        its declared shape, an instrument refusing the read — is logged once
+        and dropped, and a field answering ``None`` ("no value yet") is
+        simply left out.
+
+        Args:
+            now: The current monotonic time in seconds; ``None`` reads
+                ``time.monotonic()``. Tests pass it to step the schedule.
+
+        Returns:
+            ``{vi_name: {field: float64 ndarray}}`` holding only the fields
+            read on this call — empty when none was due.
+        """
+        if now is None:
+            now = time.monotonic()
+        result: dict[str, dict] = {}
+        for vi_name, vi in self._virtual_instruments.items():
+            if self._error_counts.get(vi_name, 0):
+                continue
+            for field_name in get_monitored_methods(vi, kinds=ARRAY_KINDS):
+                key = (vi_name, field_name)
+                period_s = get_monitored_period_s(getattr(vi, field_name)) or 0.0
+                last = self._array_last_read.get(key)
+                if last is not None and now - last < period_s:
+                    continue
+                self._array_last_read[key] = now
+                self._polling_vi = vi_name
+                try:
+                    value = vi.read_monitored_array(field_name)
+                except I2ASCommunicationError as exc:
+                    logger.warning("Array read %s.%s failed: %s", vi_name, field_name, exc)
+                    continue
+                except Exception as exc:  # display only: nothing may escape into the tick
+                    if key not in self._array_faults_logged:
+                        self._array_faults_logged.add(key)
+                        logger.error(
+                            "Array field %s.%s failed and is not shown: %s",
+                            vi_name, field_name, exc,
+                        )
+                    continue
+                finally:
+                    self._polling_vi = None
+                if value is not None:
+                    result.setdefault(vi_name, {})[field_name] = value
+        return result
 
     def polling_vi(self) -> str | None:
         """Return the VI whose read is in flight right now, or ``None``.
@@ -2428,6 +2500,10 @@ def _monitored_infos(cls: type) -> tuple[MonitoredInfo, ...]:
                 description=get_monitored_description(method),
                 group=get_ui_group(method),
                 returns=_return_type_name(method),
+                kind=get_monitored_kind(method),
+                shape=get_monitored_shape(method) or (),
+                period_s=get_monitored_period_s(method),
+                axis=get_monitored_axis(method),
             )
         )
     return tuple(infos)

@@ -811,6 +811,14 @@ class ProcedureWindow(QMainWindow):
         self._plot1.set_available_keys(keys, default_x, "voltage_V")
         self._plot2.set_available_keys(keys, default_x, "current_A")
 
+        # The image blocks the Image plot kind can draw (none for a
+        # procedure that records no frames: the kind is then disabled).
+        image_blocks = cls.live_plot_image_blocks(
+            self._station, self._params_panel.current_selections()
+        )
+        for panel in (self._plot1, self._plot2):
+            panel.set_available_image_blocks(image_blocks)
+
         # Refresh the loop selectors based on the current selections.
         self._refresh_loop_selectors()
 

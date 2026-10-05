@@ -3900,6 +3900,7 @@ _ENGINE_SIGNALS = frozenset({
     "verdict",
     "event",
     "states_updated",
+    "monitored_arrays_updated",
     "monitoring_changed",
     "state_changed",
     "procedure_progress",

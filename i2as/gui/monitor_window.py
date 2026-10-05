@@ -62,7 +62,7 @@ from i2as.gui.theme import (
     TEXT_PRIMARY,
 )
 from i2as.gui.takeover_strip import TakeoverStrip
-from i2as.gui.trends_quadrant import TrendsQuadrant
+from i2as.gui.trends_quadrant import TrendsQuadrant, array_fields_from_station_info
 from i2as.gui.widget_lifecycle import hold_window, release_window, retire_widget
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import GUEST_USER_ID
@@ -494,7 +494,11 @@ class MonitorWindow(QMainWindow):
 
         # ── Fixed 2x2 quadrant grid (Page 1 — Monitor) ───────────────
         top_left = self._build_instruments_quadrant(measurement_vis)
-        self._trends = TrendsQuadrant(self._station, parent=self)
+        self._trends = TrendsQuadrant(
+            self._station,
+            parent=self,
+            array_fields=array_fields_from_station_info(self._mirror.station_info()),
+        )
         self._session_info = ExperimentInfoPanel(
             session_manager=self._session_manager, after_start=self.offer_notebook_link
         )
@@ -1376,6 +1380,10 @@ class MonitorWindow(QMainWindow):
         # (each panel connects itself in its constructor) — this slot only
         # feeds the Trends quadrant.
         self._orchestrator.states_updated.connect(self._on_states_updated)
+        # Image/trace @monitored fields (the monitored-kind standard) arrive
+        # on their own signal, routed through the window for the same
+        # teardown reason as states_updated (see _on_states_updated).
+        self._orchestrator.monitored_arrays_updated.connect(self._on_arrays_updated)
         # ramps_updated likewise fires every tick, so it routes through this
         # window rather than connecting the tracker directly (gui-edit
         # skill's destruction-order rule).
@@ -1489,6 +1497,18 @@ class MonitorWindow(QMainWindow):
         self._trends.on_states_updated(state)
 
         self._sync_fault_alerts()
+
+    def _on_arrays_updated(self, arrays: dict) -> None:
+        """Forward the image/trace fields read this tick to the plot quadrant.
+
+        Routed through the window rather than connected to the quadrant
+        directly, for the teardown reason ``_on_states_updated`` gives.
+
+        Args:
+            arrays: ``{vi_name: {field: ndarray}}`` from the Orchestrator's
+                ``monitored_arrays_updated``.
+        """
+        self._trends.on_arrays_updated(arrays)
 
     def _on_error_event(self, event: ErrorEvent) -> None:
         """Bring a new per-VI fault into the alert list without waiting a tick.

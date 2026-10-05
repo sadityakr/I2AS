@@ -805,6 +805,17 @@ class MonitoredInfo(_ContractMessage):
             ``""`` when it belongs to none.
         returns: Name of the method's declared return type ("float",
             "str", "float | None"), or ``""`` when it declares none.
+        kind: The declared value kind (the monitored-kind standard,
+            ``core/decorators.py``): ``"scalar"``, ``"image"`` or
+            ``"trace"``. Only a scalar ever appears in ``Readings``; an
+            array kind is polled on its own period and published to the
+            GUI's plot panels only.
+        shape: An array kind's declared shape — ``(height_px, width_px)``
+            or ``(length,)``; ``()`` for a scalar.
+        period_s: An array kind's poll period in seconds; ``None`` for a
+            scalar, which is polled every monitor tick.
+        axis: A trace's physical x axis ``(start, stop, unit)``, or
+            ``None``.
     """
 
     name: str
@@ -812,12 +823,17 @@ class MonitoredInfo(_ContractMessage):
     description: str = ""
     group: str = ""
     returns: str = ""
+    kind: str = "scalar"
+    shape: tuple[int, ...] = ()
+    period_s: float | None = None
+    axis: tuple[float, float, str] | None = None
 
     def __post_init__(self) -> None:
-        """Validate the declaration strings.
+        """Validate the declaration strings and coerce the array declaration.
 
         Raises:
-            TypeError: If any field is not a string.
+            TypeError: If any string field is not a string, or ``shape`` is
+                not a sequence of ints.
             ValueError: If ``name`` is empty.
         """
         _checked_strings(
@@ -827,9 +843,19 @@ class MonitoredInfo(_ContractMessage):
             description=self.description,
             group=self.group,
             returns=self.returns,
+            kind=self.kind,
         )
         if not self.name:
             raise ValueError("MonitoredInfo.name must be a non-empty str")
+        # A JSON round trip hands tuples back as lists.
+        if not isinstance(self.shape, (tuple, list)) or not all(
+            isinstance(size, int) for size in self.shape
+        ):
+            raise TypeError(f"MonitoredInfo.shape must be a tuple of ints, got {self.shape!r}")
+        object.__setattr__(self, "shape", tuple(self.shape))
+        if self.axis is not None:
+            start, stop, axis_unit = self.axis
+            object.__setattr__(self, "axis", (float(start), float(stop), str(axis_unit)))
 
 
 @dataclass(frozen=True)

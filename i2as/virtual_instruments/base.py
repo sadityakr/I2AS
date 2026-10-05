@@ -17,6 +17,8 @@ import statistics
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
+import numpy as np
+
 from i2as.core.events import LifecycleState
 from i2as.core.logging_config import VI_LOGGER_PREFIX
 from i2as.core.exceptions import (
@@ -26,6 +28,9 @@ from i2as.core.exceptions import (
 )
 from i2as.core.plan import ImageBlock, ParamSpec, UIGroup
 from i2as.virtual_instruments.rampable import RampableVI
+
+# What the scalar monitor tick polls (the monitored-kind standard).
+_SCALAR_KINDS: frozenset[str] = frozenset({"scalar"})
 
 logger = logging.getLogger(__name__)
 
@@ -448,6 +453,15 @@ class BaseVirtualInstrument:
                         attr_value, "_monitored_description", ""
                     )
                     wrapped._ui_group = getattr(attr_value, "_ui_group", "")
+                    # The monitored-kind declaration (kind/shape/period/axis).
+                    for marker in (
+                        "_monitored_kind",
+                        "_monitored_shape",
+                        "_monitored_period_s",
+                        "_monitored_axis",
+                    ):
+                        if hasattr(attr_value, marker):
+                            setattr(wrapped, marker, getattr(attr_value, marker))
                 if is_control:
                     wrapped._is_control = True
                     wrapped._display_name = getattr(attr_value, "_display_name", attr_name)
@@ -1235,7 +1249,12 @@ class BaseVirtualInstrument:
     # ------------------------------------------------------------------
 
     def get_state(self) -> dict:
-        """Poll every @monitored method and return ``{method_name: value}``.
+        """Poll every scalar @monitored method and return ``{method_name: value}``.
+
+        Only ``kind="scalar"`` fields are read here: an array field (an image
+        or a trace, the monitored-kind standard in ``core/decorators.py``)
+        is read on its own period through ``read_monitored_array()``, never
+        on the scalar tick, so a slow frame cannot delay a safety reading.
 
         The VI's half of the monitor cycle, and the ONE place this VI reads
         its instrument on a tick. The result is also kept as the cache
@@ -1255,7 +1274,7 @@ class BaseVirtualInstrument:
         from i2as.core.decorators import get_monitored_methods
 
         state: dict = {}
-        for method_name in get_monitored_methods(self):
+        for method_name in get_monitored_methods(self, kinds=_SCALAR_KINDS):
             state[method_name] = getattr(self, method_name)()
         self._monitored_cache = dict(state)
         # The lifecycle-state standard's hardware-correction rule (see
@@ -1263,6 +1282,54 @@ class BaseVirtualInstrument:
         # the values this very poll just cached rather than reading again.
         self._refresh_lifecycle_state()
         return state
+
+    def read_monitored_array(self, name: str) -> np.ndarray | None:
+        """Read one array @monitored field and check it against its declaration.
+
+        The VI's half of the array poll (``Station.poll_monitored_arrays()``),
+        the counterpart of ``get_state()`` for the image and trace kinds of
+        the monitored-kind standard. The value is returned as a fresh
+        float64 array the caller owns, so it can cross to the GUI thread.
+
+        Args:
+            name: The name of an array (``"image"``/``"trace"``) @monitored
+                method of this VI.
+
+        Returns:
+            The value as a float64 array of exactly the declared shape, or
+            ``None`` when the field answers ``None`` — "no value yet", the
+            array counterpart of a scalar ``float | None`` reading.
+
+        Raises:
+            ValueError: If ``name`` is not an array monitored field of this
+                VI, or the value read does not have the declared shape — a
+                VI bug, reported loudly rather than drawn wrong.
+            I2ASCommunicationError: Propagated from a failing driver read.
+        """
+        from i2as.core.decorators import (
+            ARRAY_KINDS,
+            get_monitored_kind,
+            get_monitored_shape,
+        )
+
+        method = getattr(self, name, None)
+        if (
+            method is None
+            or not getattr(method, "_is_monitored", False)
+            or get_monitored_kind(method) not in ARRAY_KINDS
+        ):
+            raise ValueError(f"{type(self).__name__}.{name} is not an array @monitored field")
+        raw = method()
+        if raw is None:
+            return None
+        value = np.array(raw, dtype=np.float64)
+        declared = get_monitored_shape(method)
+        if value.shape != declared:
+            raise ValueError(
+                f"{type(self).__name__}.{name} returned shape {value.shape}, "
+                f"declared {declared}"
+            )
+        return value
 
     def last_monitored(self, name: str, default: Any = None) -> Any:
         """Return one @monitored value as of the last successful poll.

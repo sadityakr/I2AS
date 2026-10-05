@@ -368,6 +368,28 @@ class BaseProcedure:
         return list(cls.measurement_data_keys)
 
     @classmethod
+    def live_plot_image_blocks(
+        cls, station: Station, selections: Mapping[str, Any] | None = None
+    ) -> dict[str, str]:
+        """Return the image blocks a live plot can draw, with their pixel units.
+
+        The image counterpart of ``live_plot_measurement_keys``: the GUI's
+        plot panels offer an "Image" kind that draws one frame of a
+        datapoint's image block (the image-block standard). The default —
+        a procedure that records no frames — offers none.
+
+        Args:
+            station: The active Station (unused by the default).
+            selections: Current structural-parameter values, or ``None``
+                (unused by the default).
+
+        Returns:
+            ``{block_name: unit}``, empty by default.
+        """
+        _ = (station, selections)
+        return {}
+
+    @classmethod
     def live_plot_loop_labels(
         cls, station: Station, selections: Mapping[str, Any] | None = None
     ) -> tuple[dict[str, str] | None, dict[str, str] | None]:
@@ -1703,6 +1725,27 @@ class SweepMeasureProcedure(BaseProcedure):
             )
             if not key.endswith("_array")
         ]
+
+    @classmethod
+    def live_plot_image_blocks(
+        cls, station: Station, selections: Mapping[str, Any] | None = None
+    ) -> dict[str, str]:
+        """Return the selected measurement VI's image blocks and their pixel units.
+
+        Each block's frame arrives in every datapoint under the block name
+        (``(rows, cols)``, or ``(n_loop1, n_loop2, rows, cols)`` with a
+        reading loop), so a plot panel in "Image" mode draws it with the
+        same Loop selectors an XY plot uses.
+        """
+        names = station.measurement_vi_names()
+        if not names:
+            return {}
+        selections = selections or {}
+        selected = selections.get("measurement_vi")
+        if selected not in names:
+            selected = names[0]
+        vi = station.get_vi(selected)
+        return {name: block.unit for name, block in vi.measurement_image_blocks.items()}
 
     @classmethod
     def live_plot_loop_labels(

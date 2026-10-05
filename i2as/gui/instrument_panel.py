@@ -407,7 +407,16 @@ class InstrumentPanel(QGroupBox):
         val = QLabel("—")
         val.setObjectName(f"{self._vi_name}_{method_name}_value")
         val.setProperty("class", "value_readout")
-        self._value_labels[method_name] = val
+        info = next((m for m in self._info.monitored if m.name == method_name), None)
+        if info is not None and info.kind != "scalar":
+            # An image/trace field (the monitored-kind standard) has no
+            # one-line readout: it never arrives in the state dict, and the
+            # Monitor's plot quadrant is where it is drawn.
+            shape = "×".join(str(size) for size in info.shape)
+            val.setText(f"{info.kind} {shape} — see Plots")
+            val.setToolTip(info.description)
+        else:
+            self._value_labels[method_name] = val
         row.addWidget(lbl)
         row.addWidget(val)
         row.addStretch()

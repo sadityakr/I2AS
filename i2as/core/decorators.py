@@ -25,6 +25,27 @@ The @monitored decorator marks a method that:
   ``virtual_instruments/README.md``) requires every monitored field to
   declare them, and ``tests/test_conformance.py``'s
   ``test_capability_manifest_is_complete`` enforces it.
+- Carries a **value kind** (``kind=``, the monitored-kind standard): what
+  shape of value it returns, which decides how it travels and how it is
+  plotted. One of ``MONITORED_KINDS``:
+
+  * ``"scalar"`` (the default) — one number, bool or string, polled every
+    monitor tick into the state snapshot, trended and persisted exactly as
+    every monitored field always has been.
+  * ``"image"`` — a 2-D frame of declared ``shape=(height_px, width_px)``
+    (a live camera preview).
+  * ``"trace"`` — a 1-D array of declared ``shape=(length,)`` (a spectrum, a
+    scope trace, a line profile), optionally on a physical x axis
+    ``axis=(start, stop, unit)``.
+
+  A non-scalar ("array") field never enters the scalar state snapshot, the
+  trend history, the trend checks or the ``Readings`` event: it is polled on
+  its own slower ``period_s=`` (default ``DEFAULT_ARRAY_PERIOD_S``) by
+  ``Station.poll_monitored_arrays()`` and published on its own signal, so a
+  slow frame read can never delay a scalar safety reading and no scalar
+  consumer ever meets an array it does not expect. The kind is a
+  declaration on the VI, like the unit — the plot panels read it to offer
+  the field to the right renderer (trend, image, waterfall).
 
 The @control decorator marks a method that:
 - Appears as a button (with text-box inputs for arguments) on the GUI panel.
@@ -80,6 +101,23 @@ VALID_ACTION_CLASSES: tuple[str, ...] = ("read", "recovery", "run_control", "env
 # control to declare it explicitly.
 DEFAULT_ACTION_CLASS: str = "run_control"
 
+# The monitored-kind standard (see the module docstring): every value kind a
+# @monitored field may declare, and the number of dimensions its declared
+# ``shape`` must have (``None``: a scalar declares no shape). Plain strings
+# for the same reason as the action classes above — this module imports
+# nothing (layer contract C1).
+MONITORED_KINDS: dict[str, int | None] = {"scalar": None, "image": 2, "trace": 1}
+
+# The kinds polled outside the scalar monitor tick, on their own period.
+ARRAY_KINDS: frozenset[str] = frozenset(
+    kind for kind, ndim in MONITORED_KINDS.items() if ndim is not None
+)
+
+# How often an array field is polled when it declares no ``period_s=``. Slow
+# on purpose: an array read (a camera exposure, a spectrum) costs instrument
+# time on the one hardware thread, and a live preview needs no more.
+DEFAULT_ARRAY_PERIOD_S: float = 1.0
+
 
 def monitored(
     func: Callable | None = None,
@@ -87,6 +125,10 @@ def monitored(
     unit: str | None = None,
     description: str = "",
     group: str | None = None,
+    kind: str = "scalar",
+    shape: tuple[int, ...] | None = None,
+    period_s: float | None = None,
+    axis: tuple[float, float, str] | None = None,
 ) -> Callable:
     """Mark a method as a monitored variable.
 
@@ -114,15 +156,32 @@ def monitored(
             standard forbids on a shipped VI — it is not the same as ``""``.
         description: One human-readable sentence saying what the value is.
         group: Optional UI-group key (see the module docstring).
+        kind: The value kind, one of ``MONITORED_KINDS`` (the
+            monitored-kind standard, see the module docstring).
+            ``"scalar"`` (the default) is every monitored field as it always
+            was; ``"image"`` and ``"trace"`` are array kinds.
+        shape: The array's declared shape — ``(height_px, width_px)`` for an
+            image, ``(length,)`` for a trace. Required for an array kind,
+            forbidden for a scalar. Every polled value is checked against it.
+        period_s: Seconds between two polls of an array field (default
+            ``DEFAULT_ARRAY_PERIOD_S``). Forbidden for a scalar, which is
+            polled every monitor tick.
+        axis: A trace's physical x axis as ``(start, stop, unit)`` — the
+            value of its first and last sample, e.g. ``(400.0, 800.0,
+            "nm")``. Optional; without it a trace is plotted against its
+            sample index. Forbidden for any other kind.
 
     Returns:
         The wrapped method (bare form) or a decorator (parametrized form).
 
     Raises:
-        TypeError: If ``unit``, ``description`` or ``group`` is not a string.
-        ValueError: If ``group`` is an empty string.
+        TypeError: If ``unit``, ``description`` or ``group`` is not a string,
+            or an array declaration has the wrong type.
+        ValueError: If ``group`` is an empty string, ``kind`` is unknown, or
+            the shape/period/axis declaration does not fit the kind.
     """
     _check_declaration_strings(unit=unit, description=description, group=group)
+    shape, period_s, axis = _check_kind_declaration(kind, shape, period_s, axis)
 
     def _decorate(inner_func: Callable) -> Callable:
         @functools.wraps(inner_func)
@@ -134,6 +193,10 @@ def monitored(
         wrapper._monitored_unit = unit
         wrapper._monitored_description = description
         wrapper._ui_group = group or ""
+        wrapper._monitored_kind = kind
+        wrapper._monitored_shape = shape
+        wrapper._monitored_period_s = period_s
+        wrapper._monitored_axis = axis
         return wrapper
 
     if func is not None:
@@ -141,6 +204,84 @@ def monitored(
         return _decorate(func)
     # Parametrized form: @monitored(unit=..., description=...)
     return _decorate
+
+
+def _check_kind_declaration(
+    kind: str,
+    shape: tuple[int, ...] | None,
+    period_s: float | None,
+    axis: tuple[float, float, str] | None,
+) -> tuple[tuple[int, ...] | None, float | None, tuple[float, float, str] | None]:
+    """Validate and normalise a @monitored field's kind declaration.
+
+    A wrong declaration fails at import, never at the first poll.
+
+    Args:
+        kind: The declared value kind.
+        shape: The declared array shape, or ``None``.
+        period_s: The declared poll period, or ``None``.
+        axis: The declared trace x axis, or ``None``.
+
+    Returns:
+        ``(shape, period_s, axis)`` normalised: the shape as a tuple of
+        ints, the period defaulted for an array kind, the axis as a
+        ``(float, float, str)`` tuple. All three ``None`` for a scalar.
+
+    Raises:
+        TypeError: If a declaration has the wrong type.
+        ValueError: If ``kind`` is unknown or a declaration does not fit it.
+    """
+    if kind not in MONITORED_KINDS:
+        raise ValueError(
+            f"@monitored kind= must be one of {sorted(MONITORED_KINDS)}, got {kind!r}"
+        )
+    ndim = MONITORED_KINDS[kind]
+    if ndim is None:
+        for name, value in (("shape", shape), ("period_s", period_s), ("axis", axis)):
+            if value is not None:
+                raise ValueError(
+                    f"@monitored {name}= declares an array; a kind={kind!r} "
+                    f"field is polled every tick and takes none"
+                )
+        return None, None, None
+
+    if shape is None:
+        raise ValueError(f"@monitored kind={kind!r} must declare shape=")
+    if not isinstance(shape, (tuple, list)):
+        raise TypeError(f"@monitored shape= must be a tuple of ints, got {shape!r}")
+    if len(shape) != ndim:
+        raise ValueError(
+            f"@monitored kind={kind!r} needs a {ndim}-D shape=, got {tuple(shape)!r}"
+        )
+    for size in shape:
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError(f"@monitored shape= entries must be ints, got {size!r}")
+        if size <= 0:
+            raise ValueError(f"@monitored shape= entries must be > 0, got {size!r}")
+
+    if period_s is None:
+        period_s = DEFAULT_ARRAY_PERIOD_S
+    if not isinstance(period_s, (int, float)) or isinstance(period_s, bool):
+        raise TypeError(f"@monitored period_s= must be a number, got {period_s!r}")
+    if period_s <= 0:
+        raise ValueError(f"@monitored period_s= must be > 0, got {period_s!r}")
+
+    if axis is not None:
+        if kind != "trace":
+            raise ValueError(f"@monitored axis= applies to a trace, not kind={kind!r}")
+        if not isinstance(axis, (tuple, list)) or len(axis) != 3:
+            raise TypeError(
+                f"@monitored axis= must be (start, stop, unit), got {axis!r}"
+            )
+        start, stop, axis_unit = axis
+        for bound in (start, stop):
+            if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+                raise TypeError(f"@monitored axis= bounds must be numbers, got {bound!r}")
+        if not isinstance(axis_unit, str):
+            raise TypeError(f"@monitored axis= unit must be a str, got {axis_unit!r}")
+        axis = (float(start), float(stop), axis_unit)
+
+    return tuple(shape), float(period_s), axis
 
 
 def _check_declaration_strings(**values: str | None) -> None:
@@ -293,16 +434,30 @@ def control(
     return _decorate
 
 
-def get_monitored_methods(cls_or_instance) -> list[str]:
-    """Return names of all @monitored methods on a class or instance."""
+def get_monitored_methods(cls_or_instance, kinds: frozenset[str] | None = None) -> list[str]:
+    """Return names of the @monitored methods on a class or instance.
+
+    Args:
+        cls_or_instance: A VI class or instance.
+        kinds: Only methods whose declared kind is in this set; ``None``
+            (the default) returns every monitored method, whatever its kind.
+            ``{"scalar"}`` is what the monitor tick polls, ``ARRAY_KINDS``
+            what the array poll reads.
+
+    Returns:
+        The method names, sorted.
+    """
     methods = []
     for name in dir(cls_or_instance):
         try:
             attr = getattr(cls_or_instance, name)
         except AttributeError:
             continue
-        if callable(attr) and getattr(attr, "_is_monitored", False):
-            methods.append(name)
+        if not (callable(attr) and getattr(attr, "_is_monitored", False)):
+            continue
+        if kinds is not None and get_monitored_kind(attr) not in kinds:
+            continue
+        methods.append(name)
     return methods
 
 
@@ -373,6 +528,57 @@ def get_monitored_description(method: Callable) -> str:
         the method declared none.
     """
     return getattr(method, "_monitored_description", "")
+
+
+def get_monitored_kind(method: Callable) -> str:
+    """Return a @monitored method's declared value kind.
+
+    Args:
+        method: A callable, typically a bound VI method.
+
+    Returns:
+        One of ``MONITORED_KINDS`` — ``"scalar"`` when none was declared.
+    """
+    return getattr(method, "_monitored_kind", "scalar")
+
+
+def get_monitored_shape(method: Callable) -> tuple[int, ...] | None:
+    """Return an array @monitored method's declared shape.
+
+    Args:
+        method: A callable, typically a bound VI method.
+
+    Returns:
+        ``(height_px, width_px)`` for an image, ``(length,)`` for a trace,
+        ``None`` for a scalar.
+    """
+    return getattr(method, "_monitored_shape", None)
+
+
+def get_monitored_period_s(method: Callable) -> float | None:
+    """Return an array @monitored method's poll period in seconds.
+
+    Args:
+        method: A callable, typically a bound VI method.
+
+    Returns:
+        The declared (or defaulted) period, or ``None`` for a scalar, which
+        is polled every monitor tick.
+    """
+    return getattr(method, "_monitored_period_s", None)
+
+
+def get_monitored_axis(method: Callable) -> tuple[float, float, str] | None:
+    """Return a trace @monitored method's declared physical x axis.
+
+    Args:
+        method: A callable, typically a bound VI method.
+
+    Returns:
+        ``(start, stop, unit)``, or ``None`` when none was declared (the
+        trace is then plotted against its sample index).
+    """
+    return getattr(method, "_monitored_axis", None)
 
 
 def get_ui_group(method: Callable) -> str:

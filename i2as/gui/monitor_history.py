@@ -197,3 +197,76 @@ class MonitorHistory:
         times = [t for t, v in points if t >= cutoff]
         values = [v for t, v in points if t >= cutoff]
         return times, values
+
+
+class ArrayHistory:
+    """Bounded in-RAM history of the array @monitored fields (images, traces).
+
+    The array sibling of :class:`MonitorHistory`, fed from
+    ``Orchestrator.monitored_arrays_updated`` (the monitored-kind standard,
+    ``core/decorators.py``). Keys are flattened the same way —
+    ``{vi_name}_{field_name}`` — so a panel names an image or a trace exactly
+    as a trend panel names a scalar. RAM only, by design: nothing here is
+    persisted, and each key keeps only its newest ``max_entries`` arrays,
+    so memory stays bounded however long the window is open (a 128x128
+    float64 frame is 128 KiB; a trace a few KiB).
+
+    Qt-free, like ``MonitorHistory``.
+
+    Args:
+        max_entries: How many arrays each key keeps, newest last. A
+            waterfall can show at most this many rows.
+    """
+
+    def __init__(self, max_entries: int = 600) -> None:
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries!r}")
+        self._max_entries = max_entries
+        self._history: dict[str, deque[tuple[float, object]]] = {}
+
+    def record(self, arrays: dict[str, dict[str, object]], timestamp: float | None = None) -> None:
+        """Append one ``monitored_arrays_updated`` payload.
+
+        Args:
+            arrays: ``{vi_name: {field: ndarray}}`` — only the fields read
+                on that tick.
+            timestamp: Wall-clock time of the read; ``None`` uses
+                ``time.time()``.
+        """
+        if timestamp is None:
+            timestamp = time.time()
+        for vi_name, fields in arrays.items():
+            for field_name, value in fields.items():
+                key = f"{vi_name}_{field_name}"
+                buffer = self._history.get(key)
+                if buffer is None:
+                    buffer = deque(maxlen=self._max_entries)
+                    self._history[key] = buffer
+                buffer.append((timestamp, value))
+
+    def keys(self) -> list[str]:
+        """Return every key recorded so far, sorted."""
+        return sorted(self._history)
+
+    def latest(self, key: str) -> tuple[float, object] | None:
+        """Return the newest ``(timestamp, array)`` for ``key``, or ``None``."""
+        buffer = self._history.get(key)
+        if not buffer:
+            return None
+        return buffer[-1]
+
+    def window(self, key: str, window_s: float, now: float | None = None) -> list[tuple[float, object]]:
+        """Return the ``(timestamp, array)`` entries of the last ``window_s`` seconds.
+
+        Args:
+            key: The flat key.
+            window_s: How far back to reach, in seconds.
+            now: The reference time; ``None`` uses ``time.time()``.
+
+        Returns:
+            The entries oldest first; empty when the key is unknown.
+        """
+        if now is None:
+            now = time.time()
+        cutoff = now - window_s
+        return [entry for entry in self._history.get(key, ()) if entry[0] >= cutoff]

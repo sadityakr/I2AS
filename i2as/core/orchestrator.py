@@ -334,6 +334,11 @@ class Orchestrator(QObject):
 
     Signals:
         states_updated (dict): Full station state emitted every monitored tick.
+        monitored_arrays_updated (dict): ``{vi_name: {field: ndarray}}`` —
+            the image/trace @monitored fields read this tick (the
+            monitored-kind standard), each on its own declared period, and
+            only while no procedure is running. Display only: never part of
+            ``states_updated``, the trend history or the event stream.
         monitoring_changed (bool): Emitted when monitoring starts (True) or
             stops (False) — the source of truth for GUI state like the
             Monitor window's monitoring toggle.
@@ -423,6 +428,7 @@ class Orchestrator(QObject):
     verdict_emitted = pyqtSignal(object)  # events.Verdict — one per submitted Command
     event_emitted = pyqtSignal(object)  # events.Event — the engine's one event stream
     states_updated = pyqtSignal(dict)
+    monitored_arrays_updated = pyqtSignal(dict)  # {vi: {field: ndarray}} — display only
     monitoring_changed = pyqtSignal(bool)
     state_changed = pyqtSignal(str)
     procedure_progress = pyqtSignal(float)
@@ -3630,6 +3636,16 @@ class Orchestrator(QObject):
                     )
                     parts.append(f"{vi_name}: {kv}")
             logger.debug("Monitor: %s", " | ".join(parts))
+
+            # Array fields (images, traces — the monitored-kind standard):
+            # after the scalar poll, so a slow frame read never delays this
+            # tick's safety readings, and only while no procedure runs, so a
+            # live preview can never compete with a run for its instrument.
+            # The arrays are fresh copies the engine keeps no reference to.
+            if self._procedure is None and self._state == OrchestratorState.IDLE:
+                arrays = self._station.poll_monitored_arrays()
+                if arrays:
+                    self.monitored_arrays_updated.emit(arrays)
 
         # Operational-status record (runtime troubleshooting signal): assembled
         # from this tick's snapshot (empty while monitoring is off, which polls
