@@ -176,3 +176,5 @@ Deferred, with reason:
 | minor | Unreadable-lock refusal named "process None on unknown" | Says the session is being opened by another application, try again in a few seconds. |
 
 Everything else in the re-audit was verified OK by the reviewer.
+
+**Signed off** by the reviewer on `c5a6ecd`.
