@@ -47,7 +47,7 @@ from i2as.session.gateway import (
 )
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import GUEST_USER_ID, GUEST_USER_NAME, User
-from i2as.session.store import ExperimentStore, SessionStore, UserRoster
+from i2as.session.store import ExperimentStore, SessionLockedError, SessionStore, UserRoster
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +314,23 @@ class ExperimentFeeds:
             feed.attach(self._engine)
             self._feeds[experiment_id] = feed
         return feed
+
+    def reset(self, keep_open: bool = True) -> None:
+        """Detach and forget cached feeds so none records another experiment's trail.
+
+        Connected to ``experiment_changed`` (keeping the open experiment's
+        feed) and ``session_changed`` (dropping every feed — experiment ids
+        repeat across sessions, so a cached feed could otherwise write into
+        the folder of an experiment in the session left behind).
+
+        Args:
+            keep_open: Keep the open experiment's feed attached.
+        """
+        experiment = self._manager.current_experiment() if keep_open else None
+        keep = experiment.experiment_id if experiment is not None else None
+        for experiment_id in list(self._feeds):
+            if experiment_id != keep:
+                self._feeds.pop(experiment_id).detach(self._engine)
 
 
 def _open_experiment_feed(manager: ExperimentManager) -> AgentFeed | None:
@@ -597,6 +614,17 @@ def main(
     user_id = app_settings.current_user_id() or GUEST_USER_ID
     session_store = SessionStore(measurement_root(), registry=profiles.session_registry(user_id))
     session_folder = _resolve_active_session(session_store)
+    # One running application per session folder: mark this one as ours, so
+    # another station (or a second copy of the app) cannot load it live. A
+    # lock held by a live process elsewhere is reported, never fatal — the
+    # app must always start (GLOSSARY.md's **Session**).
+    try:
+        session_store.acquire_lock(session_folder)
+    except (SessionLockedError, OSError) as exc:
+        logger.warning("Session folder lock not taken: %s", exc)
+    app.aboutToQuit.connect(
+        lambda: session_store.release_lock(session_manager.store.root)
+    )
     session_manager = ExperimentManager(
         store=ExperimentStore(session_folder),
         roster=roster,
@@ -746,6 +774,24 @@ def main(
                 )
             except (OSError, RuntimeError):
                 logger.exception("the HTTP MCP endpoint could not start")
+    # Loading another session while running (ExperimentManager.
+    # request_session_switch): everything that cached the old session lets go
+    # of it. Notebook drains are bound to their own session already; agent
+    # feeds and connections are dropped (experiment ids repeat across
+    # sessions, and a connection resolves bare run ids against the open
+    # experiment); an analysis still in flight refuses the switch.
+    session_manager.experiment_changed.connect(lambda _record: app.experiment_feeds.reset())
+    session_manager.session_changed.connect(lambda _folder: app.experiment_feeds.reset(keep_open=False))
+    session_manager.session_changed.connect(lambda _folder: app.eln_service.reset_session())
+    session_manager.session_changed.connect(
+        lambda folder: app.gateway_controller.drop_connections(f"the station loaded session {folder}")
+    )
+    if app.analysis_runner is not None:
+        runner = app.analysis_runner
+        session_manager.add_busy_check(
+            lambda: "An analysis is running" if runner.is_running() else ""
+        )
+
     # Stopping on quit is what keeps the descriptor honest: a gateway.json
     # left behind names a socket that is gone and a token that means
     # nothing, and an adapter reading it reports "cannot connect" instead

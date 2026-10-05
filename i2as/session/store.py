@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import socket
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -573,6 +574,37 @@ class ExperimentStore:
         )
 
 
+#: The file that marks a session folder as in use by a running application.
+SESSION_LOCK_FILENAME = "session.lock"
+
+_HOSTNAME = socket.gethostname()
+
+
+class SessionLockedError(RuntimeError):
+    """A session folder is in use by another running application."""
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return whether a process with *pid* is running on this host."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # type: ignore[attr-defined]
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class SessionStore:
     """The machine's registry of session folders, and the one way to create them.
 
@@ -598,9 +630,10 @@ class SessionStore:
             sessions/                      where a session is created when
                                            nobody chose one (first launch)
 
-    Switching sessions is deferred until the next launch: the open
-    ``ExperimentStore`` stays rooted where it started (see ``GLOSSARY.md``'s
-    **Session**). The store creates nothing on construction.
+    A session can be loaded while the application runs
+    (``ExperimentManager.request_session_switch``); a running application
+    marks the session it holds with ``session.lock`` so a second station does
+    not open the same folder. The store creates nothing on construction.
     """
 
     def __init__(
@@ -627,6 +660,20 @@ class SessionStore:
     def root(self) -> Path:
         """The registry's folder (the measurement root)."""
         return self._root
+
+    def set_registry(
+        self,
+        registry: tuple[Callable[[], dict[str, object]], Callable[[dict[str, object]], None]] | None,
+    ) -> None:
+        """Read and write the active/recent list through another registry from now on.
+
+        Called when a different user logs in, so the sessions they load land
+        in THEIR recent list (``i2as.session.user_profile``).
+
+        Args:
+            registry: ``(read, write)``, or ``None`` for ``sessions.json``.
+        """
+        self._registry_io = registry
 
     @property
     def registry_path(self) -> Path:
@@ -805,6 +852,70 @@ class SessionStore:
             _write_json_atomic(self.registry_path, machine)
             return
         _write_json_atomic(self.registry_path, registry)
+
+    # ------------------------------------------------------------------
+    # The session lock: one running application per session folder
+    # ------------------------------------------------------------------
+
+    def lock_holder(self, folder: str | Path) -> dict[str, object] | None:
+        """Return who else holds *folder*'s session lock, or ``None`` when it is free.
+
+        A lock held by THIS process, or left by a process on this host that
+        is no longer running (a crash), counts as free. A lock from another
+        host cannot be checked for liveness and counts as held; the operator
+        removes ``session.lock`` by hand if that station is gone.
+
+        Args:
+            folder: A session folder.
+
+        Returns:
+            The lock's ``{"pid", "host", "since"}`` when another live process
+            holds it, else ``None``.
+        """
+        data = _read_json(Path(folder) / SESSION_LOCK_FILENAME)
+        if not isinstance(data, dict):
+            return None
+        pid = data.get("pid")
+        host = data.get("host")
+        if host == _HOSTNAME:
+            if pid == os.getpid() or not isinstance(pid, int) or not _pid_alive(pid):
+                return None
+        return dict(data)
+
+    def acquire_lock(self, folder: str | Path) -> None:
+        """Mark *folder* as in use by this process.
+
+        Args:
+            folder: A session folder.
+
+        Raises:
+            SessionLockedError: If another live process holds it.
+            OSError: If the lock cannot be written.
+        """
+        holder = self.lock_holder(folder)
+        if holder is not None:
+            raise SessionLockedError(
+                f"{folder} is in use by process {holder.get('pid')} on "
+                f"{holder.get('host')} since {holder.get('since')}"
+            )
+        _write_json_atomic(
+            Path(folder) / SESSION_LOCK_FILENAME,
+            {"pid": os.getpid(), "host": _HOSTNAME, "since": _utc_now_iso()},
+        )
+
+    def release_lock(self, folder: str | Path) -> None:
+        """Drop this process's lock on *folder*, if it holds one (never raises).
+
+        Args:
+            folder: A session folder.
+        """
+        path = Path(folder) / SESSION_LOCK_FILENAME
+        data = _read_json(path)
+        if isinstance(data, dict) and data.get("pid") == os.getpid() and data.get("host") == _HOSTNAME:
+            try:
+                path.unlink()
+            except OSError:
+                logger.warning("Could not remove session lock %s", path)
 
     def resolve_active(self, user_id: str) -> Path:
         """Return the active session folder, creating one on first launch.

@@ -523,6 +523,18 @@ class ElnService(QObject):
             self._outboxes[experiment_id] = outbox
         return outbox
 
+    def reset_session(self) -> None:
+        """Forget the previous session's outboxes and pages; adopt the new session's.
+
+        Called on ``ExperimentManager.session_changed``. Fresh containers, so
+        a drain already bound to the old session keeps its own.
+        """
+        self._outboxes = {}
+        self._confirmed_entries = {}
+        self._adopt_outboxes()
+        self._emit_status()
+        self.drain_soon()
+
     def _adopt_outboxes(self) -> None:
         """Pick up journals left by an earlier run of the application."""
         try:
@@ -542,47 +554,93 @@ class ElnService(QObject):
         return entry_of(record.eln if record is not None else None)
 
     def drain_soon(self) -> None:
-        """Ask the worker to perform every due job (at most one drain queued)."""
+        """Ask the worker to perform every due job (at most one drain queued).
+
+        The drain is bound HERE, on the GUI thread, to the session open now:
+        its store, outboxes and confirmed pages travel with it, and its
+        results are written back to that session's records — so a session
+        loaded while the drain runs can never receive another session's
+        notebook outcomes (experiment ids repeat across sessions).
+        """
         if self._drain_queued.is_set():
             return
         self._drain_queued.set()
-        self._submit(self._drain, self._drained)
+        store = self._manager.store
+        outboxes = dict(self._outboxes)
+        confirmed = self._confirmed_entries
+        self._submit(lambda: self._drain(store, outboxes, confirmed), self._drained)
 
-    def _drain(self) -> list[Any]:
-        """Worker thread: perform every due job, oldest first, creations first."""
+    def _drain(
+        self,
+        store: Any = None,
+        outboxes: dict[str, Outbox] | None = None,
+        confirmed: dict[str, ElnEntryRef] | None = None,
+    ) -> tuple[Any, list[Any]]:
+        """Worker thread: perform every due job, oldest first, creations first.
+
+        Args:
+            store: The session's experiment store the drain is bound to
+                (``None``: the one open now).
+            outboxes: That session's outboxes (``None``: the live ones).
+            confirmed: That session's confirmed pages (``None``: the live ones).
+
+        Returns:
+            ``(store, [(experiment_id, outcome), …])``.
+        """
         self._drain_queued.clear()
+        store = store if store is not None else self._manager.store
+        outboxes = outboxes if outboxes is not None else dict(self._outboxes)
+        confirmed = confirmed if confirmed is not None else self._confirmed_entries
+
+        def entry_for(experiment_id: str) -> ElnEntryRef | None:
+            known = confirmed.get(experiment_id)
+            if known is not None:
+                return known
+            record = store.load(experiment_id)
+            return entry_of(record.eln if record is not None else None)
+
         executor = JobExecutor(
             connector_for=self._connector,
-            entry_for=self._entry_for,
-            ledger_for=lambda experiment_id: Ledger(self._manager.store.eln_dir(experiment_id) / LEDGER_FILENAME),
+            entry_for=entry_for,
+            ledger_for=lambda experiment_id: Ledger(store.eln_dir(experiment_id) / LEDGER_FILENAME),
             timeout_s=self._publishing().block_timeout_s,
         )
         outcomes: list[Any] = []
-        for experiment_id, outbox in list(self._outboxes.items()):
+        for experiment_id, outbox in list(outboxes.items()):
             due = sorted(outbox.due(), key=lambda job: (job.kind != JOB_CREATE_ENTRY, job.created_utc))
             for job in due:
                 outcome = executor.run(outbox, job)
                 if outcome.entry is not None:
-                    self._confirmed_entries[experiment_id] = outcome.entry
+                    confirmed[experiment_id] = outcome.entry
                 outcomes.append((experiment_id, outcome))
-        return outcomes
+        return store, outcomes
 
     def _drained(self, result: Any) -> None:
-        """GUI thread: record what the drain achieved."""
+        """GUI thread: record what the drain achieved, in the session it ran for."""
         if isinstance(result, Exception):
             self._last_detail = str(result)
             self._emit_status()
             return
+        store, outcomes = result
+        session_root = store.root
+        current = session_root == self._manager.store.root
         self._offline = False
-        for experiment_id, outcome in result:
+        for experiment_id, outcome in outcomes:
             if outcome.entry is not None:
-                self._manager.set_eln_entry(experiment_id, link_of(outcome.entry))
-                self.page_ready.emit({"experiment_id": experiment_id, "entry": outcome.entry.to_dict()})
+                self._manager.set_eln_entry(experiment_id, link_of(outcome.entry), session_root=session_root)
+                if current:
+                    self.page_ready.emit({"experiment_id": experiment_id, "entry": outcome.entry.to_dict()})
             if outcome.published is not None:
                 published = outcome.published
                 self._manager.record_eln_publish(
-                    experiment_id, published["publish_id"], published["run_bundles"], published["published_utc"]
+                    experiment_id,
+                    published["publish_id"],
+                    published["run_bundles"],
+                    published["published_utc"],
+                    session_root=session_root,
                 )
+                if not current:
+                    continue
                 entry = self._confirmed_entries.get(experiment_id) or self._entry_for(experiment_id)
                 self.publish_finished.emit({**published, "experiment_id": experiment_id, "url": entry.url if entry else ""})
             if outcome.job.state == STATE_PENDING and outcome.job.last_error and not outcome.waiting:

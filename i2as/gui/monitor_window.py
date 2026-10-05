@@ -66,7 +66,7 @@ from i2as.gui.trends_quadrant import PlotsQuadrant, array_fields_from_station_in
 from i2as.gui.widget_lifecycle import hold_window, release_window, retire_widget
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import GUEST_USER_ID
-from i2as.session.store import SessionStore
+from i2as.session.store import SessionLockedError, SessionStore
 
 if TYPE_CHECKING:
     from i2as.core.station import Station
@@ -356,7 +356,7 @@ class MonitorWindow(QMainWindow):
         session_folder_action = QAction("Session Folder…", self)
         session_folder_action.setToolTip(
             "Open or create the session folder — the one folder every "
-            "experiment, run file and analysis lives in; applies on next launch"
+            "experiment, run file and analysis lives in; loads it now"
         )
         session_folder_action.triggered.connect(self._open_session_folder_dialog)
         user_menu.addAction(session_folder_action)
@@ -1194,6 +1194,11 @@ class MonitorWindow(QMainWindow):
         self._save_session()
         self._current_user_id = user_id
         app_settings.set_current_user_id(user_id)
+        # Sessions this user loads from now on land in THEIR recent list.
+        if self._session_store is not None and self._user_profiles is not None:
+            registry = getattr(self._user_profiles, "session_registry", None)
+            if callable(registry):
+                self._session_store.set_registry(registry(user_id))
         self._session = form_autosave.load(app_settings.autosave_file_path(user_id))
         self._session_info.apply_session(self._session)
         self._sync_current_user_label()
@@ -1213,13 +1218,15 @@ class MonitorWindow(QMainWindow):
             self._switch_experiment(experiment_id)
 
     def _open_session_folder_dialog(self) -> None:
-        """Open SessionFolderDialog and persist the picked or created folder as active.
+        """Open SessionFolderDialog and load the picked or created session now.
 
-        Deferred until the next launch: ``session_manager``'s own
-        ``ExperimentStore`` stays rooted at the session folder it started
-        with for the rest of this run (see ``GLOSSARY.md``'s **Session**).
+        The switch is the session layer's (``ExperimentManager.
+        request_session_switch``): refused, with the reason shown, while
+        anything of this session is in flight; otherwise it completes once
+        the engine confirms no run can start, and ``_on_session_changed``
+        brings the window over.
         """
-        if self._session_store is None:
+        if self._session_store is None or self._session_manager is None:
             QMessageBox.information(
                 self, "Session Folder", "Session management is not available."
             )
@@ -1233,10 +1240,44 @@ class MonitorWindow(QMainWindow):
         folder = dialog.selected_folder()
         if folder is None:
             return
-        self._session_store.set_active(folder)
-        self._status_bar.showMessage(
-            f"Session folder set to {folder} — applies on next launch", 8000
-        )
+        current = self._session_folder()
+        if current is not None and Path(folder).resolve() == current.resolve():
+            self._status_bar.showMessage(f"{folder} is already the open session", 6000)
+            return
+        # The current experiment's fields and queue go with it, so loading
+        # this session again (or reopening the experiment) brings them back.
+        self._save_session()
+        # Shown first: with the engine on this thread the switch can complete
+        # inside the request, and its "Session loaded" must not be overwritten.
+        self._status_bar.showMessage(f"Loading session {folder}…", 6000)
+        try:
+            self._session_manager.request_session_switch(folder)
+        except (ValueError, SessionLockedError) as exc:
+            self._status_bar.clearMessage()
+            QMessageBox.warning(self, "Session Folder", str(exc))
+
+    def _on_session_changed(self, folder: str) -> None:
+        """Bring the window over to a session loaded while running.
+
+        Args:
+            folder: The new session folder.
+        """
+        self._last_session_experiment_id = None
+        self._session_info.reset_session_tracking()
+        self._session = form_autosave.FormAutosaveState()
+        self._session_info.apply_session(self._session)
+        if self._procedure_window is not None:
+            self._procedure_window.reset_session()
+        self._sync_context()
+        self._status_bar.showMessage(f"Session loaded: {folder}", 8000)
+
+    def _on_session_switch_failed(self, reason: str) -> None:
+        """Tell the operator why the session could not be loaded.
+
+        Args:
+            reason: From ``ExperimentManager.session_switch_failed``.
+        """
+        QMessageBox.warning(self, "Session Folder", reason)
 
     def _session_folder(self) -> Path | None:
         """Return the session folder in use: the experiment store's own root."""
@@ -1425,6 +1466,12 @@ class MonitorWindow(QMainWindow):
             self._session_manager.store_health_changed.connect(
                 self._on_store_health_changed
             )
+            session_changed = getattr(self._session_manager, "session_changed", None)
+            if session_changed is not None:
+                session_changed.connect(self._on_session_changed)
+                self._session_manager.session_switch_failed.connect(
+                    self._on_session_switch_failed
+                )
 
     def _on_session_experiment_changed(self, record: dict) -> None:
         """Load a newly opened/switched session's gui_state.json, if it has one.

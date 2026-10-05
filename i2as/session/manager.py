@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from i2as.core.events import OPERATOR, Actor, RunStarted
+from i2as.core.events import OPERATOR, Actor, Command, CommandName, RunStarted, VerdictCode
 from i2as.core.orchestrator_proxy import OrchestratorProxy
 from i2as.core.plan import ExperimentEnvelope, params_digest
 from i2as.core.config import read_instrument_metadata
@@ -35,6 +36,7 @@ from i2as.session.run_queue import (
     RunSpec,
     RunValidation,
 )
+from i2as.core.run_naming import normalize_run_subfolder
 from i2as.session.store import ExperimentStore, SessionStore, UserRoster
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -74,6 +76,12 @@ class ExperimentManager(QObject):
     experiment_changed = pyqtSignal(dict)
     run_recorded = pyqtSignal(dict)
     store_health_changed = pyqtSignal(dict)
+    #: The folder every run is now written to (``""`` when none is open).
+    run_folder_changed = pyqtSignal(str)
+    #: A live session switch completed: the new session folder.
+    session_changed = pyqtSignal(str)
+    #: A live session switch was refused or failed: the reason, for the operator.
+    session_switch_failed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -138,6 +146,12 @@ class ExperimentManager(QObject):
             envelope=self._current_envelope,
         )
         self._store_save_ok = True
+        # Live session switching (request_session_switch): the extra "is
+        # anything of this session still in flight?" checks other services
+        # register (analysis, notebook publishing), and the switch waiting for
+        # the engine's verdict on releasing the run folder.
+        self._busy_checks: list[Callable[[], str]] = []
+        self._pending_switch: tuple[str, Path, ExperimentStore] | None = None
 
         orchestrator.run_started.connect(self._on_run_started)
         orchestrator.run_finished.connect(self._on_run_finished)
@@ -151,6 +165,14 @@ class ExperimentManager(QObject):
         if event_stream is None:
             event_stream = orchestrator.event
         event_stream.connect(self._on_engine_event)
+        # Verdicts, under the engine's name or the proxy's (see above): a live
+        # session switch completes only on the engine's OK to release the run
+        # folder.
+        verdicts = getattr(orchestrator, "verdict_emitted", None)
+        if verdicts is None:
+            verdicts = getattr(orchestrator, "verdict", None)
+        if verdicts is not None and hasattr(verdicts, "connect"):
+            verdicts.connect(self._on_verdict)
 
         self._resume_active_experiment()
 
@@ -486,7 +508,9 @@ class ExperimentManager(QObject):
 
         Raises:
             ValueError: If ``experiment_id`` is unknown, its record's
-                ``status`` is not ``"open"``, or its ``schema_version`` is
+                ``status`` is not ``"open"``, something of the current
+                experiment is still in flight (``session_busy_reason()``), or
+                its ``schema_version`` is
                 newer than this app's ``SCHEMA_VERSION`` — a future-format
                 record must never become the live, mutable experiment of an
                 older app.
@@ -504,6 +528,9 @@ class ExperimentManager(QObject):
                 f"(schema_version={record.schema_version} > {SCHEMA_VERSION}); "
                 "refusing to switch to it"
             )
+        busy = self.session_busy_reason()
+        if busy:
+            raise ValueError(f"Cannot switch experiment now: {busy}")
         self._experiment = record
         self._store.set_active(record.experiment_id)
         self._orchestrator.set_experiment_envelope(envelope_from_dict(record.envelope))
@@ -519,6 +546,193 @@ class ExperimentManager(QObject):
         if self._experiment is None:
             return None
         return self._store.data_dir(self._experiment.experiment_id)
+
+    def run_folder(self) -> Path | None:
+        """Return the folder every run is written to now, or ``None`` when none is open.
+
+        The open experiment's ``data/`` folder, or the operator's run
+        subfolder of it (``set_run_subfolder``).
+        """
+        data_dir = self.current_data_dir()
+        if data_dir is None or self._experiment is None:
+            return None
+        subfolder = self._experiment.run_subfolder
+        return data_dir / subfolder if subfolder else data_dir
+
+    def set_run_subfolder(self, subfolder: str) -> str:
+        """Choose the subfolder of the experiment's ``data/`` every run from now on writes to.
+
+        Applies to every run placed afterwards — the operator's, a queued one,
+        an agent's, a probe; a run already started keeps the file it has. The
+        choice is stored on the experiment, so reopening it restores it.
+
+        Args:
+            subfolder: Relative to ``data/`` (``core.run_naming``'s rule);
+                ``""`` for ``data/`` itself.
+
+        Returns:
+            The normalised subfolder.
+
+        Raises:
+            ValueError: If no experiment is open or the subfolder breaks the
+                rule.
+        """
+        if self._experiment is None:
+            raise ValueError("No experiment is open")
+        normalized = normalize_run_subfolder(subfolder)
+        self._experiment.run_subfolder = normalized
+        self._save_current()
+        self._install_run_folder(self._experiment.experiment_id)
+        logger.info("Run subfolder set: %r", normalized)
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Loading another session while running
+    # ------------------------------------------------------------------
+
+    def add_busy_check(self, check: Callable[[], str]) -> None:
+        """Register a "still in flight?" check consulted before a switch.
+
+        Args:
+            check: Returns ``""`` when idle, else a reason for the operator
+                (e.g. ``"An analysis is running"``).
+        """
+        self._busy_checks.append(check)
+
+    def session_busy_reason(self) -> str:
+        """Return why the session or experiment cannot be switched now, or ``""``.
+
+        A fast, client-side answer for the operator. It is NOT what makes a
+        session switch safe — the engine's verdict on releasing the run
+        folder is (``request_session_switch``) — and runs are filed by the
+        folder they were placed in, never by whichever experiment is open.
+
+        Returns:
+            The first reason found, or ``""``.
+        """
+        if self._pending_switch is not None:
+            return "A session switch is in progress"
+        mirror = getattr(self._orchestrator, "status", None)
+        run = getattr(mirror, "run", None)
+        if callable(run):
+            try:
+                if run() is not None:
+                    return "A run is in progress"
+            except Exception:  # a mirror that cannot answer must not block the operator
+                logger.debug("status mirror could not report the run", exc_info=True)
+        for check in self._busy_checks:
+            reason = check()
+            if reason:
+                return reason
+        return ""
+
+    def request_session_switch(self, folder: str | Path) -> None:
+        """Load another session folder while the application runs.
+
+        Two phases, so no run of the current session can start after the
+        switch began and none can be filed into the new one:
+
+        1. Here, on the caller's thread: the target is validated (a session
+           folder, not the open one, not locked by another running
+           application), nothing of this session may be in flight
+           (``session_busy_reason``), and the target's lock is taken. Then
+           the engine is asked to RELEASE the run folder — ``set_run_folder("",
+           require_idle=True)`` — which it answers only after every command
+           posted before it, and refuses if a run is active or queued in it.
+        2. On the engine's OK verdict (``_on_verdict``): the run queue is
+           parked (it is already saved with its experiment, so reopening that
+           experiment brings it back), the registry names the new session
+           (also ``sessions.json``, so ``i2as-ctl`` follows), the store is
+           re-rooted, ``session_changed`` is emitted, and the new session's
+           active experiment is adopted (``experiment_changed``).
+           A refusal emits ``session_switch_failed`` and changes nothing.
+
+        The open experiment stays open on disk; loading this session again
+        resumes it. The caller saves its GUI state before calling.
+
+        Args:
+            folder: The session folder to load.
+
+        Raises:
+            ValueError: If session management is unavailable, *folder* is not
+                a session or is the open one, or something is in flight.
+            SessionLockedError: If another running application holds it.
+        """
+        if self._session_store is None:
+            raise ValueError("Session management is not available")
+        target = Path(folder).resolve()
+        if target == self._store.root.resolve():
+            raise ValueError(f"{target} is already the open session")
+        busy = self.session_busy_reason()
+        if busy:
+            raise ValueError(f"Cannot load another session now: {busy}")
+        if self._session_store.load(target) is None:
+            raise ValueError(f"{target} is not a session folder")
+        self._session_store.acquire_lock(target)
+        command = Command(
+            name=CommandName.SET_RUN_FOLDER,
+            actor=OPERATOR,
+            args={"data_directory": "", "require_idle": True},
+        )
+        self._pending_switch = (command.request_id, target, ExperimentStore(target))
+        try:
+            self._orchestrator.submit(command)
+        except Exception:
+            self._pending_switch = None
+            self._session_store.release_lock(target)
+            raise
+
+    def _on_verdict(self, verdict: object) -> None:
+        """Complete or abandon a pending session switch on the engine's verdict."""
+        pending = self._pending_switch
+        if pending is None or getattr(verdict, "request_id", None) != pending[0]:
+            return
+        self._pending_switch = None
+        request_id, target, new_store = pending
+        assert self._session_store is not None
+        if getattr(verdict, "code", None) != VerdictCode.OK:
+            self._session_store.release_lock(target)
+            reason = getattr(verdict, "reason", "") or "the engine refused"
+            logger.info("Session switch to %s refused: %s", target, reason)
+            self.session_switch_failed.emit(f"Cannot load another session now: {reason}")
+            return
+        try:
+            self._complete_session_switch(target, new_store)
+        except Exception as exc:
+            logger.exception("Session switch to %s failed", target)
+            self.session_switch_failed.emit(f"Could not load {target}: {exc}")
+
+    def _complete_session_switch(self, target: Path, new_store: ExperimentStore) -> None:
+        """Re-root on the new session; the engine already refuses every run.
+
+        Rolls back to the current session if the registry cannot be written
+        (the only write before the store is swapped).
+        """
+        assert self._session_store is not None
+        old_root = self._store.root
+        old_experiment = self._experiment
+        try:
+            self._session_store.set_active(target)
+        except (OSError, ValueError):
+            self._session_store.release_lock(target)
+            self._install_run_folder(old_experiment.experiment_id if old_experiment else None)
+            raise
+        # Parked, not lost: the GUI saved it with its experiment.
+        self._queue_host.clear()
+        self._store = new_store
+        self._experiment = None
+        self._orchestrator.set_experiment_envelope(None)
+        self._session_store.release_lock(old_root)
+        logger.info("Session loaded: %s", target)
+        # Announced BEFORE the new session's experiment is adopted, so every
+        # listener drops what it cached for the old session first —
+        # experiment ids repeat across sessions, and an "unchanged id" must
+        # not look like no change.
+        self.session_changed.emit(str(target))
+        self._resume_active_experiment()
+        if self._experiment is None:
+            self.experiment_changed.emit({})
+        self._reconcile_session_index()
 
     def current_gui_state_path(self) -> Path | None:
         """Return the open experiment's GUI-state file path, or ``None`` when none is open."""
@@ -773,6 +987,55 @@ class ExperimentManager(QObject):
     # Run recording (driven by the Orchestrator's manifests)
     # ------------------------------------------------------------------
 
+    def _record_for(
+        self, manifest: dict
+    ) -> tuple[ExperimentStore, ExperimentRecord, bool] | None:
+        """Find the record a run manifest belongs to, by the folder the run was placed in.
+
+        A run is filed where the ENGINE placed it (the manifest's
+        ``data_root``), never into whichever experiment happens to be open
+        when the manifest arrives — so a run can never be misfiled by an
+        experiment or session switch racing its start or finish.
+
+        Args:
+            manifest: A ``run_started``/``run_finished`` manifest.
+
+        Returns:
+            ``(store, record, is_current)``, or ``None`` when the run belongs
+            to no experiment this layer can find.
+        """
+        root = str(manifest.get("data_root") or "")
+        current = self._experiment
+        if not root:
+            # A run the engine did not place (no session layer at the time,
+            # or a test double): the open experiment, as before.
+            return (self._store, current, True) if current is not None else None
+        if current is not None and _same_path(
+            self._store.data_dir(current.experiment_id), root
+        ):
+            return self._store, current, True
+        experiment_dir = Path(root).parent
+        store = (
+            self._store
+            if _same_path(experiment_dir.parent, self._store.root)
+            else ExperimentStore(experiment_dir.parent)
+        )
+        record = store.load(experiment_dir.name)
+        if record is None:
+            logger.warning("Run in %s belongs to no experiment record — not recorded", root)
+            return None
+        return store, record, False
+
+    def _save_record(self, store: ExperimentStore, record: ExperimentRecord, is_current: bool) -> None:
+        """Save a record found by ``_record_for`` — the open one through the usual path."""
+        if is_current:
+            self._save_current()
+            return
+        try:
+            store.save(record)
+        except OSError:
+            logger.exception("Could not save run record of %s", record.experiment_id)
+
     def _on_run_started(self, manifest: dict) -> None:
         """Open a ``RunRecord`` for a ``run_started`` manifest.
 
@@ -784,11 +1047,13 @@ class ExperimentManager(QObject):
         started rather than recomputed from a record that may since have been
         amended.
         """
-        if self._experiment is None:
+        found = self._record_for(manifest)
+        if found is None:
             return
+        store, record, is_current = found
         raw_data_file = str(manifest.get("data_file", ""))
         data_file = (
-            self._store.relativize_data_file(self._experiment.experiment_id, raw_data_file)
+            store.relativize_data_file(record.experiment_id, raw_data_file)
             if raw_data_file
             else ""
         )
@@ -803,9 +1068,10 @@ class ExperimentManager(QObject):
             started_utc=str(manifest.get("started_utc", "")),
             status=RUN_STATUS_RUNNING,
         )
-        self._experiment.runs.append(run)
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
+        record.runs.append(run)
+        self._save_record(store, record, is_current)
+        if is_current:
+            self.run_recorded.emit(run.to_dict())
 
     def _on_engine_event(self, event: object) -> None:
         """Stamp who started a run onto the record the manifest just opened.
@@ -824,21 +1090,28 @@ class ExperimentManager(QObject):
         Args:
             event: Anything on the Orchestrator's one event stream.
         """
-        if not isinstance(event, RunStarted) or self._experiment is None:
+        if not isinstance(event, RunStarted):
             return
-        run = self._experiment.find_run(event.run_id)
+        found = self._record_for(dict(event.manifest or {}))
+        if found is None:
+            return
+        store, record, is_current = found
+        run = record.find_run(event.run_id)
         if run is None or (run.actor == event.actor and not run.actor_legacy):
             return
         run.actor = event.actor
         run.actor_legacy = False
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
+        self._save_record(store, record, is_current)
+        if is_current:
+            self.run_recorded.emit(run.to_dict())
 
     def _on_run_finished(self, manifest: dict) -> None:
         """Complete the matching ``RunRecord`` from a ``run_finished`` manifest."""
-        if self._experiment is None:
+        found = self._record_for(manifest)
+        if found is None:
             return
-        run = self._experiment.find_run(str(manifest.get("run_id", "")))
+        store, record, is_current = found
+        run = record.find_run(str(manifest.get("run_id", "")))
         if run is None:
             logger.warning(
                 "run_finished for unknown run %r — ignored", manifest.get("run_id")
@@ -847,8 +1120,9 @@ class ExperimentManager(QObject):
         run.finished_utc = str(manifest.get("finished_utc", ""))
         run.status = str(manifest.get("status", RUN_STATUS_FAILED))
         run.reason = str(manifest.get("reason", ""))
-        self._save_current()
-        self.run_recorded.emit(run.to_dict())
+        self._save_record(store, record, is_current)
+        if is_current:
+            self.run_recorded.emit(run.to_dict())
 
     # ------------------------------------------------------------------
     # Analysis bundle selection (no notebook involved)
@@ -936,7 +1210,9 @@ class ExperimentManager(QObject):
         self.experiment_changed.emit(self._experiment.to_dict())
         return True
 
-    def set_eln_entry(self, experiment_id: str, link: ElnLink) -> bool:
+    def set_eln_entry(
+        self, experiment_id: str, link: ElnLink, session_root: Path | None = None
+    ) -> bool:
         """Record the page the backend confirmed for one experiment.
 
         Works on a closed experiment too: a page queued for creation while the
@@ -945,6 +1221,8 @@ class ExperimentManager(QObject):
         Args:
             experiment_id: The experiment.
             link: The confirmed page.
+            session_root: The session the experiment belongs to; ``None``
+                for the open one (see ``_mutate_experiment``).
 
         Returns:
             ``True`` when recorded.
@@ -957,7 +1235,9 @@ class ExperimentManager(QObject):
             record.eln = binding
             return True
 
-        return self._mutate_experiment(experiment_id, _apply, "record the notebook page of")
+        return self._mutate_experiment(
+            experiment_id, _apply, "record the notebook page of", session_root
+        )
 
     def approve_eln_publishing(self, user_id: str) -> bool:
         """Approve publishing for the open experiment, from now on.
@@ -1017,6 +1297,7 @@ class ExperimentManager(QObject):
         publish_id: str,
         run_bundles: Mapping[str, str],
         published_utc: str = "",
+        session_root: Path | None = None,
     ) -> bool:
         """Record that one publish reached the notebook.
 
@@ -1029,6 +1310,8 @@ class ExperimentManager(QObject):
             run_bundles: ``{run_id: bundle_id}`` it covered (``""`` for a run
                 published from its facts).
             published_utc: When; ``""`` for now.
+            session_root: The session the experiment belongs to; ``None``
+                for the open one.
 
         Returns:
             ``True`` when recorded.
@@ -1048,13 +1331,14 @@ class ExperimentManager(QObject):
                 }
             return True
 
-        return self._mutate_experiment(experiment_id, _apply, "record a publish of")
+        return self._mutate_experiment(experiment_id, _apply, "record a publish of", session_root)
 
     def _mutate_experiment(
         self,
         experiment_id: str,
         apply: Callable[[ExperimentRecord], bool],
         action: str,
+        session_root: Path | None = None,
     ) -> bool:
         """Apply one change to an experiment record, open or closed.
 
@@ -1066,17 +1350,25 @@ class ExperimentManager(QObject):
             experiment_id: The experiment.
             apply: Mutates the record; returns ``False`` to abandon.
             action: What is being done, for the log line.
+            session_root: The session the experiment belongs to. ``None`` or
+                the open session's folder: this session. Any other folder —
+                a result arriving for a session loaded away from since
+                (experiment ids repeat across sessions) — is changed in THAT
+                session's store and never touches the open experiment.
 
         Returns:
             ``True`` when applied and saved.
         """
-        if self._experiment is not None and self._experiment.experiment_id == experiment_id:
+        store = self._store
+        if session_root is not None and not _same_path(session_root, self._store.root):
+            store = ExperimentStore(Path(session_root))
+        elif self._experiment is not None and self._experiment.experiment_id == experiment_id:
             if not apply(self._experiment):
                 return False
             self._save_current()
             self.experiment_changed.emit(self._experiment.to_dict())
             return True
-        record = self._store.load(experiment_id)
+        record = store.load(experiment_id)
         if record is None:
             logger.warning("Unknown experiment %r — cannot %s it", experiment_id, action)
             return False
@@ -1092,7 +1384,7 @@ class ExperimentManager(QObject):
         if not apply(record):
             return False
         try:
-            self._store.save(record)
+            store.save(record)
         except OSError as exc:
             logger.error("Could not %s experiment %s: %s", action, experiment_id, exc)
             return False
@@ -1127,9 +1419,12 @@ class ExperimentManager(QObject):
         """Tell the engine where every run writes: this experiment's data folder.
 
         The third policy value pushed down beside the envelope and attendance
-        (``Orchestrator.set_run_folder``). ``None`` — no experiment open —
-        installs ``""``, which refuses every run. An engine that predates the
-        command (a test double) is skipped rather than failed.
+        (``Orchestrator.set_run_folder``), with the experiment's run
+        subfolder and its run-number floor (one more than the highest run it
+        ever recorded, so a deleted file never frees its number). ``None`` —
+        no experiment open — installs ``""``, which refuses every run. An
+        engine that predates the command (a test double) is skipped rather
+        than failed.
 
         Args:
             experiment_id: The open experiment, or ``None``.
@@ -1137,8 +1432,21 @@ class ExperimentManager(QObject):
         setter = getattr(self._orchestrator, "set_run_folder", None)
         if not callable(setter):
             return
-        folder = "" if experiment_id is None else str(self._store.data_dir(experiment_id))
-        setter(folder)
+        if experiment_id is None:
+            setter("")
+            self.run_folder_changed.emit("")
+            return
+        record = self._experiment
+        if record is None or record.experiment_id != experiment_id:
+            record = self._store.load(experiment_id)
+        subfolder = record.run_subfolder if record is not None else ""
+        floor = (record.highest_run_number() if record is not None else 0) + 1
+        setter(
+            str(self._store.data_dir(experiment_id)),
+            subfolder=subfolder,
+            run_number_floor=floor,
+        )
+        self.run_folder_changed.emit(str(self.run_folder() or ""))
 
     def _current_session_folder(self) -> Path | None:
         """Return the session folder owning ``self._store``, or ``None``.
@@ -1295,3 +1603,11 @@ class ExperimentManager(QObject):
         self._install_run_folder(record.experiment_id)
         logger.info("Resumed experiment %s (%d runs)", record.experiment_id, len(record.runs))
         self.experiment_changed.emit(record.to_dict())
+
+
+def _same_path(a: str | Path, b: str | Path) -> bool:
+    """Return whether two paths name the same folder (resolved; case per the OS)."""
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return str(a) == str(b)

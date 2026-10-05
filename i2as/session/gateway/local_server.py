@@ -341,6 +341,33 @@ class GatewayServer(QLocalServer):
             logger.warning("Gateway server could not remove %s", self._descriptor)
         logger.info("Gateway server stopped")
 
+    def drop_connections(self, reason: str) -> int:
+        """Tell every connected client why, then disconnect it; keep listening.
+
+        Used when the session changes under the clients: a connection is
+        bound to one experiment's feed and resolves bare run ids against the
+        open experiment, so after a session switch it must reconnect rather
+        than act on a different ``run-0003``.
+
+        Args:
+            reason: Sent to each client as a ``session/changed`` notification.
+
+        Returns:
+            How many connections were dropped.
+        """
+        dropped = 0
+        for connection in list(self._connections.values()):
+            self._send(
+                connection,
+                {"jsonrpc": "2.0", "method": "session/changed", "params": {"reason": reason}},
+            )
+            connection.socket.flush()
+            connection.socket.disconnectFromServer()
+            dropped += 1
+        if dropped:
+            logger.info("Gateway server dropped %d connection(s): %s", dropped, reason)
+        return dropped
+
     def _write_descriptor(self) -> None:
         """Write the descriptor file with owner-only permissions.
 

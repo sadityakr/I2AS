@@ -2,17 +2,27 @@
 
 Every run in an experiment is numbered, and its number is its identity: the
 run id is ``run-NNNN``, the data file is ``run-NNNN_<Procedure>[_<label>].h5``
-in the experiment's ``data/`` folder, and the analysis stage writes that run's
-report, figures and scripts under ``analysis/run-NNNN/``. So a person, a
+in the experiment's ``data/`` folder — or in a **run subfolder** of it the
+operator chose (``data/cooldown2/``) — and the analysis stage writes that
+run's report, figures and scripts under ``analysis/run-NNNN/``. So a person, a
 script or an analysis agent finds any run of any experiment of a session by
-walking one fixed tree, and the files sort in the order they were measured.
+walking one tree, and the files sort in the order they were measured.
 
-The number is one more than the highest ``run-NNNN`` file already in the
-folder, so it is never reused — not after a file is deleted, not after the
-application restarts. The optional label is the operator's own ("file
-prefix" in the procedure panel): it is for people, and it never replaces
-the number. A probe run carries ``probe`` in its name as well as in its file's
-metadata, so nobody mistakes it for science data from the file list alone.
+Numbers are unique per experiment, across every subfolder, and never reused.
+The number is the largest of: the **floor** the session layer pushes (one more
+than the highest run its experiment record has ever recorded), one more than
+the last number this process issued, and one more than the highest
+``run-NNNN`` *file* in the target folder and in ``data/`` itself (flat scans
+only — never a recursive walk on the instrument thread). A deleted or moved
+file therefore never frees its number. The optional label is the operator's
+own ("file prefix" in the procedure panel): it is for people, and it never
+replaces the number. A probe run carries ``probe`` in its name as well as in
+its file's metadata, so nobody mistakes it for science data from the file list
+alone.
+
+The run-subfolder rule lives here, in core, so the engine can enforce it
+without importing the session layer (contract C12): see
+:func:`normalize_run_subfolder`.
 
 Pure: nothing here writes anything; the engine applies a placement when a run
 starts (``Orchestrator._start_run``) and the data manager creates the file.
@@ -53,24 +63,115 @@ class RunPlacement:
     file_name: str
 
 
-def next_run_number(folder: str | Path) -> int:
-    """Return the number the next run in *folder* gets.
+#: The deepest a run subfolder may nest below ``data/``.
+MAX_SUBFOLDER_DEPTH = 3
+
+#: The longest a run's absolute file path may be (Windows' 260-character
+#: limit, with room for the HDF5 library's own temporary names).
+MAX_RUN_PATH_CHARS = 240
+
+#: One part of a run subfolder: starts with a letter or digit, then letters,
+#: digits, ``.``, ``_``, ``-`` or spaces; at most 64 characters.
+_SUBFOLDER_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+
+#: Windows device names, refused as a folder name whatever their case or
+#: extension (``nul.txt`` is the NUL device too).
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def normalize_run_subfolder(text: str) -> str:
+    """Validate and normalise a run subfolder, relative to an experiment's ``data/``.
+
+    The rule is portable to every filesystem the station runs on (Windows
+    first): a relative path of at most ``MAX_SUBFOLDER_DEPTH`` parts, each a
+    plain name — letters, digits, ``.``, ``_``, ``-`` and spaces, starting
+    with a letter or digit, no trailing ``.`` or space, not a Windows device
+    name. Separators may be ``/`` or ``\\``; empty parts are dropped.
 
     Args:
-        folder: The experiment's data folder (need not exist yet).
+        text: The operator's subfolder, e.g. ``"cooldown2"`` or
+            ``"cooldown2/field sweeps"``. ``""`` means ``data/`` itself.
 
     Returns:
-        One more than the highest ``run-NNNN`` file there, from 1.
+        The normalised subfolder with ``/`` separators, or ``""``.
+
+    Raises:
+        ValueError: If the subfolder is absolute, climbs (``..``), is too deep,
+            or a part breaks the name rule.
     """
-    path = Path(folder)
-    if not path.is_dir():
-        return 1
-    numbers = [
-        int(match.group(1))
-        for entry in path.iterdir()
-        if (match := _RUN_FILE.match(entry.name))
-    ]
-    return max(numbers, default=0) + 1
+    raw = str(text).strip().replace("\\", "/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        raise ValueError(f"a run subfolder must be relative to data/, got {text!r}")
+    parts = [part for part in raw.split("/") if part]
+    if len(parts) > MAX_SUBFOLDER_DEPTH:
+        raise ValueError(
+            f"a run subfolder may be at most {MAX_SUBFOLDER_DEPTH} levels deep, got {text!r}"
+        )
+    for part in parts:
+        if not _SUBFOLDER_PART.match(part) or part.endswith((".", " ")):
+            raise ValueError(
+                f"run subfolder part {part!r} must start with a letter or digit, use only "
+                "letters, digits, '.', '_', '-' or spaces, not end in '.' or a space, "
+                "and be at most 64 characters"
+            )
+        if part.split(".")[0].upper() in _RESERVED_NAMES:
+            raise ValueError(f"run subfolder part {part!r} is a reserved device name")
+    return "/".join(parts)
+
+
+def run_target_folder(root: str | Path, subfolder: str = "") -> Path:
+    """Return where a run in *subfolder* of *root* is written, proven inside *root*.
+
+    Args:
+        root: The experiment's ``data/`` folder.
+        subfolder: A run subfolder; normalised here.
+
+    Returns:
+        ``root/subfolder``.
+
+    Raises:
+        ValueError: If the subfolder breaks the rule, or the target resolves
+            outside *root* (a symlink or junction pointing elsewhere).
+    """
+    root_path = Path(root)
+    target = root_path / normalize_run_subfolder(subfolder) if subfolder else root_path
+    try:
+        inside = target.resolve().is_relative_to(root_path.resolve())
+    except (OSError, ValueError):
+        inside = False
+    if not inside:
+        raise ValueError(f"run folder {target} resolves outside {root_path}")
+    return target
+
+
+def next_run_number(folder: str | Path, floor: int = 1, *also: str | Path) -> int:
+    """Return the number the next run gets.
+
+    Args:
+        folder: The folder the run is written to (need not exist yet).
+        floor: The lowest number allowed — the session layer's record of
+            every number already issued in this experiment, plus one.
+        *also: Further folders whose run files count (``data/`` itself when
+            writing into a subfolder).
+
+    Returns:
+        The largest of *floor* and one more than the highest ``run-NNNN``
+        **file** in *folder* or *also* (flat scans; directories ignored).
+    """
+    highest = 0
+    for each in (folder, *also):
+        path = Path(each)
+        if not path.is_dir():
+            continue
+        for entry in path.iterdir():
+            match = _RUN_FILE.match(entry.name)
+            if match and entry.is_file():
+                highest = max(highest, int(match.group(1)))
+    return max(int(floor), highest + 1, 1)
 
 
 def run_id_for(number: int) -> str:
@@ -102,33 +203,67 @@ def run_file_name(number: int, procedure: str, label: str = "", kind: str = "run
     return "_".join(part for part in parts if part) + RUN_FILE_SUFFIX
 
 
-def place_run(folder: str | Path, procedure: str, label: str = "", kind: str = "run") -> RunPlacement:
-    """Decide where the next run in *folder* writes, and what it is called.
+def place_run(
+    folder: str | Path,
+    procedure: str,
+    label: str = "",
+    kind: str = "run",
+    *,
+    subfolder: str = "",
+    floor: int = 1,
+) -> RunPlacement:
+    """Decide where the next run writes, and what it is called.
 
     Args:
-        folder: The experiment's data folder.
+        folder: The experiment's ``data/`` folder (the numbering root).
         procedure: The procedure's class name.
         label: The operator's optional label.
         kind: The run's kind (``run`` or ``probe``).
+        subfolder: The run subfolder inside *folder*; ``""`` for *folder*
+            itself.
+        floor: The lowest run number allowed (see :func:`next_run_number`).
 
     Returns:
         The placement.
+
+    Raises:
+        ValueError: If the subfolder breaks the rule or resolves outside
+            *folder*, or the run file's path would exceed
+            ``MAX_RUN_PATH_CHARS``.
     """
-    number = next_run_number(folder)
+    target = run_target_folder(folder, subfolder)
+    number = next_run_number(target, floor, folder)
+    file_name = run_file_name(number, procedure, label, kind)
+    full = str(target.resolve() / file_name)
+    if len(full) > MAX_RUN_PATH_CHARS:
+        raise ValueError(
+            f"run file path is {len(full)} characters, over {MAX_RUN_PATH_CHARS}: {full}"
+        )
     return RunPlacement(
         run_id=run_id_for(number),
-        data_directory=str(folder),
-        file_name=run_file_name(number, procedure, label, kind),
+        data_directory=str(target),
+        file_name=file_name,
     )
 
 
+def run_number_of(run_id: str) -> int | None:
+    """Return the number of a ``run-NNNN`` id, or ``None`` for anything else."""
+    match = re.match(rf"^{re.escape(RUN_ID_PREFIX)}(\d{{1,9}})$", str(run_id))
+    return int(match.group(1)) if match else None
+
+
 __all__ = [
+    "MAX_RUN_PATH_CHARS",
+    "MAX_SUBFOLDER_DEPTH",
     "RUN_FILE_SUFFIX",
     "RUN_ID_PREFIX",
     "RUN_NUMBER_DIGITS",
     "RunPlacement",
     "next_run_number",
+    "normalize_run_subfolder",
     "place_run",
     "run_file_name",
     "run_id_for",
+    "run_number_of",
+    "run_target_folder",
 ]

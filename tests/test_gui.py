@@ -2181,33 +2181,55 @@ def _fake_session_folder_dialog(folder, seen_user_ids=None):
     return _FakeSessionFolderDialog
 
 
-def test_open_session_folder_dialog_sets_active_and_notes_status(
-    station, orchestrator, session_manager, qtbot, tmp_path, monkeypatch
+def _live_session_manager(tmp_path, orchestrator, store):
+    """An ExperimentManager on session A, wired to *store* as the app wires it."""
+    from i2as.session.manager import ExperimentManager
+    from i2as.session.models import User
+    from i2as.session.store import ExperimentStore, UserRoster
+
+    roster = UserRoster(tmp_path / "users.json")
+    roster.add(User(user_id="jdoe", name="J. Doe", email="jdoe@example.org"))
+    first = tmp_path / "session A"
+    store.create_session(first, "Session A", "jdoe")
+    store.set_active(first)
+    return ExperimentManager(
+        store=ExperimentStore(first),
+        roster=roster,
+        orchestrator=orchestrator,
+        config_name="sim_cryostat",
+        session_store=store,
+    )
+
+
+def test_open_session_folder_dialog_loads_the_session_now(
+    station, orchestrator, qtbot, tmp_path, monkeypatch
 ):
-    """Picking a session folder persists it in the registry and notes the status bar."""
+    """Picking a session folder loads it while running: registry, store and status follow."""
     from i2as.gui import monitor_window as mw
     from i2as.session.store import SessionStore
 
     store = SessionStore(tmp_path / "root")
+    manager = _live_session_manager(tmp_path, orchestrator, store)
     folder = tmp_path / "Cooldown 3"
     store.create_session(folder, "Cooldown 3", "jdoe")
 
-    win = MonitorWindow(
-        station, orchestrator, session_manager=session_manager, session_store=store
-    )
+    win = MonitorWindow(station, orchestrator, session_manager=manager, session_store=store)
     qtbot.addWidget(win)
     win.show()
     win._switch_user("jdoe")
 
     monkeypatch.setattr(mw, "SessionFolderDialog", _fake_session_folder_dialog(folder))
     win._open_session_folder_dialog()
+    # Completes on the engine's verdict, which may arrive from its own thread.
+    qtbot.waitUntil(lambda: manager.store.root.resolve() == folder.resolve(), timeout=5000)
 
     assert store.get_active() == folder.resolve()
-    assert "next launch" in win._status_bar.currentMessage()
+    assert "Session loaded" in win._status_bar.currentMessage()
+    assert "Cooldown 3" in win.windowTitle()
 
 
 def test_open_session_folder_dialog_resolves_logged_out_user_to_guest(
-    station, orchestrator, session_manager, qtbot, tmp_path, monkeypatch
+    station, orchestrator, qtbot, tmp_path, monkeypatch
 ):
     """Nobody logged in: a session created from the dialog is owned by Guest."""
     from i2as.gui import monitor_window as mw
@@ -2215,11 +2237,10 @@ def test_open_session_folder_dialog_resolves_logged_out_user_to_guest(
     from i2as.session.store import SessionStore
 
     store = SessionStore(tmp_path / "root")
+    manager = _live_session_manager(tmp_path, orchestrator, store)
     folder = tmp_path / "walk-in"
     store.create_session(folder, "Walk-in Cooldown", GUEST_USER_ID)
-    win = MonitorWindow(
-        station, orchestrator, session_manager=session_manager, session_store=store
-    )
+    win = MonitorWindow(station, orchestrator, session_manager=manager, session_store=store)
     qtbot.addWidget(win)
     win.show()
     assert win._current_user_id is None
@@ -2229,9 +2250,34 @@ def test_open_session_folder_dialog_resolves_logged_out_user_to_guest(
         mw, "SessionFolderDialog", _fake_session_folder_dialog(folder, seen_user_ids)
     )
     win._open_session_folder_dialog()
+    qtbot.waitUntil(lambda: manager.store.root.resolve() == folder.resolve(), timeout=5000)
 
     assert seen_user_ids == [GUEST_USER_ID]
     assert store.get_active() == folder.resolve()
+
+
+def test_open_session_folder_dialog_refusal_is_shown_and_changes_nothing(
+    station, orchestrator, qtbot, tmp_path, monkeypatch
+):
+    """Something in flight: the operator is told why, and the session stays."""
+    from i2as.gui import monitor_window as mw
+    from i2as.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "root")
+    manager = _live_session_manager(tmp_path, orchestrator, store)
+    manager.add_busy_check(lambda: "An analysis is running")
+    folder = tmp_path / "other"
+    store.create_session(folder, "Other", "jdoe")
+    win = MonitorWindow(station, orchestrator, session_manager=manager, session_store=store)
+    qtbot.addWidget(win)
+    warned: list[tuple] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+    monkeypatch.setattr(mw, "SessionFolderDialog", _fake_session_folder_dialog(folder))
+
+    win._open_session_folder_dialog()
+
+    assert warned and "An analysis is running" in warned[0][2]
+    assert manager.store.root.resolve() == (tmp_path / "session A").resolve()
 
 
 def test_the_header_names_the_session_in_use(
@@ -4274,3 +4320,47 @@ def test_repeated_card_swaps_retire_every_replaced_card(qtbot):
         assert all(sip.isdeleted(card) for card in retired)
     finally:
         orch.shutdown()
+
+
+def test_data_dir_shows_where_runs_go_even_after_a_user_switch(monitor_win_session, session_manager, monkeypatch):
+    """Regression: a loaded autosave (e.g. another user's) never shows a folder runs don't go to."""
+    from i2as.gui.form_autosave import FormAutosaveState
+
+    panel = monitor_win_session._session_info
+    _stub_start_dialog(monkeypatch, "Hall bar A3", "jdoe")
+    panel._start_close_btn.click()
+
+    panel.apply_session(FormAutosaveState(data_dir="D:/someone_elses_folder"))
+
+    assert panel._data_dir_input.text() == str(session_manager.run_folder())
+
+
+def test_subfolder_button_sends_every_later_run_inside_the_experiment(
+    monitor_win_session, session_manager, monkeypatch, tmp_path
+):
+    from PyQt6.QtWidgets import QFileDialog
+
+    panel = monitor_win_session._session_info
+    _stub_start_dialog(monkeypatch, "Hall bar A3", "jdoe")
+    panel._start_close_btn.click()
+    data_dir = session_manager.current_data_dir()
+    assert panel._subfolder_btn.isVisible() and panel._subfolder_btn.isEnabled()
+
+    monkeypatch.setattr(
+        QFileDialog, "getExistingDirectory", lambda *a, **k: str(data_dir / "cooldown2")
+    )
+    (data_dir / "cooldown2").mkdir(parents=True, exist_ok=True)
+    panel._subfolder_btn.click()
+    assert session_manager.current_experiment().run_subfolder == "cooldown2"
+    assert panel._data_dir_input.text() == str(data_dir / "cooldown2")
+
+    warned: list[tuple] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    panel._subfolder_btn.click()
+    assert warned
+    assert session_manager.current_experiment().run_subfolder == "cooldown2"
+
+    panel._subfolder_reset_btn.click()
+    assert session_manager.current_experiment().run_subfolder == ""
+    assert panel._data_dir_input.text() == str(data_dir)

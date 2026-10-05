@@ -31,7 +31,7 @@ the **session folder**, and everything below it is fixed:
   NNN_<label>/                        one experiment; NNN = order started
     experiment.json  agent_actions.jsonl  outbox.jsonl
     analysis_journal.jsonl            (planned) every analysis step, app-written only
-    data/run-NNNN_<Procedure>[_<label>].h5
+    data/[<run subfolder>/]run-NNNN_<Procedure>[_<label>].h5
     analysis/recipes/
     analysis/run-NNNN/                report.json, figures, *.plot.json, scripts/<id>/
 ```
@@ -42,11 +42,13 @@ the **session folder**, and everything below it is fixed:
 - **Experiments** are `NNN_<label>`: the next serial number, then the
   operator's folder label or the slugged title (`ExperimentStore.make_experiment_id`).
 - **Runs** are placed by the engine, whoever started them. The session layer
-  installs the open experiment's `data/` folder (`Orchestrator.set_run_folder`),
-  and every run becomes `run-NNNN` with the file
-  `run-NNNN_<Procedure>[_<label>].h5` (`core/run_naming.py`). With no
-  experiment open, every run is refused (`rule: no_experiment`). Numbers are
-  never reused.
+  installs the open experiment's `data/` folder and the operator's optional
+  run subfolder inside it (`Orchestrator.set_run_folder`), and every run
+  becomes `run-NNNN` with the file `run-NNNN_<Procedure>[_<label>].h5`
+  (`core/run_naming.py`). With no experiment open, every run is refused
+  (`rule: no_experiment`). Numbers are unique per experiment across
+  subfolders and never reused; always locate a run's file through its
+  record's `data_file`, never by assuming it sits directly in `data/`.
 - **App-owned records sit outside `analysis/`:** the journal and key
   results. A sandboxed script's working directory is its own folder under
   `analysis/`, mounted into its container, so nothing a script can reach by

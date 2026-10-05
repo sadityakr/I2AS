@@ -316,6 +316,26 @@ class AgentFeed:
 
     # ── Recording ─────────────────────────────────────────────────────
 
+
+    def detach(self, engine: _Engine) -> None:
+        """Stop recording an engine's streams (the reverse of ``attach``). Never raises.
+
+        Called when this feed's experiment is no longer the open one, so its
+        trail does not pick up another experiment's verdicts.
+
+        Args:
+            engine: The engine (or proxy) this feed was attached to.
+        """
+        for names, slot in (
+            (("verdict_emitted", "verdict"), self.record_verdict),
+            (("event_emitted", "event"), self.record_event),
+        ):
+            stream = getattr(engine, names[0], None) or getattr(engine, names[1], None)
+            try:
+                stream.disconnect(slot)
+            except (TypeError, RuntimeError, AttributeError):
+                pass
+        logger.info("Agent feed detached for experiment %r", self.experiment_id)
     def record_command(self, command: Command) -> None:
         """Record one command submitted by a non-operator actor.
 

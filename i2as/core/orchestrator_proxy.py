@@ -859,17 +859,33 @@ class OrchestratorProxy(QObject):
         """
         return self._submit(ev.CommandName.SET_ATTENDANCE, attended=bool(attended))
 
-    def set_run_folder(self, data_directory: str) -> str:
+    def set_run_folder(
+        self,
+        data_directory: str,
+        subfolder: str = "",
+        run_number_floor: int = 1,
+        require_idle: bool = False,
+    ) -> str:
         """Install the open experiment's data folder, where every run writes.
 
         Args:
             data_directory: The folder, or ``""`` when no experiment is open
                 (every run is then refused).
+            subfolder: The operator's run subfolder inside it, ``""`` for none.
+            run_number_floor: The lowest run number the next run may get.
+            require_idle: Refuse unless the engine is idle (releasing the
+                folder before a session switch).
 
         Returns:
             The command's request id.
         """
-        return self._submit(ev.CommandName.SET_RUN_FOLDER, data_directory=str(data_directory))
+        return self._submit(
+            ev.CommandName.SET_RUN_FOLDER,
+            data_directory=str(data_directory),
+            subfolder=str(subfolder),
+            run_number_floor=int(run_number_floor),
+            require_idle=bool(require_idle),
+        )
 
     def set_agent_gate(self, state: ev.AgentGate | str) -> str:
         """Set the kill switch: how much of the engine agents may reach.

@@ -15,6 +15,7 @@ from typing import Any
 
 from i2as.core.events import OPERATOR, Actor
 from i2as.core.plan import EnvelopeBound, ExperimentEnvelope
+from i2as.core.run_naming import normalize_run_subfolder
 
 logger = logging.getLogger(__name__)
 
@@ -571,6 +572,11 @@ class ExperimentRecord:
             only while unattended.
         envelope: The session envelope in its JSON form
             (``envelope_to_dict()``); ``{}`` means no envelope.
+        run_subfolder: The operator's **run subfolder** inside the
+            experiment's ``data/`` folder, where every run started from now
+            on is written (``core.run_naming``'s rule); ``""`` — the default,
+            and what a record written before it existed reads as — means
+            ``data/`` itself. An invalid stored value reads as ``""``.
         runs: The experiment's runs, oldest first.
         findings: Free-text science notes (markdown).
         eln: The experiment's notebook binding (``ElnBinding``): which page
@@ -597,6 +603,7 @@ class ExperimentRecord:
     status: str = EXPERIMENT_STATUS_OPEN
     attended: bool = True
     envelope: dict[str, Any] = field(default_factory=dict)
+    run_subfolder: str = ""
     runs: list[RunRecord] = field(default_factory=list)
     findings: str = ""
     eln: ElnBinding | None = None
@@ -623,6 +630,7 @@ class ExperimentRecord:
             "status": self.status,
             "attended": self.attended,
             "envelope": dict(self.envelope),
+            "run_subfolder": self.run_subfolder,
             "runs": [run.to_dict() for run in self.runs],
             "findings": self.findings,
             "eln": self.eln.to_dict() if self.eln else None,
@@ -666,6 +674,7 @@ class ExperimentRecord:
             status=status,
             attended=_as_bool(data.get("attended"), True),
             envelope=_as_dict(data.get("envelope")),
+            run_subfolder=_as_run_subfolder(data.get("run_subfolder")),
             runs=runs,
             findings=_as_str(data.get("findings")),
             eln=eln,
@@ -678,16 +687,41 @@ class ExperimentRecord:
     def find_run(self, run_id: str) -> RunRecord | None:
         """Return the run with ``run_id``, or ``None``.
 
+        Run ids are unique in a record written by this app; in an older
+        record that reused a number, the NEWEST run with the id is the one
+        returned — the one a ``run_finished`` manifest can still be about.
+
         Args:
             run_id: The manifest run id to look up.
 
         Returns:
             The matching ``RunRecord``, or ``None`` when absent.
         """
-        for run in self.runs:
+        for run in reversed(self.runs):
             if run.run_id == run_id:
                 return run
         return None
+
+    def highest_run_number(self) -> int:
+        """Return the highest ``run-NNNN`` number this experiment ever recorded (0 if none)."""
+        from i2as.core.run_naming import run_number_of
+
+        numbers = [run_number_of(run.run_id) for run in self.runs]
+        return max((number for number in numbers if number is not None), default=0)
+
+
+def _as_run_subfolder(value: object) -> str:
+    """Read a stored run subfolder, falling back to ``""`` when it breaks the rule.
+
+    A hand-edited or corrupt value must not leave every run refused: the
+    experiment simply writes to ``data/`` again, with a warning.
+    """
+    text = value if isinstance(value, str) else ""
+    try:
+        return normalize_run_subfolder(text)
+    except ValueError as exc:
+        logger.warning("Stored run subfolder %r ignored: %s", text, exc)
+        return ""
 
 
 @dataclass

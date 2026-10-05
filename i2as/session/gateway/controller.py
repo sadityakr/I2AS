@@ -182,6 +182,17 @@ class GatewayController:
             self.server.stop()
             self.server = None
 
+    def drop_connections(self, reason: str) -> int:
+        """Disconnect every agent client (they reconnect to the new session). Idempotent.
+
+        Args:
+            reason: Told to each client before it is disconnected.
+
+        Returns:
+            How many connections were dropped (0 while the gateway is off).
+        """
+        return self.server.drop_connections(reason) if self.server is not None else 0
+
     def connections(self) -> list[dict[str, str]]:
         """Return every connected client's ``{"actor_id", "role"}``.
 

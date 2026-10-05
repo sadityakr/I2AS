@@ -415,10 +415,7 @@ class ExperimentInfoPanel(QWidget):
         if self._last_experiment_id is None:
             self._pre_session_data_dir = self._data_dir_input.text()
         self._last_experiment_id = experiment_id
-        if self._session_manager is not None:
-            data_dir = self._session_manager.current_data_dir()
-            if data_dir is not None:
-                self._data_dir_input.setText(str(data_dir))
+        self._show_run_folder()
         self._update_data_dir_note()
 
     def _restore_data_dir_on_close(self) -> None:
@@ -470,18 +467,42 @@ class ExperimentInfoPanel(QWidget):
         dir_row.addWidget(self._data_dir_input)
         dir_row.addWidget(browse_btn)
         form.addRow("Data Dir:", dir_row)
-        # With a session layer, where a run writes is not a choice: the
-        # engine places every run in the open experiment's data folder
-        # (Orchestrator.set_run_folder, core.run_naming), so the field only
-        # shows that folder and the operator's one choice of location is the
-        # session folder (User → Session Folder…).
+        # With a session layer, the engine places every run in the open
+        # experiment's data folder (Orchestrator.set_run_folder,
+        # core.run_naming), so the field only SHOWS where runs go. The
+        # operator's choices of location are the session folder (User →
+        # Session Folder…) and a run subfolder inside the experiment's
+        # data/ folder (Subfolder… here), which every later run — the
+        # operator's, a queued one, an agent's — is written to.
+        self._subfolder_btn = QPushButton("Subfolder…")
+        self._subfolder_btn.setObjectName("run_subfolder_btn")
+        self._subfolder_btn.setIcon(qta.icon("fa5s.folder-plus", color=TEXT_PRIMARY))
+        self._subfolder_btn.setToolTip(
+            "Choose or create a folder inside this experiment's data/ folder; "
+            "every run from now on is saved there"
+        )
+        self._subfolder_btn.clicked.connect(self._on_choose_subfolder)
+        self._subfolder_reset_btn = QPushButton("Reset")
+        self._subfolder_reset_btn.setObjectName("run_subfolder_reset_btn")
+        self._subfolder_reset_btn.setToolTip("Save runs directly in the experiment's data/ folder again")
+        self._subfolder_reset_btn.clicked.connect(lambda: self._apply_run_subfolder(""))
+        dir_row.addWidget(self._subfolder_btn)
+        dir_row.addWidget(self._subfolder_reset_btn)
+        self._subfolder_btn.hide()
+        self._subfolder_reset_btn.hide()
         if self._session_manager is not None:
             self._data_dir_input.setReadOnly(True)
             self._data_dir_input.setToolTip(
                 "Every run is saved here, as run-NNNN_<Procedure>[_<label>].h5 — "
-                "the open experiment's data folder inside the session folder."
+                "the open experiment's data folder (or the run subfolder chosen "
+                "with Subfolder…) inside the session folder."
             )
             browse_btn.hide()
+            self._subfolder_btn.show()
+            self._subfolder_reset_btn.show()
+            run_folder_changed = getattr(self._session_manager, "run_folder_changed", None)
+            if run_folder_changed is not None:
+                run_folder_changed.connect(lambda _folder: self._show_run_folder())
 
         self._data_dir_note = QLabel(_OUTSIDE_SESSION_NOTE_TEXT)
         self._data_dir_note.setObjectName("data_dir_note")
@@ -490,6 +511,69 @@ class ExperimentInfoPanel(QWidget):
         form.addRow("", self._data_dir_note)
 
         return box
+
+    def _show_run_folder(self) -> None:
+        """Show where runs are written now, read from the session layer — never an autosaved value.
+
+        No-op without a session layer or with no experiment open (the field
+        then keeps whatever the session-less path put there).
+        """
+        if self._session_manager is None:
+            return
+        run_folder = getattr(self._session_manager, "run_folder", None)
+        folder = run_folder() if callable(run_folder) else self._session_manager.current_data_dir()
+        if self._last_experiment_id is None:
+            # The open/close transition has not reached this panel yet (the
+            # run folder is announced first): it captures the operator's own
+            # text before showing the run folder, so leave the field alone.
+            folder = None
+        enabled = folder is not None
+        self._subfolder_btn.setEnabled(enabled)
+        self._subfolder_reset_btn.setEnabled(enabled)
+        if folder is not None:
+            self._data_dir_input.setText(str(folder))
+
+    def _on_choose_subfolder(self) -> None:
+        """Pick (or create) a folder inside the experiment's ``data/`` for every later run."""
+        if self._session_manager is None:
+            return
+        data_dir = self._session_manager.current_data_dir()
+        if data_dir is None:
+            return
+        data_dir.mkdir(parents=True, exist_ok=True)
+        current = self._session_manager.run_folder() or data_dir
+        selected = QFileDialog.getExistingDirectory(
+            self, "Run subfolder (inside the experiment's data/ folder)", str(current)
+        )
+        if not selected:
+            return
+        try:
+            relative = Path(selected).resolve().relative_to(data_dir.resolve())
+        except (OSError, ValueError):
+            QMessageBox.warning(
+                self,
+                "Outside the experiment",
+                "Runs can only be saved inside this experiment's data folder:\n"
+                f"{data_dir}",
+            )
+            return
+        self._apply_run_subfolder(relative.as_posix() if str(relative) != "." else "")
+
+    def _apply_run_subfolder(self, subfolder: str) -> None:
+        """Hand the subfolder to the session layer, reporting a refusal.
+
+        Args:
+            subfolder: Relative to the experiment's ``data/``; ``""`` for
+                ``data/`` itself.
+        """
+        if self._session_manager is None:
+            return
+        try:
+            self._session_manager.set_run_subfolder(subfolder)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Run subfolder", str(exc))
+            return
+        self._show_run_folder()
 
     def _on_browse_dir(self) -> None:
         """Open a directory browser and fill the data-dir field.
@@ -581,6 +665,15 @@ class ExperimentInfoPanel(QWidget):
         """
         return self._data_dir_input.text().strip() or self._default_data_dir_text()
 
+    def reset_session_tracking(self) -> None:
+        """Forget the experiment transition state after another session was loaded.
+
+        Experiment ids repeat across sessions, so the next experiment seen
+        must count as a transition even if its id equals the last one.
+        """
+        self._last_experiment_id = None
+        self._pre_session_data_dir = None
+
     def _default_data_dir_text(self) -> str:
         """Return the fallback Data Dir text for an empty field/experiment state.
 
@@ -591,7 +684,8 @@ class ExperimentInfoPanel(QWidget):
         to make (form_autosave itself stays Qt-free and cannot resolve a
         platform Documents directory).
         """
-        experiment_data_dir = (
+        run_folder = getattr(self._session_manager, "run_folder", None)
+        experiment_data_dir = run_folder() if callable(run_folder) else (
             self._session_manager.current_data_dir()
             if self._session_manager is not None
             else None
@@ -636,4 +730,8 @@ class ExperimentInfoPanel(QWidget):
         self._sample_id_input.setText(state.sample_id)
         self._comments_input.setPlainText(state.comments)
         self._data_dir_input.setText(state.data_dir or self._default_data_dir_text())
+        # With an experiment open the field shows where runs ARE written, not
+        # whatever folder the loaded state remembered (a user switch loads
+        # that user's autosave, whose data_dir may be anywhere).
+        self._show_run_folder()
         self._update_data_dir_note()

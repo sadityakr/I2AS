@@ -98,25 +98,28 @@ Three mechanisms can only ever subtract from that table. Each door has a ceiling
 
 One action is outside the table. Emergency standby is permitted to every role, in every state, at every kill-switch setting. Whoever can see a problem must be able to make the station safe.
 
-### Where data lives: one session folder, one fixed tree
+### Where data lives: one session folder, one tree
 
-The operator makes exactly one choice about where data goes: the **session folder** (User → Session Folder…, any folder on disk; the Monitor header shows the session's name). Everything below it has one shape, so a person, a script or an analysis agent finds any run of any experiment without being told where to look:
+The operator makes two choices about where data goes. The first is the **session folder** (User → Session Folder…, any folder on disk; the Monitor header shows the session's name). The app opens the last one silently at startup, and a different one can be loaded while the app is running. The second, optional, is a **run subfolder** inside the open experiment's `data/` folder (Subfolder… in the Experiment panel). Everything below the session folder has one shape, so a person, a script or an analysis agent finds any run of any experiment without being told where to look:
 
 ```
-<session folder>/                      the only folder the operator chooses
+<session folder>/                      the folder the operator chooses
   session.json                         name, owner, experiment index
+  session.lock                         held by the app that has it open
   001_<experiment label>/              experiments, numbered in the order started
     experiment.json  agent_actions.jsonl  outbox.jsonl
     data/
       run-0001_FieldSweep.h5           runs, numbered; the procedure; the
       run-0002_FieldSweep_10K.h5       operator's optional label last
+      cooldown2/                       an optional run subfolder
+        run-0003_FieldSweep.h5         numbering continues across subfolders
     analysis/
       recipes/                         this experiment's analysis recipes
       run-0001/                        report.json, figures, scripts/<id>/
   002_<experiment label>/
 ```
 
-A run needs an open experiment, and the engine places every run, whoever started it, in that experiment's `data/` folder as `run-NNNN`. Numbers are never reused. The machine remembers the active and recent session folders in `<measurement root>/sessions.json`.
+A run needs an open experiment, and the engine places every run, whoever started it (the operator, the queue or an agent), in that experiment's `data/` folder or the chosen subfolder of it, as `run-NNNN`. A subfolder can never point outside `data/`. Numbers are unique per experiment across all subfolders and are never reused, even if a file is deleted. Loading another session is refused while a run, a queued engine run or an analysis is in flight. The experiment that was open stays open on disk and resumes when its session is loaded again, with its queue. Agent connections are closed so they reconnect to the new session. The machine remembers the active and recent session folders in `<measurement root>/sessions.json`.
 
 ## Setting up your own station
 

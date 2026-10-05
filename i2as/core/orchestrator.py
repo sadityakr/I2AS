@@ -44,7 +44,7 @@ from i2as.core.plan import (
 )
 from i2as.core.ramps import RampRecord, build_ramp_records
 from i2as.core.request_spool import RequestSpool
-from i2as.core.run_naming import RunPlacement, place_run
+from i2as.core.run_naming import RunPlacement, normalize_run_subfolder, place_run
 from i2as.core.run_builder import build_procedure
 from i2as.core.stall_detection import (
     StallConfig,
@@ -649,6 +649,14 @@ class Orchestrator(QObject):
         # client asked. "": no experiment open — every run is refused. A path:
         # every run is placed there as run-NNNN (core.run_naming).
         self._run_folder: str | None = None
+        # The operator's run subfolder inside it ("" = the folder itself) and
+        # the lowest run number the session layer allows (one more than the
+        # highest its experiment record ever recorded). Numbers this process
+        # issued are remembered per folder, so a deleted or moved file never
+        # frees its number (core.run_naming).
+        self._run_subfolder: str = ""
+        self._run_number_floor: int = 1
+        self._last_issued_run_number: dict[str, int] = {}
         self._run_placement: RunPlacement | None = None
 
         # Attendance and the kill switch: two session-owned policy VALUES
@@ -1206,28 +1214,74 @@ class Orchestrator(QObject):
         self._emit_status_snapshot()
 
     @command
-    def set_run_folder(self, data_directory: str) -> None:
+    def set_run_folder(
+        self,
+        data_directory: str,
+        subfolder: str = "",
+        run_number_floor: int = 1,
+        require_idle: bool = False,
+    ) -> None:
         """Install the open experiment's data folder, where every run writes.
 
         The third session-owned policy value pushed DOWN into the engine,
         beside the session envelope and attendance, and for the same reason
         (contract C12). With a folder installed, every run — the operator's,
         a queued one, an agent's — writes ``run-NNNN_<Procedure>[_<label>].h5``
-        into it and is identified as ``run-NNNN`` (``core.run_naming``),
-        whatever directory the client that built the run asked for; so every
-        session has one fixed tree an analysis can walk. An empty string
-        means no experiment is open, and every run is refused until one is:
-        a run's data always belongs to an experiment.
+        into it (or into the operator's run subfolder of it) and is
+        identified as ``run-NNNN`` (``core.run_naming``), whatever directory
+        the client that built the run asked for. An empty string means no
+        experiment is open, and every run is refused until one is: a run's
+        data always belongs to an experiment.
 
         Args:
             data_directory: The open experiment's data folder, or ``""`` when
                 no experiment is open.
+            subfolder: The run subfolder inside it, ``""`` for the folder
+                itself. Checked against ``core.run_naming``'s rule; a bad
+                value is refused and nothing changes.
+            run_number_floor: The lowest run number the next run may get —
+                one more than the highest run the experiment has recorded —
+                so run ids are never reused within an experiment.
+            require_idle: Refuse unless the engine is idle — no run active,
+                none waiting in the engine's own queue. The session layer
+                sets it to RELEASE the folder before loading another
+                session: the verdict, answered on this thread after every
+                command posted before it, is what proves no run of the old
+                session can still start.
         """
+        if require_idle:
+            busy = self._run_folder_busy_reason()
+            if busy:
+                self._action_blocked(busy, detail={"rule": "run_folder_busy"})
+                return
+        try:
+            normalized = normalize_run_subfolder(subfolder) if data_directory else ""
+        except ValueError as exc:
+            self._action_blocked(f"Run subfolder refused: {exc}", detail={"rule": "run_subfolder"})
+            return
         self._run_folder = str(data_directory)
+        self._run_subfolder = normalized
+        self._run_number_floor = max(1, int(run_number_floor))
         if self._run_folder:
-            logger.info("Run folder set: %s", self._run_folder)
+            where = f"{self._run_folder}/{normalized}" if normalized else self._run_folder
+            logger.info("Run folder set: %s (next run >= %d)", where, self._run_number_floor)
         else:
             logger.info("Run folder cleared: runs are refused until an experiment is open")
+
+    def _run_folder_busy_reason(self) -> str:
+        """Return why the run folder cannot be released now, or ``""``.
+
+        Returns:
+            A reason when a run is active or waiting in the engine's own
+            queue, ``""`` when the engine is idle (or in ERROR with no run).
+        """
+        if self._procedure is not None:
+            return "A run is in progress"
+        if self._procedure_queue:
+            return "Runs are waiting in the engine's queue"
+        if self._state not in (OrchestratorState.IDLE, OrchestratorState.ERROR):
+            return f"The station is busy ({self._state.value})"
+        return ""
 
     def _no_experiment_refusal(self) -> bool:
         """Refuse the run in flight when the session layer says no experiment is open.
@@ -1355,8 +1409,8 @@ class Orchestrator(QObject):
         self._start_run(procedure)
 
 
-    def _place_run(self, procedure: Any) -> RunPlacement | None:
-        """Place the run's data file in the open experiment's folder, if one is installed.
+    def _plan_run_placement(self, procedure: Any) -> RunPlacement | None:
+        """Decide where the run's data file goes, without writing anything.
 
         Duck-typed like every other procedure accessor here (contract C5): a
         procedure without ``place_data_file`` — a test double — is left
@@ -1366,19 +1420,50 @@ class Orchestrator(QObject):
             procedure: The run about to start.
 
         Returns:
-            The placement applied, or ``None`` when no folder is installed or
-            the procedure cannot be placed.
+            The placement, or ``None`` when no folder is installed or the
+            procedure cannot be placed.
+
+        Raises:
+            ValueError: If the run subfolder resolves outside the data folder
+                or the run file's path would be too long
+                (``core.run_naming.place_run``).
         """
         place = getattr(procedure, "place_data_file", None)
         if not self._run_folder or not callable(place):
             return None
-        placement = place_run(
+        floor = max(
+            self._run_number_floor,
+            self._last_issued_run_number.get(self._run_folder, 0) + 1,
+        )
+        return place_run(
             self._run_folder,
             type(procedure).__name__,
             str(getattr(procedure, "file_prefix", "") or ""),
             str(getattr(procedure, "run_kind", "run") or "run"),
+            subfolder=self._run_subfolder,
+            floor=floor,
         )
-        place(placement.data_directory, placement.file_name)
+
+    def _place_run(self, procedure: Any, placement: RunPlacement | None = None) -> RunPlacement | None:
+        """Apply a run placement to the procedure and remember the number issued.
+
+        Args:
+            procedure: The run about to start.
+            placement: The placement already planned; ``None`` plans it now.
+
+        Returns:
+            The placement applied, or ``None`` when the run is not placed.
+        """
+        if placement is None:
+            placement = self._plan_run_placement(procedure)
+        if placement is None:
+            return None
+        procedure.place_data_file(placement.data_directory, placement.file_name)
+        number = int(placement.run_id.rsplit("-", 1)[-1])
+        assert self._run_folder is not None
+        self._last_issued_run_number[self._run_folder] = max(
+            number, self._last_issued_run_number.get(self._run_folder, 0)
+        )
         logger.info("Run placed: %s → %s", placement.run_id, placement.file_name)
         return placement
 
@@ -1394,6 +1479,15 @@ class Orchestrator(QObject):
         Args:
             procedure: The procedure to start.
         """
+        # Where the run writes is decided BEFORE anything changes: a run
+        # subfolder that resolves outside the experiment, or a path too long
+        # to create, refuses the run cleanly instead of degrading to ERROR.
+        try:
+            placement = self._plan_run_placement(procedure)
+        except ValueError as exc:
+            logger.warning("Run refused: %s", exc)
+            self._action_blocked(f"Run refused: {exc}", detail={"rule": "run_folder"})
+            return
         self._procedure = procedure
         # The **run owner** (GLOSSARY.md's *Run owner*): whoever started this
         # run owns it. A run pulled off a queue is owned by whoever QUEUED
@@ -1414,7 +1508,7 @@ class Orchestrator(QObject):
         self._pending_gates = []
         self._pause_requested = False
         try:
-            self._run_placement = self._place_run(procedure)
+            self._run_placement = self._place_run(procedure, placement)
             plan = procedure.initiate()
             # The frozen-dataclass repr is the permanent record of exactly what
             # was requested — logged once, at INFO, on receipt.
@@ -2750,6 +2844,10 @@ class Orchestrator(QObject):
             "params": params,
             "owner": owner.ref() if isinstance(owner, ev.Actor) else None,
             "data_file": str(getattr(procedure, "data_filepath", None) or ""),
+            # The data folder this run was placed under: the session layer
+            # files the run's record by it, never by whichever experiment
+            # happens to be open when the manifest arrives.
+            "data_root": (self._run_folder or "") if self._run_placement is not None else "",
             "started_utc": datetime.now(timezone.utc).isoformat(),
         }
         self._datapoint_index = 0
