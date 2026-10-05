@@ -28,6 +28,7 @@ from i2as.session.models import (
     RUN_STATUS_DONE,
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
+    ElnLink,
     ExperimentRecord,
     RunRecord,
     User,
@@ -162,12 +163,13 @@ def test_runs_are_placed_in_the_subfolder_and_numbers_never_repeat(engine, tmp_p
     assert orchestrator._place_run(Placeable()).run_id == "run-0004"
 
 
-def test_a_bad_subfolder_is_refused_and_nothing_changes(engine, tmp_path):
+def test_a_bad_subfolder_is_refused_and_fails_closed(engine, tmp_path):
     orchestrator, verdicts = engine
     _set_run_folder(orchestrator, data_directory=str(tmp_path), subfolder="ok")
-    _set_run_folder(orchestrator, data_directory=str(tmp_path), subfolder="../escape")
+    _set_run_folder(orchestrator, data_directory=str(tmp_path / "other"), subfolder="../escape")
     assert verdicts[-1].code is not ev.VerdictCode.OK
-    assert orchestrator._run_subfolder == "ok"
+    # Not the previous experiment's folder: no run at all until a valid one.
+    assert orchestrator._run_folder == ""
 
 
 def test_releasing_the_folder_is_refused_while_a_run_is_active(engine, tmp_path):
@@ -358,8 +360,6 @@ def test_a_stale_lock_of_this_host_is_taken_over(tmp_path):
 
 def test_a_result_for_a_session_left_behind_goes_to_that_session(sessions):
     """Notebook outcomes carry their session: same experiment id, other session untouched."""
-    from i2as.session.models import ElnLink
-
     manager, _store, a, b = sessions
     manager.start_experiment("Same id", "jdoe", SAMPLE)
     experiment_id = manager.current_experiment().experiment_id
@@ -403,6 +403,7 @@ def test_an_escaping_subfolder_refuses_the_run_before_any_side_effect(engine, tm
     (data / "escape").symlink_to(tmp_path)
     _set_run_folder(orchestrator, data_directory=str(data), subfolder="escape")
     assert verdicts[-1].code is not ev.VerdictCode.OK, "an escape is refused at install"
+    assert orchestrator._run_folder == ""
     assert not orchestrator._monitoring
     orchestrator.run_procedure(Placeable())
     assert orchestrator._procedure is None
@@ -450,17 +451,44 @@ def test_a_registry_write_failure_rolls_back(sessions, engine, monkeypatch):
     assert not (b / SESSION_LOCK_FILENAME).exists()
 
 
-def test_held_runs_refuse_every_run_until_another_session_loads(sessions, engine):
-    manager, _store, _a, b = sessions
+def test_a_held_session_adopts_nothing_and_writes_nothing(tmp_path, roster, engine):
+    """Another station holds the session: its records are never touched here."""
     orchestrator, _verdicts = engine
-    manager.start_experiment("In A", "jdoe", SAMPLE)
-    manager.hold_runs("in use by the other station")
+    store = SessionStore(tmp_path / "root")
+    a, b = tmp_path / "A", tmp_path / "B"
+    store.create_session(a, "A", "jdoe")
+    store.create_session(b, "B", "jdoe")
+    shared = ExperimentStore(a)
+    shared.save(
+        ExperimentRecord(
+            experiment_id="001_shared", title="Shared", user_id="jdoe", status="open",
+            runs=[RunRecord(run_id="run-0001", status=RUN_STATUS_RUNNING)],
+        )
+    )
+    shared.set_active("001_shared")
+    before = (a / "001_shared" / "experiment.json").read_bytes()
+
+    manager = ExperimentManager(
+        store=ExperimentStore(a), roster=roster, orchestrator=orchestrator,
+        config_name="sim_cryostat", session_store=store, runs_held="in use by station 2",
+    )
+
+    assert manager.current_experiment() is None
     assert orchestrator._run_folder == ""
-    manager.set_run_subfolder("cd2")
-    assert orchestrator._run_folder == "", "held means held"
+    manager.set_queue([{"x": 1}])  # what a quit-time save does
+    for refused in (
+        lambda: manager.start_experiment("Mine", "jdoe", SAMPLE),
+        lambda: manager.switch_experiment("001_shared"),
+        lambda: manager.set_run_subfolder("cd2"),
+    ):
+        with pytest.raises(ValueError, match="held"):
+            refused()
+    assert manager.set_eln_entry("001_shared", ElnLink(entry_id="9")) is False
+    assert (a / "001_shared" / "experiment.json").read_bytes() == before
 
     manager.request_session_switch(b)
     assert manager.runs_held_reason() == ""
+    assert manager.store.root.resolve() == b.resolve()
 
 
 def test_the_lock_is_atomic_and_explains_a_foreign_holder(tmp_path):
@@ -485,3 +513,15 @@ def test_a_failing_session_listener_is_contained(caplog):
     with caplog.at_level("ERROR"):
         _guarded("agent disconnect", boom)("folder")
     assert "agent disconnect failed" in caplog.text
+
+
+def test_a_lock_being_written_counts_as_held(tmp_path):
+    store = SessionStore(tmp_path / "root")
+    folder = tmp_path / "S"
+    store.create_session(folder, "S", "jdoe")
+    (folder / SESSION_LOCK_FILENAME).write_text("")  # created, not yet written
+    with pytest.raises(SessionLockedError):
+        store.acquire_lock(folder)
+    old = os.path.getmtime(folder / SESSION_LOCK_FILENAME) - 60
+    os.utime(folder / SESSION_LOCK_FILENAME, (old, old))
+    store.acquire_lock(folder)  # debris: taken over

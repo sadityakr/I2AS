@@ -660,13 +660,12 @@ def main(
         session_store=session_store,
         station=station,
         run_catalog=run_catalog,
-    )
-
-    if session_lock_conflict:
         # Another running station holds this session: the app still starts
-        # (it always does), but no run may write into records the other
-        # station is also saving — until the operator loads another session.
-        session_manager.hold_runs(session_lock_conflict)
+        # (it always does), but it adopts no experiment and writes nothing
+        # into records the other station is saving — until the operator
+        # loads another session.
+        runs_held=session_lock_conflict,
+    )
 
     # The pull seam (GLOSSARY.md's **Run queue**): the engine ASKS the session
     # layer's queue for the next run rather than holding one of its own, and

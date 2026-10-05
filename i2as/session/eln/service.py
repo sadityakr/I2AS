@@ -625,13 +625,13 @@ class ElnService(QObject):
 
     def _drained(self, result: Any) -> None:
         """GUI thread: record what the drain achieved, in the session it ran for."""
+        if self._drain_again:
+            self._drain_again = False
+            self.drain_soon()
         if isinstance(result, Exception):
             self._last_detail = str(result)
             self._emit_status()
             return
-        if self._drain_again:
-            self._drain_again = False
-            self.drain_soon()
         store, outcomes = result
         session_root = store.root
         current = session_root == self._manager.store.root

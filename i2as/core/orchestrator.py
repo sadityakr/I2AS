@@ -1245,8 +1245,9 @@ class Orchestrator(QObject):
             data_directory: The open experiment's data folder, or ``""`` when
                 no experiment is open.
             subfolder: The run subfolder inside it, ``""`` for the folder
-                itself. Checked against ``core.run_naming``'s rule; a bad
-                value is refused and nothing changes.
+                itself. Checked against ``core.run_naming``'s rule and for
+                containment; a refusal clears the run folder, so every run is
+                refused until a valid folder is installed (fail closed).
             run_number_floor: The lowest run number the next run may get —
                 one more than the highest run the experiment has recorded —
                 so run ids are never reused within an experiment.
@@ -1267,6 +1268,11 @@ class Orchestrator(QObject):
             if data_directory:
                 run_target_folder(data_directory, normalized)  # refuses an escape now
         except ValueError as exc:
+            # Fail closed: the previous folder may belong to another
+            # experiment, so no run may start until a valid one is installed.
+            self._run_folder = ""
+            self._run_subfolder = ""
+            logger.warning("Run folder refused, every run refused until a valid one: %s", exc)
             self._action_blocked(f"Run subfolder refused: {exc}", detail={"rule": "run_subfolder"})
             return
         self._run_folder = str(data_directory)

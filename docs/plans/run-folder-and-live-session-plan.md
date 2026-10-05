@@ -156,3 +156,13 @@ Deferred, with reason:
   HTTP adapter's session model and is a separate change.
 * **Windows CI.** Junctions and long paths are covered by the rule and
   `_ON_WINDOWS` tests here; a Windows CI job is recommended but out of scope.
+
+### Re-audit of the implementation fixes
+
+| # | Finding | Response |
+|---|---|---|
+| BLOCKER | Holding runs AFTER the manager was built: the shared active experiment was already adopted (a run of the other station marked failed and saved), and later saves overwrote the shared record | The lock is decided before the manager is built and passed as `runs_held`; a held session adopts no experiment, refuses start/switch experiment and the run subfolder, and every write to its records (`_save_current`, `_mutate_experiment`, index reconcile) is refused until another session is loaded. Test asserts `experiment.json` is byte-identical afterwards. |
+| MAJOR | A refused `set_run_folder` left the engine on the previous experiment's folder | Fail closed: a refusal clears the run folder, so every run is refused until a valid one is installed. |
+| minor | Lock file created but not yet written read as free | An unreadable lock counts as held for 10 s, then as debris. |
+| minor | `_drain_again` skipped when the old drain failed | Re-drain happens before the error return. |
+| minor | `session_about_to_change` save unguarded | Guarded. |

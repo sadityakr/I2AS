@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import socket
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -579,6 +580,9 @@ SESSION_LOCK_FILENAME = "session.lock"
 
 _HOSTNAME = socket.gethostname()
 
+#: How long an unreadable lock file counts as held (a writer mid-creation).
+_UNREADABLE_LOCK_GRACE_S = 10.0
+
 
 class SessionLockedError(RuntimeError):
     """A session folder is in use by another running application."""
@@ -872,8 +876,18 @@ class SessionStore:
             The lock's ``{"pid", "host", "since"}`` when another live process
             holds it, else ``None``.
         """
-        data = _read_json(Path(folder) / SESSION_LOCK_FILENAME)
+        path = Path(folder) / SESSION_LOCK_FILENAME
+        data = _read_json(path)
         if not isinstance(data, dict):
+            # Missing: free. Present but unreadable: another process may be
+            # between creating it and writing it — held, unless it has stayed
+            # unreadable for long enough to be debris.
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                return None
+            if age < _UNREADABLE_LOCK_GRACE_S:
+                return {"pid": None, "host": "unknown", "since": "just now"}
             return None
         pid = data.get("pid")
         host = data.get("host")

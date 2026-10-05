@@ -96,6 +96,7 @@ class ExperimentManager(QObject):
         session_store: SessionStore | None = None,
         station: Station | None = None,
         run_catalog: Mapping[str, type] | None = None,
+        runs_held: str = "",
     ) -> None:
         """Wire into the Orchestrator and resume any active experiment.
 
@@ -130,6 +131,12 @@ class ExperimentManager(QObject):
                 catalog a queued **run spec**'s class name is resolved
                 through. Supplied by whoever owns discovery, because this
                 package may not import ``i2as.procedures`` (contract C11).
+            runs_held: Why this session's records must not be written —
+                another running application holds the session folder. The
+                session then opens with NO experiment adopted, every run is
+                refused and every write to this session's records is refused,
+                until another session is loaded. ``""`` (the default): not
+                held.
         """
         super().__init__()
         self._store = store
@@ -155,10 +162,10 @@ class ExperimentManager(QObject):
         # the engine's verdict on releasing the run folder.
         self._busy_checks: list[Callable[[], str]] = []
         self._pending_switch: tuple[str, Path, ExperimentStore] | None = None
-        # Why every run is held off in this session ("" = not held): set when
-        # the session folder is in use by another running application, so two
-        # stations never write the same experiment records.
-        self._runs_held = ""
+        # Why this session is held ("" = not held): set when the session
+        # folder is in use by another running application, so two stations
+        # never write the same experiment records (see ``runs_held``).
+        self._runs_held = runs_held
 
         orchestrator.run_started.connect(self._on_run_started)
         orchestrator.run_finished.connect(self._on_run_finished)
@@ -301,6 +308,8 @@ class ExperimentManager(QObject):
                 ``"."``/``".."``.
             OSError: If the record cannot be written.
         """
+        if self._runs_held:
+            raise ValueError(f"This session is held: {self._runs_held}")
         if not title.strip():
             raise ValueError("Experiment title must not be empty")
         if self._experiment is not None:
@@ -522,6 +531,8 @@ class ExperimentManager(QObject):
                 record must never become the live, mutable experiment of an
                 older app.
         """
+        if self._runs_held:
+            raise ValueError(f"This session is held: {self._runs_held}")
         record = self._store.load(experiment_id)
         if record is None:
             raise ValueError(f"Unknown experiment {experiment_id!r}")
@@ -584,6 +595,8 @@ class ExperimentManager(QObject):
             ValueError: If no experiment is open or the subfolder breaks the
                 rule.
         """
+        if self._runs_held:
+            raise ValueError(f"This session is held: {self._runs_held}")
         if self._experiment is None:
             raise ValueError("No experiment is open")
         normalized = normalize_run_subfolder(subfolder)
@@ -598,7 +611,10 @@ class ExperimentManager(QObject):
     # ------------------------------------------------------------------
 
     def hold_runs(self, reason: str) -> None:
-        """Refuse every run in this session until another session is loaded.
+        """Hold this session: no experiment, no run, no record write, until another session loads.
+
+        Prefer the constructor's ``runs_held`` — holding after construction
+        comes after the active experiment was already adopted.
 
         Used when the session folder is in use by another running
         application: both would otherwise save the same experiment records,
@@ -610,6 +626,9 @@ class ExperimentManager(QObject):
         self._runs_held = reason
         logger.error("Runs held in this session: %s", reason)
         self._install_run_folder(None)
+        if self._experiment is not None:
+            self._experiment = None
+            self.experiment_changed.emit({})
 
     def runs_held_reason(self) -> str:
         """Why runs are held in this session, or ``""`` when they are not."""
@@ -1414,6 +1433,9 @@ class ExperimentManager(QObject):
         store = self._store
         if session_root is not None and not _same_path(session_root, self._store.root):
             store = ExperimentStore(Path(session_root))
+        elif self._runs_held:
+            logger.warning("Session held — not allowed to %s experiment %s", action, experiment_id)
+            return False
         elif self._experiment is not None and self._experiment.experiment_id == experiment_id:
             if not apply(self._experiment):
                 return False
@@ -1544,6 +1566,8 @@ class ExperimentManager(QObject):
         lifecycle, it must never be allowed to block it. No-op when this
         manager was built without a ``session_store``.
         """
+        if self._runs_held:
+            return
         folder = self._current_session_folder()
         if folder is None:
             return
@@ -1597,6 +1621,8 @@ class ExperimentManager(QObject):
         the read-only rule; such a record should never have become
         ``self._experiment`` in the first place (see ``switch_experiment``).
         """
+        if self._runs_held:
+            return  # never write records another station is saving
         if self._experiment is None:
             return
         if self._experiment.schema_version > SCHEMA_VERSION:
@@ -1631,6 +1657,11 @@ class ExperimentManager(QObject):
         # No experiment until one is resumed below: until then every run is
         # refused, because a run's data always belongs to an experiment.
         self._install_run_folder(None)
+        if self._runs_held:
+            # Another station holds this session: its records are not ours to
+            # touch — not even to mark a run of theirs failed.
+            logger.error("Session held, no experiment adopted: %s", self._runs_held)
+            return
         active_id = self._store.get_active()
         if active_id is None:
             return

@@ -301,7 +301,8 @@ class MonitorWindow(QMainWindow):
                 "session_lock",
                 SEVERITY_ERROR,
                 "session",
-                f"Runs are held: {held()}",
+                f"This session is held — no runs, no record changes: {held()}. "
+                "Load another session (User → Session Folder…).",
                 dismissible=False,
             )
         if self._startup_warning:
@@ -1268,6 +1269,13 @@ class MonitorWindow(QMainWindow):
             self._status_bar.clearMessage()
             QMessageBox.warning(self, "Session Folder", str(exc))
 
+    def _save_before_session_change(self) -> None:
+        """Save the fields and queue of the session being left; never raises."""
+        try:
+            self._save_session()
+        except Exception:
+            logger.exception("MonitorWindow: could not save before the session change")
+
     def _on_session_changed(self, folder: str) -> None:
         """Bring the window over to a session loaded while running.
 
@@ -1491,7 +1499,9 @@ class MonitorWindow(QMainWindow):
             if session_changed is not None:
                 # Fields and queue edited while the switch waited for the
                 # engine still belong to the session being left.
-                self._session_manager.session_about_to_change.connect(self._save_session)
+                self._session_manager.session_about_to_change.connect(
+                    self._save_before_session_change
+                )
                 session_changed.connect(self._on_session_changed)
                 self._session_manager.session_switch_failed.connect(
                     self._on_session_switch_failed
