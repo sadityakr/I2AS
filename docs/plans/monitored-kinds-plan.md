@@ -140,3 +140,24 @@ monitor never triggers an exposure.
 5. No XY "latest trace" snapshot panel on the Monitor (not requested).
 6. ArrayHistory memory: 600 × 128 KiB = 75 MiB worst case per image key.
 7. No disk persistence of arrays (by decision).
+
+## 6. Audit (senior lab-software review) and revision
+
+Verdict: **approve with changes**. Findings and the response, implemented in the
+commit that follows this revision:
+
+| # | Finding | Revision |
+|---|---|---|
+| M1 | Array poll ran before `check_safety`/emergency/holds in the same tick | Poll moved to the very end of `_tick_body`, re-gated on still-IDLE, wrapped in `try/except`; per-tick budget (`ARRAY_TICK_BUDGET_S = 0.05`) stops further reads once spent; a field whose single read exceeds `ARRAY_READ_LIMIT_S = 0.5` is disabled with one ERROR. Test asserts safety runs before any array read. |
+| M2 | ArrayHistory bounded by count, not bytes; process-wide OOM risk | Image keys keep the latest frame only; total byte budget (64 MiB) evicts oldest trace rows; `@monitored` refuses a shape over `MAX_ARRAY_ELEMENTS = 4_194_304`. |
+| m1 | Traceback per failing read | After 3 consecutive failures a field backs off (period doubles, capped 60 s); one ERROR on first failure. |
+| m2 | Waterfall rows evenly spaced, hides run gaps; 1 h window unreachable | Rows binned on the real time axis, gaps NaN (transparent); window list limited to what the history can hold. |
+| m3 | Waterfall x/y off by half a pixel; single-trace collapse | Pixel-centred rects; minimum row height. |
+| m4 | Shutdown diagnostic can't tell array read from safety read | `polling_vi()` reports `"vi.field (array read)"`. |
+| m5 | Registry not a real extension point | `PlotPanel` `typing.Protocol`; each `_PANEL_KINDS` entry carries its factory and feed (`"states"`/`"arrays"`); no kind branches left in the quadrant. |
+| m6 | Manifest schema changed without version bump; `MonitoredInfo` loose | Schema id bumped to `/2`; `MonitoredInfo` validates `kind`, `period_s`, `axis`. |
+| m7 | Test gaps | Tests for each of the above, incl. no poll in ERROR/EMERGENCY/PAUSED. |
+| nit | Naming; uncaught TypeError in image slot | `PlotsQuadrant` (with `TrendsQuadrant` alias, settings key kept); image redraw catches `TypeError`. |
+
+Deferred (accepted): procedure panel kind not persisted; inherited flat-key
+collision; `array_fields` fixed at window build (instrument set is fixed per session).
