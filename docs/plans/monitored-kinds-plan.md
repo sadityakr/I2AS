@@ -173,3 +173,10 @@ All ten findings confirmed resolved; four defects in the new mechanisms, fixed:
 | 3 | VI logging wrapper still logged a traceback per failed array read | Array reads call beneath the wrapper; the Station logs once and backs off; test asserts no tracebacks |
 | 4 | Waterfall striped when reads come at the tick (3 s) on a 1 s declaration | Effective period = max(declared, tick) in the GUI's field map; rows = max(period, observed median spacing) |
 | nit | Panel redraw failure logged every tick | Logged once per failing spell |
+
+### Final re-audit (round 3)
+
+**Signed off.** Accepted residuals: an array read bypasses the VI wrapper's
+VISA-error translation (documented; logged at ERROR instead of WARNING, health
+untouched); one read can run up to `ARRAY_READ_LIMIT_S` once before its field is
+switched off, since a read in progress cannot be pre-empted.

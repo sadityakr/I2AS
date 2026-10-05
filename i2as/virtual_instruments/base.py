@@ -1322,7 +1322,10 @@ class BaseVirtualInstrument:
         # Below the per-call logging wrapper: it logs every failure with a
         # traceback, and an array field polled every second would flood the
         # log. The Station's array poll logs a failing field once and backs
-        # it off instead.
+        # it off instead. Bypassing it also skips its pyvisa VisaIOError ->
+        # I2ASCommunicationError translation; harmless here, because the
+        # array poll absorbs every exception and never touches instrument
+        # health — a VISA error is only logged at ERROR rather than WARNING.
         func = getattr(method, "__func__", method)
         raw = getattr(func, "__wrapped__", func)(self)
         if raw is None:
