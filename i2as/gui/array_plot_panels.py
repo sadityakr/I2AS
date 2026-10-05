@@ -337,7 +337,8 @@ def waterfall_image(
             length.
         now: The time the Y axis's 0 stands for.
         window_s: How far back the grid reaches.
-        period_s: The field's declared period — the natural row height.
+        period_s: The field's effective period — the minimum row height;
+            the observed median spacing is used when traces arrive slower.
         max_rows: The most rows to draw; the row height grows to fit.
         axis: The trace's declared ``(start, stop, unit)`` x axis, or
             ``None`` for the sample index.
@@ -349,6 +350,12 @@ def waterfall_image(
         sample values, Y from ``-window_s`` to ``0``.
     """
     length = int(np.asarray(entries[-1][1]).shape[0])
+    # Rows are as tall as traces actually arrive: the declared period, or the
+    # observed median spacing when reads come slower (the tick, a back-off),
+    # so steady data never draws as stripes — only a real gap stays empty.
+    if len(entries) > 1:
+        spacing = float(np.median(np.diff([t for t, _ in entries])))
+        period_s = max(period_s, spacing)
     rows = max(1, min(max_rows, int(np.ceil(window_s / max(period_s, 1e-9)))))
     row_s = window_s / rows
     image = np.full((rows, length), np.nan)

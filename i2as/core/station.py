@@ -275,6 +275,8 @@ class Station:
         # switched off for the session because one read took too long.
         self._array_failures: dict[tuple[str, str], int] = {}
         self._array_disabled: set[tuple[str, str]] = set()
+        # The field read last, where the next poll's round-robin starts.
+        self._array_cursor: tuple[str, str] | None = None
         # Degraded-build support: VIs whose hardware failed to connect at
         # build time, plus the build recipes and live driver instances that
         # connect_instrument() needs to bring one back without a restart.
@@ -1208,6 +1210,8 @@ class Station:
 
         * **Time budget.** Once ``ARRAY_TICK_BUDGET_S`` of reading has been
           spent this call, the remaining due fields wait for a later tick.
+          Fields are visited round-robin from the one read last, so a field
+          that spends the whole budget cannot starve the others.
         * **Slow fields are switched off.** A single read longer than
           ``ARRAY_READ_LIMIT_S`` disables that field for the session, with
           one ERROR — a preview that stalls the instrument thread is a VI
@@ -1231,32 +1235,44 @@ class Station:
         """
         if now is None:
             now = time.monotonic()
+        candidates = [
+            (vi_name, vi, field_name)
+            for vi_name, vi in self._virtual_instruments.items()
+            if not self._error_counts.get(vi_name, 0)
+            for field_name in get_monitored_methods(vi, kinds=ARRAY_KINDS)
+            if (vi_name, field_name) not in self._array_disabled
+        ]
+        # Round-robin: start after the field read last, so one slow field
+        # that spends the budget every tick can never starve the others.
+        if candidates:
+            start = next(
+                (i + 1 for i, (n, _vi, f) in enumerate(candidates) if (n, f) == self._array_cursor),
+                0,
+            )
+            candidates = candidates[start:] + candidates[:start]
+
         result: dict[str, dict] = {}
         spent = 0.0
-        for vi_name, vi in self._virtual_instruments.items():
-            if self._error_counts.get(vi_name, 0):
+        for vi_name, vi, field_name in candidates:
+            key = (vi_name, field_name)
+            if not self._array_field_due(key, getattr(vi, field_name), now):
                 continue
-            for field_name in get_monitored_methods(vi, kinds=ARRAY_KINDS):
-                key = (vi_name, field_name)
-                if key in self._array_disabled:
-                    continue
-                if not self._array_field_due(key, getattr(vi, field_name), now):
-                    continue
-                if spent >= ARRAY_TICK_BUDGET_S:
-                    return result  # due fields wait for the next tick
-                self._array_last_read[key] = now
-                value, elapsed = self._read_array_field(vi_name, vi, field_name)
-                spent += elapsed
-                if elapsed > ARRAY_READ_LIMIT_S:
-                    self._array_disabled.add(key)
-                    logger.error(
-                        "Array field %s.%s took %.2f s to read (limit %.2f s) and is "
-                        "switched off for this session: a preview must not hold the "
-                        "instrument thread", vi_name, field_name, elapsed, ARRAY_READ_LIMIT_S,
-                    )
-                    continue
-                if value is not None:
-                    result.setdefault(vi_name, {})[field_name] = value
+            if spent >= ARRAY_TICK_BUDGET_S:
+                break  # due fields wait for the next tick
+            self._array_last_read[key] = now
+            self._array_cursor = key
+            value, elapsed = self._read_array_field(vi_name, vi, field_name)
+            spent += elapsed
+            if elapsed > ARRAY_READ_LIMIT_S:
+                self._array_disabled.add(key)
+                logger.error(
+                    "Array field %s.%s took %.2f s to read (limit %.2f s) and is "
+                    "switched off for this session: a preview must not hold the "
+                    "instrument thread", vi_name, field_name, elapsed, ARRAY_READ_LIMIT_S,
+                )
+                continue
+            if value is not None:
+                result.setdefault(vi_name, {})[field_name] = value
         return result
 
     def _array_field_due(self, key: tuple[str, str], method: Any, now: float) -> bool:
@@ -1277,7 +1293,9 @@ class Station:
         period_s = get_monitored_period_s(method) or 0.0
         excess = self._array_failures.get(key, 0) - ARRAY_FAILURE_BACKOFF_AFTER + 1
         if excess > 0:
-            period_s = min(period_s * 2.0**excess, max(period_s, ARRAY_BACKOFF_MAX_S))
+            # Clamped exponent: a field failing for days must not overflow.
+            backed_off = period_s * 2.0 ** min(excess, 16)
+            period_s = min(backed_off, max(period_s, ARRAY_BACKOFF_MAX_S))
         return now - last >= period_s
 
     def _read_array_field(

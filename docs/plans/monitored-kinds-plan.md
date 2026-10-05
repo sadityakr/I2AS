@@ -161,3 +161,15 @@ commit that follows this revision:
 
 Deferred (accepted): procedure panel kind not persisted; inherited flat-key
 collision; `array_fields` fixed at window build (instrument set is fixed per session).
+
+### Re-audit (round 2)
+
+All ten findings confirmed resolved; four defects in the new mechanisms, fixed:
+
+| # | Finding | Revision |
+|---|---|---|
+| 1 | Back-off `2**excess` overflows after ~1000 failures, silently ending all previews | Exponent clamped (`min(excess, 16)`); test with 5000 failures |
+| 2 | A field spending the budget every tick starves later fields | Round-robin from the field read last; starvation test |
+| 3 | VI logging wrapper still logged a traceback per failed array read | Array reads call beneath the wrapper; the Station logs once and backs off; test asserts no tracebacks |
+| 4 | Waterfall striped when reads come at the tick (3 s) on a 1 s declaration | Effective period = max(declared, tick) in the GUI's field map; rows = max(period, observed median spacing) |
+| nit | Panel redraw failure logged every tick | Logged once per failing spell |

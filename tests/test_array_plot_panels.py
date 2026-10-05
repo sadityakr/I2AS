@@ -54,13 +54,14 @@ def settings_file(tmp_path, monkeypatch):
 class TestWaterfallImage:
     def test_a_gap_stays_empty_and_rows_are_one_period(self):
         now = 100.0
-        entries = [(40.0, np.zeros(5)), (41.0, np.ones(5)), (99.0, np.full(5, 2.0))]
+        entries = [(40.0 + t, np.full(5, float(t))) for t in range(4)] + [(99.0, np.full(5, 9.0))]
         image, rect = waterfall_image(
             entries, now=now, window_s=60.0, period_s=1.0, max_rows=600, axis=None
         )
         assert image.shape == (60, 5)
-        assert image[0, 0] == 0.0 and image[1, 0] == 1.0 and image[59, 0] == 2.0
-        assert np.isnan(image[2:59]).all()  # the run in between is a visible gap
+        np.testing.assert_array_equal(image[0:4, 0], [0.0, 1.0, 2.0, 3.0])
+        assert image[59, 0] == 9.0
+        assert np.isnan(image[4:59]).all()  # the run in between is a visible gap
         assert rect == (-0.5, -60.0, 5.0, 60.0)
 
     def test_pixels_are_centred_on_the_declared_axis(self):
@@ -78,6 +79,24 @@ class TestWaterfallImage:
             max_rows=600, axis=None,
         )
         assert image.shape == (600, 3)
+
+
+def test_steady_traces_slower_than_declared_draw_without_stripes():
+    """Traces every 3 s (the tick) on a 1 s declaration fill every row."""
+    entries = [(float(t), np.zeros(4)) for t in range(0, 60, 3)]
+    image, _rect = waterfall_image(
+        entries, now=60.0, window_s=60.0, period_s=1.0, max_rows=600, axis=None
+    )
+    assert image.shape[0] == 20
+    assert not np.isnan(image).any()
+
+
+def test_the_effective_period_is_never_faster_than_the_tick():
+    info = StationInfo(
+        tick_interval_s=3.0,
+        instruments=(InstrumentInfo(name="spec", monitored=(TRACE_INFO,)),),
+    )
+    assert array_fields_from_station_info(info)["spec_spectrum"].period_s == 3.0
 
 
 class TestArrayHistory:

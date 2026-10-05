@@ -31,6 +31,7 @@ import json
 import logging
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -86,13 +87,18 @@ def array_fields_from_station_info(station_info: Any) -> dict[str, MonitoredInfo
     Returns:
         ``{f"{vi_name}_{field}": MonitoredInfo}`` for every ``@monitored``
         field whose kind is not ``"scalar"`` — the keys
-        ``ArrayHistory`` records them under.
+        ``ArrayHistory`` records them under. Each ``period_s`` is the
+        EFFECTIVE one, at least the station's tick interval: an array field
+        is read on the tick, so it never arrives faster than that, whatever
+        it declares.
     """
+    tick_s = float(getattr(station_info, "tick_interval_s", 0.0) or 0.0)
     fields: dict[str, MonitoredInfo] = {}
     for instrument in getattr(station_info, "instruments", ()):
         for info in instrument.monitored:
             if info.kind != "scalar":
-                fields[f"{instrument.name}_{info.name}"] = info
+                effective = max(info.period_s or 0.0, tick_s) or None
+                fields[f"{instrument.name}_{info.name}"] = replace(info, period_s=effective)
     return fields
 
 
@@ -150,6 +156,8 @@ class PlotsQuadrant(QWidget):
 
         # Every panel, of every kind, in grid order.
         self._panels: dict[str, PlotPanel] = {}
+        # Panels whose redraw is currently failing (their error is logged once).
+        self._failing_panels: set[str] = set()
         # Keys the restore path still wants applied once the panel offers
         # them (a fresh trend panel's Y combo is empty until the first
         # states_updated tick, so set_selected_key() at restore time is a
@@ -457,8 +465,12 @@ class PlotsQuadrant(QWidget):
         try:
             panel.refresh()
         except Exception:
-            logger.exception("plots_quadrant: %s failed to redraw", panel_id)
+            # Logged once per failing spell, not on every tick.
+            if panel_id not in self._failing_panels:
+                self._failing_panels.add(panel_id)
+                logger.exception("plots_quadrant: %s failed to redraw", panel_id)
             return
+        self._failing_panels.discard(panel_id)
 
         pending_key = self._pending_trend_keys.get(panel_id)
         if pending_key is not None:

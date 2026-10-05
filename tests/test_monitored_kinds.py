@@ -433,3 +433,37 @@ def test_a_failing_field_backs_off():
     vi.fail_spectrum = False
     station.poll_monitored_arrays(now=1000.0)
     assert ("box", "spectrum") not in station._array_failures
+
+
+def test_a_field_failing_for_days_never_overflows_the_back_off():
+    vi = ArrayVI()
+    station = _station(vi)
+    station._array_failures[("box", "spectrum")] = 5000
+    station._array_last_read[("box", "spectrum")] = 0.0
+    station.poll_monitored_arrays(now=30.0)  # must not raise OverflowError
+    assert station._array_field_due(("box", "spectrum"), vi.spectrum, now=61.0)
+
+
+def test_one_budget_hungry_field_cannot_starve_the_others(monkeypatch):
+    from i2as.core import station as station_module
+
+    monkeypatch.setattr(station_module, "ARRAY_TICK_BUDGET_S", 0.01)
+    vi = SlowVI(delay_s=0.02)
+    station = _station(vi)
+    seen: set[str] = set()
+    for second in range(4):
+        seen |= set(station.poll_monitored_arrays(now=float(second)).get("box", {}))
+    assert seen == {"first", "second"}
+
+
+def test_a_failing_array_read_is_not_logged_by_the_vi_wrapper(caplog):
+    vi = ArrayVI()
+    vi.fail_spectrum = True
+    station = _station(vi)
+    with caplog.at_level("DEBUG"):
+        for second in range(3):
+            station.poll_monitored_arrays(now=float(second))
+    tracebacks = [r for r in caplog.records if r.exc_info]
+    assert tracebacks == []
+    failures = [r for r in caplog.records if "spectrum failed" in r.getMessage()]
+    assert len(failures) == 1

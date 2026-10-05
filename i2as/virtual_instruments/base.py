@@ -1319,7 +1319,12 @@ class BaseVirtualInstrument:
             or get_monitored_kind(method) not in ARRAY_KINDS
         ):
             raise ValueError(f"{type(self).__name__}.{name} is not an array @monitored field")
-        raw = method()
+        # Below the per-call logging wrapper: it logs every failure with a
+        # traceback, and an array field polled every second would flood the
+        # log. The Station's array poll logs a failing field once and backs
+        # it off instead.
+        func = getattr(method, "__func__", method)
+        raw = getattr(func, "__wrapped__", func)(self)
         if raw is None:
             return None
         value = np.array(raw, dtype=np.float64)
