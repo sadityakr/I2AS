@@ -72,6 +72,14 @@ from i2as.virtual_instruments.rampable import RampableVI
 
 logger = logging.getLogger(__name__)
 
+# The array poll's bounds (the monitored-kind standard; see
+# Station.poll_monitored_arrays). Display reads share the one hardware
+# thread with every safety read, so they get a small, fixed slice of it.
+ARRAY_TICK_BUDGET_S: float = 0.05
+ARRAY_READ_LIMIT_S: float = 0.5
+ARRAY_FAILURE_BACKOFF_AFTER: int = 3
+ARRAY_BACKOFF_MAX_S: float = 60.0
+
 #: The two connection-lifecycle operating-state methods (see
 #: ``BaseVirtualInstrument``'s "Connection-lifecycle standard"). They carry no
 #: ``@control`` — every VI inherits or defines them as plain methods — but they
@@ -263,6 +271,10 @@ class Station:
         # VI logs its error once rather than every period.
         self._array_last_read: dict[tuple[str, str], float] = {}
         self._array_faults_logged: set[tuple[str, str]] = set()
+        # Consecutive failures per field (drives the back-off) and the fields
+        # switched off for the session because one read took too long.
+        self._array_failures: dict[tuple[str, str], int] = {}
+        self._array_disabled: set[tuple[str, str]] = set()
         # Degraded-build support: VIs whose hardware failed to connect at
         # build time, plus the build recipes and live driver instances that
         # connect_instrument() needs to bring one back without a restart.
@@ -1183,23 +1195,31 @@ class Station:
         return full_state
 
     def poll_monitored_arrays(self, now: float | None = None) -> dict[str, dict]:
-        """Read every array @monitored field whose period has elapsed.
+        """Read every array @monitored field whose period has elapsed, within a time budget.
 
         The array half of the monitor cycle (the monitored-kind standard,
         ``core/decorators.py``): images and traces are read here, each on
-        its own declared ``period_s``, never in ``get_state()``. Called by
-        the Orchestrator on its tick, after the scalar poll, so a slow frame
-        read only ever delays the NEXT tick, never this tick's safety
-        readings.
+        its own declared ``period_s``, never in ``get_state()``. The
+        Orchestrator calls this LAST in its tick, after every safety action,
+        and only while idle.
 
-        An array read is display-only, so it never affects instrument
-        health: a VI the scalar poll currently reports stale or
-        disconnected is skipped (its scalar poll owns the fault and its
-        recovery), a communication error here is logged and skipped without
-        touching the error counters, any other failure — a value that breaks
-        its declared shape, an instrument refusing the read — is logged once
-        and dropped, and a field answering ``None`` ("no value yet") is
-        simply left out.
+        An array read is display only, so it is bounded and never affects
+        instrument health:
+
+        * **Time budget.** Once ``ARRAY_TICK_BUDGET_S`` of reading has been
+          spent this call, the remaining due fields wait for a later tick.
+        * **Slow fields are switched off.** A single read longer than
+          ``ARRAY_READ_LIMIT_S`` disables that field for the session, with
+          one ERROR — a preview that stalls the instrument thread is a VI
+          bug, not something to retry every period.
+        * **Failures back off.** A communication error or any other failure
+          (a value breaking its declared shape, an instrument refusing the
+          read) is logged once; after ``ARRAY_FAILURE_BACKOFF_AFTER``
+          consecutive failures the field's period doubles per failure, up to
+          ``ARRAY_BACKOFF_MAX_S``. Error counters and conditions are never
+          touched — the scalar poll owns instrument health.
+        * A VI the scalar poll reports stale or disconnected is skipped, and
+          a field answering ``None`` ("no value yet") is left out.
 
         Args:
             now: The current monotonic time in seconds; ``None`` reads
@@ -1212,35 +1232,94 @@ class Station:
         if now is None:
             now = time.monotonic()
         result: dict[str, dict] = {}
+        spent = 0.0
         for vi_name, vi in self._virtual_instruments.items():
             if self._error_counts.get(vi_name, 0):
                 continue
             for field_name in get_monitored_methods(vi, kinds=ARRAY_KINDS):
                 key = (vi_name, field_name)
-                period_s = get_monitored_period_s(getattr(vi, field_name)) or 0.0
-                last = self._array_last_read.get(key)
-                if last is not None and now - last < period_s:
+                if key in self._array_disabled:
                     continue
+                if not self._array_field_due(key, getattr(vi, field_name), now):
+                    continue
+                if spent >= ARRAY_TICK_BUDGET_S:
+                    return result  # due fields wait for the next tick
                 self._array_last_read[key] = now
-                self._polling_vi = vi_name
-                try:
-                    value = vi.read_monitored_array(field_name)
-                except I2ASCommunicationError as exc:
-                    logger.warning("Array read %s.%s failed: %s", vi_name, field_name, exc)
+                value, elapsed = self._read_array_field(vi_name, vi, field_name)
+                spent += elapsed
+                if elapsed > ARRAY_READ_LIMIT_S:
+                    self._array_disabled.add(key)
+                    logger.error(
+                        "Array field %s.%s took %.2f s to read (limit %.2f s) and is "
+                        "switched off for this session: a preview must not hold the "
+                        "instrument thread", vi_name, field_name, elapsed, ARRAY_READ_LIMIT_S,
+                    )
                     continue
-                except Exception as exc:  # display only: nothing may escape into the tick
-                    if key not in self._array_faults_logged:
-                        self._array_faults_logged.add(key)
-                        logger.error(
-                            "Array field %s.%s failed and is not shown: %s",
-                            vi_name, field_name, exc,
-                        )
-                    continue
-                finally:
-                    self._polling_vi = None
                 if value is not None:
                     result.setdefault(vi_name, {})[field_name] = value
         return result
+
+    def _array_field_due(self, key: tuple[str, str], method: Any, now: float) -> bool:
+        """Whether an array field's (backed-off) period has elapsed.
+
+        Args:
+            key: ``(vi_name, field_name)``.
+            method: The bound monitored method, for its declared period.
+            now: The current monotonic time.
+
+        Returns:
+            ``True`` when the field has never been read, or its period —
+            doubled per failure beyond the back-off threshold — has passed.
+        """
+        last = self._array_last_read.get(key)
+        if last is None:
+            return True
+        period_s = get_monitored_period_s(method) or 0.0
+        excess = self._array_failures.get(key, 0) - ARRAY_FAILURE_BACKOFF_AFTER + 1
+        if excess > 0:
+            period_s = min(period_s * 2.0**excess, max(period_s, ARRAY_BACKOFF_MAX_S))
+        return now - last >= period_s
+
+    def _read_array_field(
+        self, vi_name: str, vi: BaseVirtualInstrument, field_name: str
+    ) -> tuple[Any, float]:
+        """Read one array field, timing it and absorbing every failure.
+
+        Args:
+            vi_name: The VI's configured name.
+            vi: The VI.
+            field_name: The array field's name.
+
+        Returns:
+            ``(value, elapsed_s)`` — ``value`` is the array, or ``None`` when
+            the field had no value yet or the read failed.
+        """
+        key = (vi_name, field_name)
+        # Named as an array read, so a shutdown that times out on a wedged
+        # preview is never mistaken for a hung safety read.
+        self._polling_vi = f"{vi_name}.{field_name} (array read)"
+        started = time.perf_counter()
+        value = None
+        try:
+            value = vi.read_monitored_array(field_name)
+        except Exception as exc:  # display only: nothing may escape into the tick
+            self._array_failures[key] = self._array_failures.get(key, 0) + 1
+            if key not in self._array_faults_logged:
+                self._array_faults_logged.add(key)
+                level = (
+                    logging.WARNING if isinstance(exc, I2ASCommunicationError) else logging.ERROR
+                )
+                logger.log(
+                    level, "Array field %s.%s failed and is not shown: %s "
+                    "(further failures back off silently)", vi_name, field_name, exc,
+                )
+        else:
+            if self._array_failures.pop(key, None):
+                self._array_faults_logged.discard(key)
+                logger.info("Array field %s.%s reads again", vi_name, field_name)
+        finally:
+            self._polling_vi = None
+        return value, time.perf_counter() - started
 
     def polling_vi(self) -> str | None:
         """Return the VI whose read is in flight right now, or ``None``.

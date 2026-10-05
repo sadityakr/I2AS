@@ -62,7 +62,7 @@ from i2as.gui.theme import (
     TEXT_PRIMARY,
 )
 from i2as.gui.takeover_strip import TakeoverStrip
-from i2as.gui.trends_quadrant import TrendsQuadrant, array_fields_from_station_info
+from i2as.gui.trends_quadrant import PlotsQuadrant, array_fields_from_station_info
 from i2as.gui.widget_lifecycle import hold_window, release_window, retire_widget
 from i2as.session.manager import ExperimentManager
 from i2as.session.models import GUEST_USER_ID
@@ -494,7 +494,7 @@ class MonitorWindow(QMainWindow):
 
         # ── Fixed 2x2 quadrant grid (Page 1 — Monitor) ───────────────
         top_left = self._build_instruments_quadrant(measurement_vis)
-        self._trends = TrendsQuadrant(
+        self._trends = PlotsQuadrant(
             self._station,
             parent=self,
             array_fields=array_fields_from_station_info(self._mirror.station_info()),

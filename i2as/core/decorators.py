@@ -118,6 +118,13 @@ ARRAY_KINDS: frozenset[str] = frozenset(
 # time on the one hardware thread, and a live preview needs no more.
 DEFAULT_ARRAY_PERIOD_S: float = 1.0
 
+# The largest array a @monitored field may declare, in elements (a
+# 2048x2048 frame). Array values cross to the GUI and are held in memory in
+# the same process as the instrument thread, so their size is a declared,
+# bounded quantity — a larger image belongs in a measurement's image block,
+# written to disk, not in a live preview.
+MAX_ARRAY_ELEMENTS: int = 2048 * 2048
+
 
 def monitored(
     func: Callable | None = None,
@@ -258,6 +265,14 @@ def _check_kind_declaration(
             raise TypeError(f"@monitored shape= entries must be ints, got {size!r}")
         if size <= 0:
             raise ValueError(f"@monitored shape= entries must be > 0, got {size!r}")
+    elements = 1
+    for size in shape:
+        elements *= size
+    if elements > MAX_ARRAY_ELEMENTS:
+        raise ValueError(
+            f"@monitored shape={tuple(shape)!r} has {elements} elements, over the "
+            f"{MAX_ARRAY_ELEMENTS} a live field may declare"
+        )
 
     if period_s is None:
         period_s = DEFAULT_ARRAY_PERIOD_S

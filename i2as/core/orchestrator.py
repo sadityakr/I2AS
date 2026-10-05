@@ -3637,16 +3637,6 @@ class Orchestrator(QObject):
                     parts.append(f"{vi_name}: {kv}")
             logger.debug("Monitor: %s", " | ".join(parts))
 
-            # Array fields (images, traces — the monitored-kind standard):
-            # after the scalar poll, so a slow frame read never delays this
-            # tick's safety readings, and only while no procedure runs, so a
-            # live preview can never compete with a run for its instrument.
-            # The arrays are fresh copies the engine keeps no reference to.
-            if self._procedure is None and self._state == OrchestratorState.IDLE:
-                arrays = self._station.poll_monitored_arrays()
-                if arrays:
-                    self.monitored_arrays_updated.emit(arrays)
-
         # Operational-status record (runtime troubleshooting signal): assembled
         # from this tick's snapshot (empty while monitoring is off, which polls
         # nothing), emitted, and appended to the resolved log directory's
@@ -4015,6 +4005,36 @@ class Orchestrator(QObject):
         # A tick that changed state has already emitted one from
         # _change_state(); this is the quiet tick's.
         self._emit_status_snapshot()
+
+        # 7. Array fields (images, traces — the monitored-kind standard):
+        # display only, so LAST — after the safety check, the emergency
+        # decision, hold enforcement, stall detection and the state machine
+        # — and only if the station is still idle after all of that, so a
+        # live preview can never delay a safety action or compete with a run
+        # for its instrument. The Station bounds the read time per tick; a
+        # failure here is logged and never reaches the tick's error path.
+        self._publish_monitored_arrays()
+
+    def _publish_monitored_arrays(self) -> None:
+        """Read the due array fields and emit them, never letting a failure out.
+
+        Only while monitoring and IDLE with no procedure. The arrays are
+        fresh copies the engine keeps no reference to (the signal payload
+        rule).
+        """
+        if not (
+            self._monitoring
+            and self._procedure is None
+            and self._state == OrchestratorState.IDLE
+        ):
+            return
+        try:
+            arrays = self._station.poll_monitored_arrays()
+        except Exception:
+            logger.exception("monitored-array poll failed (non-fatal, display only)")
+            return
+        if arrays:
+            self.monitored_arrays_updated.emit(arrays)
 
     # ------------------------------------------------------------------
     # Failure handling

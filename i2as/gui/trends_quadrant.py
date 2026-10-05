@@ -15,10 +15,14 @@ waterfall   a 1-D trace stacked in time  ``monitored_arrays_updated`` ->
                                          ``ArrayHistory`` (RAM only)
 ==========  ===========================  ==================================
 
-Every panel follows one plot-panel protocol (see
-``gui/array_plot_panels.py``), so adding a kind is one ``_PANEL_KINDS``
-entry plus a panel class — the grid, the Add buttons, the panel cap and the
-persisted layout all work for it unchanged.
+The quadrant knows no kind by name: every panel follows the
+:class:`~i2as.gui.plot_panel.PlotPanel` protocol, and each kind's label,
+data kind, feed and factory come from :data:`~i2as.gui.plot_panel.PANEL_KINDS`
+— adding a kind changes nothing here (see ``gui/plot_panel.py``).
+
+``PlotsQuadrant`` was ``TrendsQuadrant`` when it hosted trends only; the old
+name stays as an alias, and the module, objectNames and QSettings key keep
+theirs so saved layouts and existing callers are untouched.
 """
 
 from __future__ import annotations
@@ -27,7 +31,6 @@ import json
 import logging
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,13 +49,12 @@ from i2as.core import trend_history
 from i2as.core.events import MonitoredInfo
 from i2as.core.paths import log_directory
 from i2as.gui import app_settings  # import the module (not the function) so tests can monkeypatch the factory
-from i2as.gui.array_plot_panels import ImagePlotPanel, WaterfallPlotPanel
 from i2as.gui.monitor_history import ArrayHistory, MonitorHistory
+from i2as.gui.plot_panel import PANEL_KINDS, PanelContext, PlotPanel
 from i2as.gui.theme import TEXT_PRIMARY
 
 if TYPE_CHECKING:  # the GUI holds a Station only as a type (contract C19)
     from i2as.core.station import Station
-from i2as.gui.trend_plot_panel import TrendPlotPanel
 
 logger = logging.getLogger(__name__)
 
@@ -72,31 +74,6 @@ _DEFAULT_TREND_KEY_HINTS = ("temperature",)
 # pre-extraction MonitorWindow key so existing saved layouts still restore
 # (an entry without a "kind" is a trend, which is all they ever held).
 _TRENDS_KEY = "MonitorWindow/trends"
-
-
-@dataclass(frozen=True)
-class _PanelKind:
-    """One entry of the panel-kind registry.
-
-    Attributes:
-        label: The Add button's caption.
-        icon: The Add button's qtawesome icon name.
-        data_kind: The ``MonitoredInfo.kind`` the panel draws. An array kind
-            no declared field has is not offered: its Add button is hidden.
-    """
-
-    label: str
-    icon: str
-    data_kind: str
-
-
-#: The panel kinds the quadrant can host, in button order. Keys are each
-#: panel class's ``kind`` and the ``"kind"`` of a persisted layout entry.
-_PANEL_KINDS: dict[str, _PanelKind] = {
-    "trend": _PanelKind("Trend", "fa5s.chart-line", "scalar"),
-    "image": _PanelKind("Image", "fa5s.image", "image"),
-    "waterfall": _PanelKind("Waterfall", "fa5s.water", "trace"),
-}
 
 
 def array_fields_from_station_info(station_info: Any) -> dict[str, MonitoredInfo]:
@@ -119,7 +96,7 @@ def array_fields_from_station_info(station_info: Any) -> dict[str, MonitoredInfo
     return fields
 
 
-class TrendsQuadrant(QWidget):
+class PlotsQuadrant(QWidget):
     """The Monitor's plot quadrant: an auto-gridded set of plot panels of any kind.
 
     Owns the shared :class:`MonitorHistory` (scalars, Qt-free by design, see
@@ -162,14 +139,21 @@ class TrendsQuadrant(QWidget):
         self._rehydrate_history()
         # Shared RAM-only history feeding the image and waterfall panels.
         self._array_history = ArrayHistory()
+        # What every panel factory gets (gui/plot_panel.py).
+        self._context = PanelContext(
+            history=self._history,
+            array_history=self._array_history,
+            array_fields=self._array_fields,
+            log_dir=Path(self._log_dir),
+            parent=self,
+        )
 
         # Every panel, of every kind, in grid order.
-        self._panels: dict[str, Any] = {}
-        self._trend_series_counter = 0
-        # Keys the restore path still wants applied once MonitorHistory has
-        # data for them (a fresh trend panel's Y combo is empty until the
-        # first states_updated tick, so set_selected_key() at restore time is
-        # a harmless no-op that we retry from on_states_updated).
+        self._panels: dict[str, PlotPanel] = {}
+        # Keys the restore path still wants applied once the panel offers
+        # them (a fresh trend panel's Y combo is empty until the first
+        # states_updated tick, so set_selected_key() at restore time is a
+        # harmless no-op that is retried on each refresh of its feed).
         self._pending_trend_keys: dict[str, str] = {}
         # Same retry pattern for the DEFAULT (non-restored) trend panels'
         # opportunistic default key selection.
@@ -184,7 +168,7 @@ class TrendsQuadrant(QWidget):
         toolbar.addStretch()
         toolbar.addWidget(QLabel("Add:"))
         self._add_buttons: dict[str, QPushButton] = {}
-        for kind, spec in _PANEL_KINDS.items():
+        for kind, spec in PANEL_KINDS.items():
             button = QPushButton(spec.label)
             button.setObjectName(f"add_{kind}_btn")
             button.setIcon(qta.icon(spec.icon, color=TEXT_PRIMARY))
@@ -221,7 +205,7 @@ class TrendsQuadrant(QWidget):
         """The shared ArrayHistory feeding the image and waterfall panels."""
         return self._array_history
 
-    def panels(self) -> dict[str, Any]:
+    def panels(self) -> dict[str, PlotPanel]:
         """Return ``{panel_id: panel}`` for every panel, in grid order."""
         return dict(self._panels)
 
@@ -268,13 +252,13 @@ class TrendsQuadrant(QWidget):
         """Whether a panel kind has anything to draw on this station.
 
         Args:
-            kind: A ``_PANEL_KINDS`` key.
+            kind: A ``PANEL_KINDS`` key.
 
         Returns:
-            ``True`` for a trend (every station has scalars) and for an
-            array kind at least one declared field has.
+            ``True`` for a scalar kind (every station has scalars) and for
+            an array kind at least one declared field has.
         """
-        data_kind = _PANEL_KINDS[kind].data_kind
+        data_kind = PANEL_KINDS[kind].data_kind
         if data_kind == "scalar":
             return True
         return any(info.kind == data_kind for info in self._array_fields.values())
@@ -290,7 +274,7 @@ class TrendsQuadrant(QWidget):
         """
         for panel_id in list(self._panels.keys()):
             self._remove_panel_widget(panel_id)
-        self._trend_series_counter = 0
+        self._context.series_counter = 0
         self._default_trend_key_hints.clear()
 
         for _ in range(_DEFAULT_TREND_PANEL_COUNT):
@@ -299,39 +283,27 @@ class TrendsQuadrant(QWidget):
         for panel_id, hint in zip(self._panels.keys(), _DEFAULT_TREND_KEY_HINTS):
             self._default_trend_key_hints[panel_id] = hint
 
-    def _create_panel(self, kind: str) -> tuple[str, Any]:
-        """Create and register a new panel of ``kind``.
+    def _create_panel(self, kind: str) -> tuple[str, PlotPanel]:
+        """Create and register a new panel of ``kind`` through its registry factory.
 
         Registers the panel in ``self._panels`` but does NOT place it in the
         grid — callers call ``_relayout_trend_grid()``.
 
         Args:
-            kind: A ``_PANEL_KINDS`` key.
+            kind: A ``PANEL_KINDS`` key.
 
         Returns:
             ``(panel_id, panel)`` for the caller.
-        """
-        panel_id = f"{kind}_{self._next_panel_index()}"
-        panel: Any
-        if kind == "trend":
-            panel = TrendPlotPanel(
-                self._history,
-                panel_id,
-                series_index=self._trend_series_counter,
-                parent=self,
-                log_dir=self._log_dir,
-            )
-            self._trend_series_counter += 1
-        elif kind == "image":
-            panel = ImagePlotPanel(self._array_history, panel_id, self._array_fields, parent=self)
-        elif kind == "waterfall":
-            panel = WaterfallPlotPanel(
-                self._array_history, panel_id, self._array_fields, parent=self
-            )
-        else:
-            raise ValueError(f"unknown plot panel kind {kind!r}")
-        panel.remove_requested.connect(self._on_remove_requested)
 
+        Raises:
+            ValueError: If ``kind`` is not registered.
+        """
+        spec = PANEL_KINDS.get(kind)
+        if spec is None:
+            raise ValueError(f"unknown plot panel kind {kind!r}")
+        panel_id = f"{kind}_{self._next_panel_index()}"
+        panel = spec.factory(self._context, panel_id)
+        panel.remove_requested.connect(self._on_remove_requested)
         self._panels[panel_id] = panel
         return panel_id, panel
 
@@ -358,7 +330,7 @@ class TrendsQuadrant(QWidget):
         """Create, place, and grid-arrange a new panel of ``kind``.
 
         Args:
-            kind: A ``_PANEL_KINDS`` key.
+            kind: A ``PANEL_KINDS`` key.
 
         Returns:
             The new panel's ``panel_id``.
@@ -366,8 +338,7 @@ class TrendsQuadrant(QWidget):
         panel_id, panel = self._create_panel(kind)
         self._relayout_trend_grid()
         self._update_add_buttons_state()
-        if kind != "trend":
-            panel.refresh()
+        self._refresh_panel(panel_id, panel)
         return panel_id
 
     def _next_panel_index(self) -> int:
@@ -394,7 +365,7 @@ class TrendsQuadrant(QWidget):
         """Add a panel of ``kind`` via its Add button, up to the cap.
 
         Args:
-            kind: A ``_PANEL_KINDS`` key.
+            kind: A ``PANEL_KINDS`` key.
         """
         if len(self._panels) >= _MAX_TREND_PANELS or not self._kind_available(kind):
             return
@@ -445,33 +416,16 @@ class TrendsQuadrant(QWidget):
     # ------------------------------------------------------------------
 
     def on_states_updated(self, state: dict) -> None:
-        """Record a state snapshot into MonitorHistory and refresh trend panels.
+        """Record a state snapshot into MonitorHistory and refresh the ``"states"``-fed panels.
 
         Args:
             state: ``{vi_name: {field: value, ...}}`` from the Orchestrator.
         """
         self._history.record(state)
-        for panel_id, panel in self._panels.items():
-            if panel.kind != "trend":
-                continue
-            panel.refresh()
-
-            pending_key = self._pending_trend_keys.get(panel_id)
-            if pending_key is not None:
-                panel.set_selected_key(pending_key)
-                if panel.selected_key() == pending_key:
-                    del self._pending_trend_keys[panel_id]
-                continue
-
-            hint = self._default_trend_key_hints.get(panel_id)
-            if hint is not None:
-                keys = self._history.keys()
-                if keys:
-                    panel.set_selected_key(self._pick_default_trend_key(hint, keys))
-                    del self._default_trend_key_hints[panel_id]
+        self._refresh_feed("states")
 
     def on_arrays_updated(self, arrays: dict) -> None:
-        """Record an array payload into ArrayHistory and refresh the array panels.
+        """Record an array payload into ArrayHistory and refresh the ``"arrays"``-fed panels.
 
         Args:
             arrays: ``{vi_name: {field: ndarray}}`` from the Orchestrator's
@@ -479,15 +433,46 @@ class TrendsQuadrant(QWidget):
                 tick.
         """
         self._array_history.record(arrays)
-        for panel in self._panels.values():
-            if panel.kind == "trend":
-                continue
-            try:
-                panel.refresh()
-            except Exception:
-                # A malformed array must cost one panel one redraw, never
-                # the Monitor window.
-                logger.exception("trends_quadrant: %s failed to redraw", panel.panel_id)
+        self._refresh_feed("arrays")
+
+    def _refresh_feed(self, feed: str) -> None:
+        """Refresh every panel whose kind is fed by ``feed``.
+
+        Args:
+            feed: ``"states"`` or ``"arrays"``.
+        """
+        for panel_id, panel in list(self._panels.items()):
+            if PANEL_KINDS[panel.kind].feed == feed:
+                self._refresh_panel(panel_id, panel)
+
+    def _refresh_panel(self, panel_id: str, panel: PlotPanel) -> None:
+        """Redraw one panel, then apply any key it was still waiting to offer.
+
+        A failing redraw costs that panel one redraw, never the Monitor.
+
+        Args:
+            panel_id: The panel's id.
+            panel: The panel.
+        """
+        try:
+            panel.refresh()
+        except Exception:
+            logger.exception("plots_quadrant: %s failed to redraw", panel_id)
+            return
+
+        pending_key = self._pending_trend_keys.get(panel_id)
+        if pending_key is not None:
+            panel.set_selected_key(pending_key)
+            if panel.selected_key() == pending_key:
+                del self._pending_trend_keys[panel_id]
+            return
+
+        hint = self._default_trend_key_hints.get(panel_id)
+        if hint is not None:
+            keys = self._history.keys()
+            if keys:
+                panel.set_selected_key(self._pick_default_trend_key(hint, keys))
+                del self._default_trend_key_hints[panel_id]
 
     def _pick_default_trend_key(self, hint: str, keys: list[str]) -> str:
         """Pick the best default trend key for a hint substring (e.g. "temperature").
@@ -560,7 +545,7 @@ class TrendsQuadrant(QWidget):
             entry
             for entry in entries
             if isinstance(entry, dict)
-            and entry.get("kind", "trend") in _PANEL_KINDS
+            and entry.get("kind", "trend") in PANEL_KINDS
             and self._kind_available(entry.get("kind", "trend"))
         ][:_MAX_TREND_PANELS]
         if not valid_entries:
@@ -574,8 +559,14 @@ class TrendsQuadrant(QWidget):
             kind = entry.get("kind", "trend")
             panel_id = self._add_panel(kind)
             panel = self._panels[panel_id]
-            panel.apply_settings_entry(entry)  # a trend key is a no-op now if history is empty
+            panel.apply_settings_entry(entry)
 
+            # A key the panel does not offer yet (a trend before the first
+            # tick) is retried on each refresh of its feed until it sticks.
             key = entry.get("key")
-            if kind == "trend" and isinstance(key, str) and key:
+            if isinstance(key, str) and key and panel.selected_key() != key:
                 self._pending_trend_keys[panel_id] = key
+
+
+#: The pre-kinds name, kept so existing callers and tests keep working.
+TrendsQuadrant = PlotsQuadrant

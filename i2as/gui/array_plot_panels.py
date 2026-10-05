@@ -194,11 +194,15 @@ class _ArrayPlotPanel(QGroupBox):
     # Internals
     # ------------------------------------------------------------------
 
+    def _on_field_selected(self, info: MonitoredInfo | None) -> None:
+        """React to a newly selected field before it is drawn (default: nothing)."""
+
     def _on_key_changed(self, key: str) -> None:
         info = self._fields.get(key)
         self._key_selector.setToolTip(info.description if info else "")
         if not self._fields:
             self._status.setText(f"No {self.data_kind} field is declared on this station.")
+        self._on_field_selected(info)
         self._view.clear()
         self._redraw()
 
@@ -228,11 +232,17 @@ class ImagePlotPanel(_ArrayPlotPanel):
 class WaterfallPlotPanel(_ArrayPlotPanel):
     """The recent values of one ``@monitored(kind="trace")`` field, stacked over time.
 
-    Rows are drawn evenly spaced between the oldest and newest trace in the
-    window — the traces arrive on the field's declared period, so the
-    spacing is close to uniform; the Y axis reads "seconds ago". The X axis
-    is the trace's declared physical axis when it has one, its sample index
-    otherwise.
+    The Y axis is real time, "seconds ago", newest at the top: the window is
+    cut into rows one declared period wide (more coarsely when the window
+    holds more periods than the history keeps traces), each trace lands in
+    the row of its timestamp, and a row no trace landed in — a run, during
+    which array fields are not polled, or a failing read — stays empty
+    (transparent), so a gap is shown as a gap. The X axis is the trace's
+    declared physical axis when it has one, its sample index otherwise, with
+    each pixel centred on its sample.
+
+    Only windows the history can fill are offered: at most
+    ``period_s x ArrayHistory.max_entries`` seconds.
     """
 
     kind: ClassVar[str] = "waterfall"
@@ -244,11 +254,21 @@ class WaterfallPlotPanel(_ArrayPlotPanel):
         self._window_selector = QComboBox()
         self._window_selector.setObjectName(f"waterfall_window_selector_{self._panel_id}")
         self._window_selector.setToolTip("How far back the waterfall reaches")
-        for label, _seconds in WATERFALL_WINDOWS:
-            self._window_selector.addItem(label)
-        self._window_selector.setCurrentText(_DEFAULT_WATERFALL_WINDOW)
         self._window_selector.currentTextChanged.connect(lambda _text: self._redraw())
         row.addWidget(self._window_selector)
+
+    def _on_field_selected(self, info: MonitoredInfo | None) -> None:
+        """Offer the windows this field's history can fill, keeping a still-valid choice."""
+        reach = (info.period_s or 1.0) * self._history.max_entries if info else 0.0
+        offered = [label for label, seconds in WATERFALL_WINDOWS if seconds <= reach]
+        if not offered:
+            offered = [WATERFALL_WINDOWS[0][0]]
+        previous = self._window_selector.currentText() or _DEFAULT_WATERFALL_WINDOW
+        self._window_selector.blockSignals(True)
+        self._window_selector.clear()
+        self._window_selector.addItems(offered)
+        self._window_selector.setCurrentText(previous if previous in offered else offered[-1])
+        self._window_selector.blockSignals(False)
 
     def selected_window_s(self) -> float:
         """Return the selected window in seconds."""
@@ -261,16 +281,16 @@ class WaterfallPlotPanel(_ArrayPlotPanel):
         return entry
 
     def apply_settings_entry(self, entry: Mapping[str, Any]) -> None:
-        """Restore the key and the window from a persisted entry.
+        """Restore the key, then the window (which the key's period bounds).
 
         Args:
             entry: A dict as produced by ``settings_entry()``.
         """
+        super().apply_settings_entry(entry)
         window_s = entry.get("window_s")
         for label, seconds in WATERFALL_WINDOWS:
-            if seconds == window_s:
+            if seconds == window_s and self._window_selector.findText(label) >= 0:
                 self._window_selector.setCurrentText(label)
-        super().apply_settings_entry(entry)
 
     def _redraw(self) -> None:
         key = self.selected_key()
@@ -279,25 +299,68 @@ class WaterfallPlotPanel(_ArrayPlotPanel):
         info = self._fields[key]
         x_label = "sample"
         if info.axis is not None:
-            x_label = f"{info.axis[2]}" if info.axis[2] else "x"
+            x_label = info.axis[2] or "x"
         self._view.set_labels(x_label, "seconds ago", info.unit)
 
         now = time.time()
-        entries = self._history.window(key, self.selected_window_s(), now=now)
+        window_s = self.selected_window_s()
+        entries = self._history.window(key, window_s, now=now)
         if not entries:
+            self._view.clear()
             self._status.setText("Waiting for the first trace…")
             return
-        stack = np.vstack([np.asarray(trace, dtype=np.float64) for _t, trace in entries])
-        length = stack.shape[1]
-        if info.axis is not None:
-            x0, x1 = info.axis[0], info.axis[1]
-        else:
-            x0, x1 = 0.0, float(length - 1)
-        oldest_age = now - entries[0][0]
-        newest_age = now - entries[-1][0]
-        height = max(oldest_age - newest_age, 1e-6)
-        # One row per trace, oldest at the bottom: y runs from -oldest_age
-        # up to -newest_age, so "seconds ago" reads as a negative offset.
-        width = (x1 - x0) if x1 != x0 else float(length)
-        self._view.set_frame(stack, rect=(x0, -oldest_age, width, height))
-        self._status.setText(f"{len(entries)} trace(s), newest {newest_age:.0f} s ago")
+        stack, rect = waterfall_image(
+            entries, now=now, window_s=window_s,
+            period_s=info.period_s or 1.0,
+            max_rows=self._history.max_entries,
+            axis=info.axis,
+        )
+        self._view.set_frame(stack, rect=rect)
+        self._status.setText(
+            f"{len(entries)} trace(s), newest {now - entries[-1][0]:.0f} s ago"
+        )
+
+
+def waterfall_image(
+    entries: list[tuple[float, Any]],
+    *,
+    now: float,
+    window_s: float,
+    period_s: float,
+    max_rows: int,
+    axis: tuple[float, float, str] | None,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Bin traces onto a real-time grid for a waterfall.
+
+    Args:
+        entries: ``(timestamp, trace)`` pairs, oldest first, all 1-D of one
+            length.
+        now: The time the Y axis's 0 stands for.
+        window_s: How far back the grid reaches.
+        period_s: The field's declared period — the natural row height.
+        max_rows: The most rows to draw; the row height grows to fit.
+        axis: The trace's declared ``(start, stop, unit)`` x axis, or
+            ``None`` for the sample index.
+
+    Returns:
+        ``(image, rect)``: the ``(rows, length)`` array, oldest row first,
+        NaN where no trace landed (drawn transparent); and the ``(x, y,
+        width, height)`` it spans in data units — pixels centred on their
+        sample values, Y from ``-window_s`` to ``0``.
+    """
+    length = int(np.asarray(entries[-1][1]).shape[0])
+    rows = max(1, min(max_rows, int(np.ceil(window_s / max(period_s, 1e-9)))))
+    row_s = window_s / rows
+    image = np.full((rows, length), np.nan)
+    start = now - window_s
+    for timestamp, trace in entries:
+        row = min(rows - 1, max(0, int((timestamp - start) // row_s)))
+        image[row] = np.asarray(trace, dtype=np.float64)
+
+    if axis is not None and length > 1:
+        x0, x1 = float(axis[0]), float(axis[1])
+        dx = (x1 - x0) / (length - 1)
+    else:
+        x0, dx = (float(axis[0]) if axis is not None else 0.0), 1.0
+    rect = (x0 - dx / 2.0, -window_s, dx * length, window_s)
+    return image, rect

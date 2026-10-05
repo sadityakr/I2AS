@@ -100,7 +100,8 @@ class ImageView(QWidget):
         if rect is not None:
             self._image.setRect(*rect)
         else:
-            self._image.setRect(0.0, 0.0, float(array.shape[1]), float(array.shape[0]))
+            # Pixel (r, c) centred on (c, r): pixel indices read as axis values.
+            self._image.setRect(-0.5, -0.5, float(array.shape[1]), float(array.shape[0]))
 
     def clear(self) -> None:
         """Remove the frame (the axes and colour bar stay)."""

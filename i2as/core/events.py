@@ -791,6 +791,13 @@ def _checked_strings(owner: str, **values: Any) -> None:
             raise TypeError(f"{owner}.{name} must be a str, got {value!r}")
 
 
+#: The value kinds a ``MonitoredInfo`` may carry — the same set as
+#: ``decorators.MONITORED_KINDS``, repeated here because this contract module
+#: imports nothing from the decorators; ``tests/test_conformance.py`` asserts
+#: the two agree.
+MONITORED_INFO_KINDS: tuple[str, ...] = ("scalar", "image", "trace")
+
+
 @dataclass(frozen=True)
 class MonitoredInfo(_ContractMessage):
     """One ``@monitored`` reading of one instrument, as declared.
@@ -847,13 +854,25 @@ class MonitoredInfo(_ContractMessage):
         )
         if not self.name:
             raise ValueError("MonitoredInfo.name must be a non-empty str")
+        if self.kind not in MONITORED_INFO_KINDS:
+            raise ValueError(
+                f"MonitoredInfo.kind must be one of {MONITORED_INFO_KINDS}, got {self.kind!r}"
+            )
         # A JSON round trip hands tuples back as lists.
         if not isinstance(self.shape, (tuple, list)) or not all(
-            isinstance(size, int) for size in self.shape
+            isinstance(size, int) and not isinstance(size, bool) for size in self.shape
         ):
             raise TypeError(f"MonitoredInfo.shape must be a tuple of ints, got {self.shape!r}")
         object.__setattr__(self, "shape", tuple(self.shape))
+        if self.period_s is not None:
+            if not isinstance(self.period_s, (int, float)) or isinstance(self.period_s, bool):
+                raise TypeError(f"MonitoredInfo.period_s must be a number, got {self.period_s!r}")
+            object.__setattr__(self, "period_s", float(self.period_s))
         if self.axis is not None:
+            if not isinstance(self.axis, (tuple, list)) or len(self.axis) != 3:
+                raise TypeError(
+                    f"MonitoredInfo.axis must be (start, stop, unit), got {self.axis!r}"
+                )
             start, stop, axis_unit = self.axis
             object.__setattr__(self, "axis", (float(start), float(stop), str(axis_unit)))
 

@@ -12,7 +12,7 @@ from PyQt6.QtCore import QSettings
 
 from i2as.core.events import InstrumentInfo, MonitoredInfo, StationInfo
 from i2as.core.station import build_station
-from i2as.gui.array_plot_panels import ImagePlotPanel, WaterfallPlotPanel
+from i2as.gui.array_plot_panels import ImagePlotPanel, WaterfallPlotPanel, waterfall_image
 from i2as.gui.live_plot_panel import LivePlotPanel
 from i2as.gui.monitor_history import ArrayHistory
 from i2as.gui.trends_quadrant import TrendsQuadrant, array_fields_from_station_info
@@ -51,7 +51,55 @@ def settings_file(tmp_path, monkeypatch):
 # ----------------------------------------------------------------------
 
 
+class TestWaterfallImage:
+    def test_a_gap_stays_empty_and_rows_are_one_period(self):
+        now = 100.0
+        entries = [(40.0, np.zeros(5)), (41.0, np.ones(5)), (99.0, np.full(5, 2.0))]
+        image, rect = waterfall_image(
+            entries, now=now, window_s=60.0, period_s=1.0, max_rows=600, axis=None
+        )
+        assert image.shape == (60, 5)
+        assert image[0, 0] == 0.0 and image[1, 0] == 1.0 and image[59, 0] == 2.0
+        assert np.isnan(image[2:59]).all()  # the run in between is a visible gap
+        assert rect == (-0.5, -60.0, 5.0, 60.0)
+
+    def test_pixels_are_centred_on_the_declared_axis(self):
+        _image, rect = waterfall_image(
+            [(0.0, np.zeros(5))], now=1.0, window_s=60.0, period_s=1.0,
+            max_rows=600, axis=(400.0, 800.0, "nm"),
+        )
+        x, _y, width, _height = rect
+        assert x == pytest.approx(350.0)  # 400 - dx/2, dx = 100
+        assert width == pytest.approx(500.0)
+
+    def test_rows_coarsen_to_the_history_cap(self):
+        image, _rect = waterfall_image(
+            [(0.0, np.zeros(3))], now=1.0, window_s=3600.0, period_s=1.0,
+            max_rows=600, axis=None,
+        )
+        assert image.shape == (600, 3)
+
+
 class TestArrayHistory:
+    def test_an_image_keeps_its_newest_frame_only(self):
+        history = ArrayHistory()
+        for t in range(5):
+            history.record({"camera": {"last_frame": np.full((4, 4), float(t))}}, timestamp=t)
+        entries = history.window("camera_last_frame", 100.0, now=5.0)
+        assert len(entries) == 1 and entries[0][1][0, 0] == 4.0
+        assert history.nbytes == 4 * 4 * 8
+
+    def test_a_byte_budget_evicts_the_oldest_trace_rows_across_keys(self):
+        row = np.zeros(100)  # 800 bytes
+        history = ArrayHistory(max_entries=600, max_bytes=8 * 800)
+        for t in range(10):
+            history.record({"a": {"x": row.copy()}, "b": {"y": row.copy()}}, timestamp=float(t))
+        assert history.nbytes <= 8 * 800
+        a = history.window("a_x", 100.0, now=10.0)
+        b = history.window("b_y", 100.0, now=10.0)
+        assert a[-1][0] == 9.0 and b[-1][0] == 9.0  # the newest always survive
+        assert len(a) + len(b) == 8
+
     def test_keys_are_flattened_like_the_scalar_history(self):
         history = ArrayHistory()
         history.record({"camera": {"last_frame": np.zeros((2, 2))}}, timestamp=1.0)
@@ -124,7 +172,7 @@ class TestImagePlotPanel:
 
 
 class TestWaterfallPlotPanel:
-    def test_stacks_the_traces_of_the_window_oldest_first(self, qtbot):
+    def test_traces_land_on_the_real_time_axis_newest_last(self, qtbot):
         history = ArrayHistory()
         now = time.time()
         for age, level in ((30.0, 0.0), (20.0, 1.0), (10.0, 2.0)):
@@ -134,8 +182,16 @@ class TestWaterfallPlotPanel:
         panel.refresh()
 
         stack = panel._view.frame()
-        assert stack.shape == (3, 5)
-        np.testing.assert_array_equal(stack[:, 0], [0.0, 1.0, 2.0])
+        assert stack.shape[1] == 5
+        filled = stack[~np.isnan(stack[:, 0]), 0]
+        np.testing.assert_array_equal(filled, [0.0, 1.0, 2.0])
+
+    def test_windows_are_limited_to_what_the_history_can_hold(self, qtbot):
+        panel = WaterfallPlotPanel(ArrayHistory(max_entries=120), "waterfall_0", FIELDS)
+        qtbot.addWidget(panel)
+        # period 1 s x 120 traces = 2 min: only "1 min" can be filled.
+        items = [panel._window_selector.itemText(i) for i in range(panel._window_selector.count())]
+        assert items == ["1 min"]
 
     def test_settings_entry_carries_the_window(self, qtbot):
         panel = WaterfallPlotPanel(ArrayHistory(), "waterfall_0", FIELDS)
@@ -144,6 +200,9 @@ class TestWaterfallPlotPanel:
         assert panel.settings_entry() == {
             "kind": "waterfall", "key": "spec_spectrum", "window_s": 60.0,
         }
+        # A window the history cannot fill is not restored.
+        panel.apply_settings_entry({"kind": "waterfall", "key": "spec_spectrum", "window_s": 3600.0})
+        assert panel.selected_window_s() == 60.0
 
 
 # ----------------------------------------------------------------------
@@ -276,3 +335,16 @@ class TestLivePlotPanelKinds:
         panel.redraw([{"frame": np.zeros((2, 2))}])
         panel.clear()
         assert panel._image_view.frame() is None
+
+
+def test_every_registered_kind_builds_a_protocol_panel(qtbot, station, tmp_path):
+    """The registry is the extension point: each entry's factory yields a PlotPanel."""
+    from i2as.gui.plot_panel import PANEL_KINDS, PlotPanel
+
+    quadrant = TrendsQuadrant(station, log_dir=tmp_path, array_fields=FIELDS)
+    qtbot.addWidget(quadrant)
+    for kind in PANEL_KINDS:
+        panel_id, panel = quadrant._create_panel(kind)
+        assert isinstance(panel, PlotPanel)
+        assert panel.kind == kind and panel.panel_id == panel_id
+        assert panel.settings_entry()["kind"] == kind

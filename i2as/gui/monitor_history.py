@@ -207,22 +207,45 @@ class ArrayHistory:
     ``core/decorators.py``). Keys are flattened the same way —
     ``{vi_name}_{field_name}`` — so a panel names an image or a trace exactly
     as a trend panel names a scalar. RAM only, by design: nothing here is
-    persisted, and each key keeps only its newest ``max_entries`` arrays,
-    so memory stays bounded however long the window is open (a 128x128
-    float64 frame is 128 KiB; a trace a few KiB).
+    persisted.
+
+    Memory is bounded twice, because this history lives in the same process
+    as the instrument thread and an out-of-memory kill would take the
+    instrument control with it:
+
+    * an **image** (a 2-D value) keeps its newest frame only — the image
+      panel draws nothing else;
+    * a **trace** (a 1-D value) keeps up to ``max_entries`` rows for the
+      waterfall, and all keys together stay under ``max_bytes``: the oldest
+      trace rows across keys are evicted first.
 
     Qt-free, like ``MonitorHistory``.
 
     Args:
-        max_entries: How many arrays each key keeps, newest last. A
-            waterfall can show at most this many rows.
+        max_entries: How many traces each key keeps, newest last — the most
+            rows a waterfall can show.
+        max_bytes: Budget for every stored array together, in bytes.
     """
 
-    def __init__(self, max_entries: int = 600) -> None:
+    def __init__(self, max_entries: int = 600, max_bytes: int = 64 * 1024 * 1024) -> None:
         if max_entries < 1:
             raise ValueError(f"max_entries must be >= 1, got {max_entries!r}")
+        if max_bytes < 1:
+            raise ValueError(f"max_bytes must be >= 1, got {max_bytes!r}")
         self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._bytes = 0
         self._history: dict[str, deque[tuple[float, object]]] = {}
+
+    @property
+    def max_entries(self) -> int:
+        """How many traces each key keeps."""
+        return self._max_entries
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes held by every stored array together."""
+        return self._bytes
 
     def record(self, arrays: dict[str, dict[str, object]], timestamp: float | None = None) -> None:
         """Append one ``monitored_arrays_updated`` payload.
@@ -240,9 +263,30 @@ class ArrayHistory:
                 key = f"{vi_name}_{field_name}"
                 buffer = self._history.get(key)
                 if buffer is None:
-                    buffer = deque(maxlen=self._max_entries)
+                    buffer = deque()
                     self._history[key] = buffer
+                cap = 1 if getattr(value, "ndim", 1) >= 2 else self._max_entries
                 buffer.append((timestamp, value))
+                self._bytes += _nbytes(value)
+                while len(buffer) > cap:
+                    self._bytes -= _nbytes(buffer.popleft()[1])
+        self._enforce_byte_budget()
+
+    def _enforce_byte_budget(self) -> None:
+        """Evict the oldest stored arrays, across keys, until under ``max_bytes``.
+
+        Each key keeps at least its newest entry, so an image panel always
+        has its frame; only history (older trace rows) is given up.
+        """
+        while self._bytes > self._max_bytes:
+            oldest_key = None
+            oldest_time = None
+            for key, buffer in self._history.items():
+                if len(buffer) > 1 and (oldest_time is None or buffer[0][0] < oldest_time):
+                    oldest_key, oldest_time = key, buffer[0][0]
+            if oldest_key is None:
+                return  # only newest entries left — the per-field cap bounds them
+            self._bytes -= _nbytes(self._history[oldest_key].popleft()[1])
 
     def keys(self) -> list[str]:
         """Return every key recorded so far, sorted."""
@@ -270,3 +314,8 @@ class ArrayHistory:
             now = time.time()
         cutoff = now - window_s
         return [entry for entry in self._history.get(key, ()) if entry[0] >= cutoff]
+
+
+def _nbytes(value: object) -> int:
+    """Return an array's size in bytes (0 for anything without ``nbytes``)."""
+    return int(getattr(value, "nbytes", 0))

@@ -290,3 +290,146 @@ def test_orchestrator_emits_arrays_only_when_idle(qtbot):
     orchestrator._state = OrchestratorState.MEASURING
     orchestrator._tick_body()
     assert received == []
+
+
+# ----------------------------------------------------------------------
+# Audit follow-ups: ordering, bounds, back-off, diagnostics
+# ----------------------------------------------------------------------
+
+
+def test_the_declared_size_is_capped():
+    from i2as.core.decorators import MAX_ARRAY_ELEMENTS
+
+    with pytest.raises(ValueError, match="elements"):
+        monitored(unit="", description="x", kind="image", shape=(MAX_ARRAY_ELEMENTS, 2))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "x", "kind": "movie"},
+        {"name": "x", "kind": "trace", "axis": [1, 2]},
+        {"name": "x", "kind": "trace", "period_s": "1"},
+    ],
+)
+def test_monitored_info_refuses_a_malformed_declaration(payload):
+    with pytest.raises((TypeError, ValueError)):
+        MonitoredInfo.from_json(payload)
+
+
+def test_the_array_poll_runs_after_the_safety_check(qtbot, monkeypatch):
+    from i2as.core.orchestrator import Orchestrator
+
+    order: list[str] = []
+    station = _station(ArrayVI())
+    real_check = station.check_safety
+    real_poll = station.poll_monitored_arrays
+
+    def check(*args, **kwargs):
+        order.append("safety")
+        return real_check(*args, **kwargs)
+
+    def poll(*args, **kwargs):
+        order.append("arrays")
+        return real_poll(*args, **kwargs)
+
+    monkeypatch.setattr(station, "check_safety", check)
+    monkeypatch.setattr(station, "poll_monitored_arrays", poll)
+    orchestrator = Orchestrator(station)
+    orchestrator._monitoring = True
+    orchestrator._tick_body()
+    assert order == ["safety", "arrays"]
+
+
+@pytest.mark.parametrize("state_name", ["ERROR", "EMERGENCY", "PAUSED", "RAMPING"])
+def test_no_array_poll_outside_idle(qtbot, monkeypatch, state_name):
+    from i2as.core.orchestrator import Orchestrator, OrchestratorState
+
+    station = _station(ArrayVI())
+    calls: list[int] = []
+    monkeypatch.setattr(station, "poll_monitored_arrays", lambda *a, **k: calls.append(1) or {})
+    orchestrator = Orchestrator(station)
+    orchestrator._monitoring = True
+    orchestrator._state = OrchestratorState[state_name]
+    orchestrator._publish_monitored_arrays()
+    assert calls == []
+
+
+def test_a_failing_array_poll_never_reaches_the_tick(qtbot, monkeypatch):
+    from i2as.core.orchestrator import Orchestrator, OrchestratorState
+
+    station = _station(ArrayVI())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("preview exploded")
+
+    monkeypatch.setattr(station, "poll_monitored_arrays", boom)
+    orchestrator = Orchestrator(station)
+    orchestrator._monitoring = True
+    orchestrator._tick_body()
+    assert orchestrator._state == OrchestratorState.IDLE
+
+
+class SlowVI(BaseVirtualInstrument):
+    """Two traces that each take a measurable time to read."""
+
+    vi_type = "mock"
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__({})
+        self.delay_s = delay_s
+        self.polling_seen: list[str | None] = []
+        self.station: Station | None = None
+
+    @monitored(unit="", description="a", kind="trace", shape=(2,))
+    def first(self):
+        if self.station is not None:
+            self.polling_seen.append(self.station.polling_vi())
+        time.sleep(self.delay_s)
+        return [0.0, 1.0]
+
+    @monitored(unit="", description="b", kind="trace", shape=(2,))
+    def second(self):
+        time.sleep(self.delay_s)
+        return [0.0, 1.0]
+
+
+def test_the_per_tick_budget_defers_the_rest(monkeypatch):
+    from i2as.core import station as station_module
+
+    monkeypatch.setattr(station_module, "ARRAY_TICK_BUDGET_S", 0.01)
+    station = _station(SlowVI(delay_s=0.02))
+    assert set(station.poll_monitored_arrays(now=0.0)["box"]) == {"first"}
+    assert set(station.poll_monitored_arrays(now=0.0)["box"]) == {"second"}
+
+
+def test_a_field_slower_than_the_limit_is_switched_off(monkeypatch):
+    from i2as.core import station as station_module
+
+    monkeypatch.setattr(station_module, "ARRAY_READ_LIMIT_S", 0.005)
+    station = _station(SlowVI(delay_s=0.02))
+    assert station.poll_monitored_arrays(now=0.0) == {}
+    assert station.poll_monitored_arrays(now=100.0) == {}
+    assert station._array_disabled == {("box", "first"), ("box", "second")}
+
+
+def test_the_shutdown_diagnostic_names_an_array_read():
+    vi = SlowVI(delay_s=0.0)
+    station = _station(vi)
+    vi.station = station
+    station.poll_monitored_arrays(now=0.0)
+    assert vi.polling_seen == ["box.first (array read)"]
+    assert station.polling_vi() is None
+
+
+def test_a_failing_field_backs_off():
+    vi = ArrayVI()
+    vi.fail_spectrum = True
+    station = _station(vi)
+    for second in range(0, 40):
+        station.poll_monitored_arrays(now=float(second))
+    # 1 s period: reads at 0, 1, 2 (three failures), then 4 s, 8 s, 16 s, ... apart.
+    assert vi.reads["spectrum"] < 10
+    vi.fail_spectrum = False
+    station.poll_monitored_arrays(now=1000.0)
+    assert ("box", "spectrum") not in station._array_failures

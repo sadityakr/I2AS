@@ -326,10 +326,10 @@ MANIFEST_SCHEMA: dict[str, Any] = {
         "monitored": {
             "type": "object",
             "description": "One @monitored reading.",
-            "required": [
-                "name", "unit", "description", "group", "returns",
-                "kind", "shape", "period_s", "axis",
-            ],
+            # kind/shape/period_s/axis are additive (the monitored-kind
+            # standard): optional, so the schema id stays /1 and a /1
+            # consumer that never heard of them is unaffected.
+            "required": ["name", "unit", "description", "group", "returns"],
             "additionalProperties": False,
             "properties": {
                 "name": {"type": "string"},

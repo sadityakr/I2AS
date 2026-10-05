@@ -424,7 +424,7 @@ class LivePlotPanel(QGroupBox):
             return
         try:
             frame = select_frame(np.asarray(raw, dtype=np.float64), i1, i2)
-        except (IndexError, ValueError):
+        except (IndexError, ValueError, TypeError):
             logger.debug("LivePlotPanel: no frame for %r at loop (%d, %d)", block, i1, i2)
             self._image_view.clear()
             return

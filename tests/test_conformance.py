@@ -4893,3 +4893,11 @@ def test_console_scripts_name_callable_entry_points() -> None:
             )
         ]
         assert required == [], f"{command} -> {target} needs {required}"
+
+
+def test_monitored_kinds_agree_between_declaration_and_contract() -> None:
+    """The decorator's kinds and the contract's kinds are one set (the monitored-kind standard)."""
+    from i2as.core.decorators import MONITORED_KINDS
+    from i2as.core.events import MONITORED_INFO_KINDS
+
+    assert set(MONITORED_KINDS) == set(MONITORED_INFO_KINDS)
