@@ -101,3 +101,28 @@ README "Where data lives" (operator now makes two choices: session folder, optio
 2. Gateway agent connections during a session switch: per-request feed resolution vs. disconnect.
 3. Should an agent be able to set the subfolder (proposed: no)?
 4. Subfolder depth limit (proposed 3) and name rule.
+
+## 8. Audit (senior lab-software review) and revised design
+
+Verdict: **approve with changes** — §3 sound with the numbering/validation changes;
+§4 not as written. Both blockers verified in the code before revising.
+
+| # | Finding | Revision (supersedes §3–§4 where they differ) |
+|---|---|---|
+| B1 | Busy check on the lagging GUI mirror; a `run_procedure` posted just before the switch still starts with the old folder and its manifest is filed into whatever `self._experiment` is by then; the engine's own `_procedure_queue` is invisible to the session layer | (a) **Engine-verified release**: new engine command `release_run_folder()` answering by verdict — OK only when IDLE (or ERROR with no run), no procedure, `_procedure_queue` empty; it then clears the run folder atomically on the engine thread. The session layer re-roots **only after** that verdict is OK, and holds a *switching* flag meanwhile that refuses new runs from the GUI queue/gateway. (b) **Runs filed by folder, not by "current"**: the run-started manifest carries `experiment_dir` (the folder the engine placed it under); `_on_run_started`/`_on_run_finished`/`_on_engine_event` resolve the record by that folder (current experiment if it matches, otherwise load-mutate-save that record by path) — also fixes today's unguarded `switch_experiment`. |
+| B2 | Run ids re-issued after the highest file is deleted/moved; directories counted; recursive scan on the instrument thread | **Monotonic number source**: session pushes `run_number_floor` = highest number in the experiment record + 1 with the folder; engine issues `max(floor, last_issued + 1, flat scan of the TARGET folder (files only))` and remembers `last_issued`. No recursive scan on the instrument thread. |
+| M3 | ELN worker reads the live store and files by bare id | Capture the store (session root) when a drain is queued, carry it to `_drained`; outbox caches keyed by `(root, experiment_id)`; switch waits for an in-flight drain only. |
+| M4 | Agent feeds never detached; gateway connections bound to a feed at admission | `AgentFeed.detach()`; `ExperimentFeeds.reset()` on session **and** experiment switch; agent gateway connections are closed with a "session changed" error on a session switch. |
+| M5 | No rollback; no session-folder lock | Validate/load the target session and its active record **before** tearing down; write registry, then swap; restore on error. A `session.lock` (pid + host + time) is taken by the running app; a live switch refuses a folder locked by another live process. With the lock + released engine, a `running` run in the adopted session is stale and is marked failed (crash recovery applies on adoption too). |
+| M6 | Subfolder rule must live in core; validate on load | `normalize_run_subfolder()` lives in `core/run_naming`; `set_run_folder` refuses a bad value by verdict; engine containment check before `_start_run`'s try; on load an invalid stored value falls back to `""` with a warning. |
+| minor | Plan wrong about code: tool is `read_experiment`, command schema comes from method signature/docstring, queued specs carry no experiment context | Adjusted: `read_experiment` reports `run_folder`; `set_run_folder` docstring documents `subfolder`; queue is **parked**, not refused (see Q1). |
+| minor | Unlisted consumers | `AnalysisRunner._select` keyed by (root, id); `SessionStore` rebinds to the logged-in user's registry on login; docstring/tooltip "next launch" updated. Long-lived `i2as-ctl` clients keep their store (documented). |
+| minor | Windows paths | Subfolder rule: ≤ 3 levels, each part `[A-Za-z0-9][A-Za-z0-9._ -]{0,63}`, no trailing `.`/space, no reserved device names (CON, NUL, COMn, LPTn…), no comma; engine refuses a total run-file path over 240 chars and a target that resolves outside `data/` (junction/symlink). |
+| minor | Back-compat | `run_subfolder` additive; `SCHEMA_VERSION` **not** bumped. |
+| nit | `ProcedureWindow.reset_session()` exists | Reused. |
+
+**Open questions, decided:**
+1. Queue at switch: **park** — it is already saved with the old experiment's record/GUI state, so clear the live queue and it returns when that experiment is reopened; refuse only while the queue is draining or the engine queue is non-empty.
+2. Agent connections: **disconnect** on session switch (and reset feeds on experiment switch).
+3. Agents setting the subfolder: **no**; `set_run_folder` stays an ENVELOPE-class action; agents read it via `read_experiment`.
+4. Depth 3 and the name rule above.
