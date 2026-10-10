@@ -1,6 +1,6 @@
 # Plan: run the instruments in their own process (engine process)
 
-Status: **plan, revision 4 (after audit round 3).** Nothing here is
+Status: **plan, revision 5, signed off by the audit (round 4).** Nothing here is
 implemented. §11 records the audit findings and where each one lands.
 
 ## 1. Problem
@@ -155,7 +155,10 @@ procedures would break any snapshot. Instead:
     * the Station's declaration readers;
     * a VI wrapper that allows plain attributes plus a declared set of
       declaration methods (`data_arrays`, `raw_block_row_counts`,
-      `quantity_columns`, …);
+      `quantity_columns`, …) and declared properties
+      (`active_measurement_parameters`, `reading_parameters`,
+      `configured_externally`, `base.py:2008-2075`). A property can do I/O,
+      so properties count as callables;
     * every other callable is **denied by default**. Undecorated methods such as
       `magnet_field_T()` can do driver I/O (`procedures/field_sweep.py:135`), so
       denying decorated methods alone is not enough. A denied call becomes a
@@ -163,6 +166,9 @@ procedures would break any snapshot. Instead:
   * The instrument thread publishes an **immutable registry snapshot** on every
     rebuild. Validation reads that snapshot, never the live registry that
     `connect_instrument` mutates.
+  * Validation does not wait behind a normal `measure()`. A GIL-holding driver
+    call also starves the engine's main thread, so the GUI shows "validating…"
+    and the deferred answer has a timeout ("engine busy, try again").
   * The parity test below shows every catalog procedure builds through the
     allow-list. No catalog procedure uses `isinstance` on a VI, and a
     conformance check keeps it that way.
@@ -212,8 +218,12 @@ head** and answers every claim exactly once.
     * The engine writes and fsyncs `spec_id` **at `Claimed`, before the
       build**, and appends the outcome (`started`, `failed:<stage>`, `done`)
       once known.
-    * It refuses any `spec_id` already in the ledger.
-    * Manifests only cross-check it. Entries older than 30 days are pruned.
+    * It refuses any `spec_id` already in the ledger. **Retry** on a flagged
+      spec clones it with a fresh `spec_id`, an explicit operator action. That
+      keeps the guarantee of no automatic re-run.
+    * Manifests only cross-check it. Entries older than 30 days are pruned. For
+      older autosaves, run records (which carry `spec_id`) decide
+      reconciliation.
   * Together these make a stale re-stage of a started run impossible, whatever
     the timing.
 * **Start trigger.** A claim happens only on the `run_queue` command or on the
@@ -241,6 +251,9 @@ head** and answers every claim exactly once.
     can change without a folder change. So the atomic folder+context command is
     re-sent on every `experiment_changed` and record edit, not only on a folder
     change.
+  * The context's `attended` is **stamped metadata only**. The engine stamps
+    each run from its own attendance state, and a re-sent context can never
+    change policy.
   * Releasing the run folder (a session switch, a held session) also clears the
     staged head.
 * **No hidden queue.** The engine holds no queue of its own (§5.1). On client
@@ -308,6 +321,9 @@ head** and answers every claim exactly once.
       reconciliation path (§7). Only the policy changes are skipped.
     * Events missed during the drop reach the GUI through the outbox and the
       snapshot, never through a resumed byte stream.
+    * If the chain was held during the grace, the engine re-attempts it once,
+      after reconciliation and a fresh stage. If it cannot run, it tells the
+      operator; it never stalls silently.
 
 ## 7. Phase 3: lifecycle and failure
 
@@ -360,6 +376,11 @@ head** and answers every claim exactly once.
   * If a driver I/O cannot be cancelled, the process may linger and keep the
     lock. The GUI then shows "engine terminating, stuck in driver I/O".
   * The GUI does not repeat the kill or offer a restart while the lock is held.
+  * `os._exit` cannot run while a driver holds the GIL. In that case the GUI's
+    10 s kill is the real backstop.
+* **Windows logoff.** Logging off the owning Windows user ends the engine and
+  its run. For long runs, the documentation recommends a shared operator
+  account.
 * **Engine death.**
   * The GUI shows a non-dismissible `engine_lost` alert, marks every reading
     stale, and refuses commands with a clear verdict.
@@ -375,15 +396,16 @@ head** and answers every claim exactly once.
   * the staged head is cleared, and the engine holds no other queue;
   * monitoring and safety keep running, and nothing is ramped down because the
     GUI left.
-* **Runs that finish while detached.** The engine keeps a persisted **outbox**
-  of terminal manifests (`RunFinished` plus `spec_id`) in the rack directory,
-  for runs that ended with no client attached.
+* **Finished runs.** The engine keeps a persisted **outbox** of terminal
+  manifests (`RunFinished` plus `spec_id`) in the rack directory for **every**
+  finished run, attached or not. That covers a GUI that dies between receiving
+  `RunFinished` and saving the record (`manager.py:1179-1195`).
   * **Delivery is at-least-once.** The outbox is replayed in every `ready`. An
     entry is removed only on the GUI's `ack{run_id}`, sent **after** the record
     is saved.
   * **Applying is idempotent** by `run_id` and `spec_id`.
-  * **Bound.** Nothing is claimed after a loss, so at most one run can finish
-    per detachment. Overflow is impossible by construction; if it ever happens,
+  * **Bound.** Entries are acked within seconds while attached, and nothing is
+    claimed after a loss, so at most one entry waits per detachment. Overflow is impossible by construction; if it ever happens,
     it is a CRITICAL log, never a silent drop.
 * **Reattach, in v1, in this order:**
   1. The GUI finds the rack lock held, reads `engine.json` (owner-only) and
@@ -399,14 +421,6 @@ head** and answers every claim exactly once.
      the engine's session root and run folder, and refuses to change them until
      the engine is IDLE. A different OS user cannot reattach, because
      `engine.json` is per-user. They still have emergency control (below).
-* **Emergency access for every local user.**
-  * The engine opens a second, **emergency-only** endpoint, ACL'd to local
-    interactive users.
-  * It accepts only `emergency_standby` and status reads, attributed to the
-    calling OS user.
-  * Another user's GUI shows "Emergency standby (rack owned by <user>)". This
-    follows the role model's own carve-out, that an actor who can see a problem
-    can always make the station safe (`session/gateway/roles.py:450-452`).
   5. **Queue reconciliation, before any stage.**
      * The restored queue is matched by `spec_id` against the engine's active
        run, the outbox, the run records and the consumed ledger.
@@ -419,6 +433,23 @@ head** and answers every claim exactly once.
      adopt path's push of `record.attended` (`manager.py:555, 1690`) is
      suppressed. The operator confirms attendance explicitly, and the queue
      stays stopped until they run it.
+* **Emergency access for every local user.**
+  * The engine opens a second, **emergency-only** endpoint, ACL'd to local
+    interactive users.
+  * It accepts only `emergency_standby` and status reads, attributed to the
+    calling OS user.
+    * **Who may call it** is a configured decision (`emergency_endpoint:
+      console|interactive`, default `interactive`, which includes RDP
+      sessions). Every use is logged at CRITICAL and raises an alert in the
+      owner's GUI.
+    * Status reads are limited to state and safety fields, never experiment
+      details.
+    * Identifying the caller needs a small native shim
+      (`GetNamedPipeClientProcessId` → token user), because `QLocalServer`
+      doesn't expose it.
+  * Another user's GUI shows "Emergency standby (rack owned by <user>)". This
+    follows the role model's own carve-out, that an actor who can see a problem
+    can always make the station safe (`session/gateway/roles.py:450-452`).
 * **Quit.**
   * With no run in progress: `bye` → the engine runs today's bounded
     `shutdown()` and exits. If the rack lock is still held 10 s later, the GUI
@@ -438,11 +469,15 @@ head** and answers every claim exactly once.
     troubleshoot and `run_scenario`.
   * The lock handle belongs to the caller and is passed into `InstrumentHost`,
     so one process holds it once and may build more than once.
-  * All-sim configs get a per-process `rack_id`, and `I2AS_RACK_LOCK=off`
-    exists for tests. So fixtures that build a second Station, and `loopback`
-    mode, never collide. A test proves two hardware-config builders do.
-  * The lock file holds the owner's user and host, for "rack in use by
-    <user>".
+  * All-sim configs get a **stable** `rack_id`: a hash of the config path and
+    the OS user, the same in every mode. A restarted GUI then finds its own sim
+    engine and can reattach. This keeps the §8 reattach tests and sim demo
+    installs working.
+  * Test fixtures are isolated by the caller-owned handle, `I2AS_RACK_LOCK=off`,
+    or a fixture-scoped id, never by a per-process id. A test proves two
+    hardware-config builders collide.
+  * The holder sidecar is written atomically right after the lock is
+    acquired, and is trusted only while the lock is held.
 * **Logging.** The engine writes `logs/engine.log` and forwards WARNING and
   above. Every line in both processes carries the run id or request id.
 
@@ -577,3 +612,21 @@ Phase 3 waited on R1 to R4 and R6 to R8. All findings are adopted.
 | R10 | minor | The context changes without a folder change | Re-sent on every experiment/record change (§5.3) |
 | R11 | nit | `seq` has no engine-instance epoch | Instance id in `ready` and `stage` (§5.3) |
 | R12 | nit | Restore may trip the duplicate check; legacy autosaves have no id | Replace-not-add; ids minted on legacy load (§5.3) |
+
+## 14. Audit, round 4: signed off
+
+R1 to R12 were confirmed resolved. Sign-off depended on A1; A2 to A10 were
+adopted as well.
+
+| # | Sev | Finding | Revision |
+|---|---|---|---|
+| A1 | major | A per-process sim `rack_id` breaks reattach and its tests | Stable `rack_id` (config path + user); fixtures isolated by handle/env/fixture id (§7) |
+| A2 | minor | A run finished while attached, with the GUI dying before the save, is filed FAILED | Every terminal manifest goes to the outbox and is acked after the save (§7) |
+| A3 | minor | The ledger blocks retrying a flagged spec | Retry clones with a fresh `spec_id`; run records decide for old autosaves (§5.3) |
+| A4 | minor | Properties can do I/O; the latency claim was false under a GIL hold | Properties are allow-listed callables; "validating…" state plus timeout (§5.2) |
+| A5 | minor | A context re-send could undo attendance | `attended` in the context is metadata; the engine stamps its own (§5.3) |
+| A6 | minor | A graced reconnect can leave the queue stalled | Re-attempt once or notify (§6) |
+| A7 | minor | Emergency endpoint: who may call, exposure, caller identity | Configured scope, CRITICAL log + alert, state-only reads, native shim (§7) |
+| A8 | nit | Contradictory lock-info text | Atomic sidecar, trusted only under the lock (§7) |
+| A9 | nit | List structure broken | Emergency bullet moved out of the reattach steps (§7) |
+| A10 | nit | `os._exit` under a GIL hold; Windows logoff | Documented (§7) |
