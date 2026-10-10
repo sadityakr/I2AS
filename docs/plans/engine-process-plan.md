@@ -1,6 +1,6 @@
 # Plan: run the instruments in their own process (engine process)
 
-Status: **plan, revision 2 (after audit round 1).** Nothing here is
+Status: **plan, revision 3 (after audit round 2).** Nothing here is
 implemented. §11 records the audit findings and where each one lands.
 
 ## 1. Problem
@@ -111,17 +111,18 @@ with a disposition. Each item lands and ships in `threaded` mode.
 
 | Crossing today | Evidence | Becomes |
 |---|---|---|
-| `run_procedure(obj)` / `queue_procedure(obj)` (built objects) | `orchestrator_proxy.py:508-530` | `run_spec(RunSpec)` contract command; the engine builds |
+| `run_procedure(obj)` / `queue_procedure(obj)` (built objects) | `orchestrator_proxy.py:508-530` | `run_spec(RunSpec)` contract command; the engine builds. Refused unless IDLE: a Run now during a run goes into the GUI queue instead |
+| The engine-held `_procedure_queue` (fed when `run_procedure` arrives non-IDLE, drained first by `run_queue`) | `orchestrator.py:1427-1429, 1736-1740` | Deleted. The GUI queue is the only queue |
 | Queue pull: `ask(take_next_spec)` blocks the instrument thread, and a timeout loses the popped spec | `instrument_host.py:278-287`, `run_queue.py:1002-1025`, called in-tick from `_finish_run` (`orchestrator.py:4228-4241`) | **Asynchronous claim** (§5.3) |
-| `build_spec` (session code) runs on the engine thread and calls `ExperimentManager.experiment_context` | `run_queue.py:1027-1052`, `manager.py:155` | The spec carries its `experiment_info`; the engine-side builder needs no session object |
+| `build_spec` (session code) runs on the engine thread and calls `ExperimentManager.experiment_context` | `run_queue.py:1027-1052`, `manager.py:155` | `experiment_info` travels with `set_run_folder` as one atomic command (§5.3), not with the spec; the engine-side builder needs no session object |
 | `next_procedure` / `queue_snapshot` setters; `QueuePanel._standalone_host` installs callables on the engine | `orchestrator_proxy.py:645-673`, `queue_panel.py:252-259` | Deleted; the only installer is the claim protocol |
 | `main(on_station_built=…)` mutates the Station from the GUI side | `main.py:509-521`, `scripts/run_scenario.py:90` | Engine-side `--scenario` hook |
 | The gateway reads the live `station.station_info` | `main.py:779` | `mirror.station_info` |
 | GUI windows and `RunQueueHost` hold the live `Station` (6 C19 ignores, 5 for `core.station` plus 1 for `OrchestratorState`) | `pyproject.toml:438-449` | §5.2 |
-| `last_state_flat()` read on the GUI thread (an unlocked read of an engine-mutated dict) | `procedure_window.py:796`, `station.py:1128-1145` | Keys come from `InstrumentInfo.monitored` declarations |
+| `last_state_flat()` read on the GUI thread (an unlocked read of an engine-mutated dict) | `procedure_window.py:796`, `station.py:1128-1145` | Keys come from `InstrumentInfo.monitored` declarations, filtered to numeric scalar fields of *system* VIs (what `last_state_flat` holds) |
 | `validate_run` / estimates do a headless build with the live Station on the GUI thread | `run_queue.py:860-880`, `procedure_window.py:695-711`, `queue_panel.py:266-290` | **Engine-side validation** request/answer (§5.2) |
 | Run now builds a throwaway instance and keeps it as `_active_procedure` for plot setup | `procedure_window.py:710-718, 843-853` | The plot is set up from the class plus `ProcedureInfo.data_keys` |
-| Agent read tools open the in-flight run's HDF5 file (`open_run` falls back to `locking=False`) | `gateway/tools.py:1996-2022`, `data_reader.py:65-79, 1104-1120` | The active `run_id` is served from `RunBuffer`; a file read for it is refused |
+| Agent read tools open the in-flight run's HDF5 file (`open_run` falls back to `locking=False`) | `gateway/tools.py:1996-2022`, `data_reader.py:65-79, 1104-1120` | The active `run_id` is served from `RunBuffer`, which marks itself partial when it lacks the points before a reattach; a file read for it is refused |
 | Request-spool authorisation lives in `session.gateway.roles` | `main.py:525-538` | Moves to core so the engine never imports the session layer |
 | Passthrough payloads that are not plain data: `RampRecord` (`ramps_updated`), `ErrorEvent` (`error_event`) | `orchestrator.py:2046, 3558, 4407` | Registered codec types (§5.4) |
 
@@ -139,16 +140,32 @@ procedures would break any snapshot. Instead:
   * `TimeSeries`' Station-derived `get_param_groups` override moves into it.
     That also fixes today's drift between the GUI form and the agent's form.
   * The GUI uses `resolve_form`.
+  * The engine re-runs `build_procedure_infos` on every `StationInfo` rebuild,
+    so role candidates follow `connect_instrument`/`disconnect_instrument`
+    as the live `get_param_groups` call does today (`main.py:516`,
+    `station.py:829-850`).
 * **Live-plot vocabulary.** It moves into `ProcedureInfo.data_keys`, keyed per
   `measurement_vi` choice: live-plot measurement keys, image blocks and loop
   labels. These are enumerable, because `measurement_vi` is the only structural
   selection they depend on.
-* **Validation and estimates.** They run **in the engine**, as a request with a
-  correlated answer (`validate_run` → `RunValidation` as a contract type).
-  * They fire on Run now and on Add to queue, both clicks, not on every
-    keystroke.
-  * The engine re-validates on `run_spec` regardless; a build error is a refused
-    `Verdict`.
+* **Validation and estimates.** They run **in the engine process, on its main
+  thread**, as a request with a correlated answer (`validate_run` →
+  `RunValidation`, a contract type). They do not run on the instrument thread:
+  * They read the Station through a **guard view** that raises on any method
+    able to do I/O. That is the same read-only access the GUI thread has
+    today, now explicit and enforced. So the answer never waits behind a
+    `measure()`.
+  * The request carries the envelope to check against, as today's call does.
+    The engine still re-validates at start against its own envelope, and a
+    build error there is a refused claim (§5.3).
+  * The synchronous surfaces become asynchronous: `RunQueueHost.add`,
+    `ExperimentManager.queue_run`/`validate_run` (`manager.py:852-940`), and
+    the gateway's `_tool_validate_run` (`gateway/tools.py:2381-2418`) through a
+    deferred JSON-RPC answer in `local_server.py`.
+  * With no engine running, the answer is "cannot validate: engine not
+    running". Queueing is refused, and the form stays editable.
+  * A parity test runs every catalog procedure with its defaults and with
+    edge values, and checks the answer equals today's `validate_run` output.
 * **Contracts.**
   * The `OrchestratorState` enum moves into `core/events.py`.
   * All six C19 ignores are deleted.
@@ -157,19 +174,55 @@ procedures would break any snapshot. Instead:
   * `i2as.engine` joins the contracts as a composition root next to `main`. It
     must not import `i2as.gui` or `i2as.session`.
 
-### 5.3 The queue: asynchronous claim, never a blocking ask
+### 5.3 The queue: claims with ids, never a blocking ask
 
-1. The GUI **pre-stages** the head spec with every queue push. That is the push
-   it already does for the snapshot (`publish_queue`). The head carries
-   `spec_id`, the spec and its `experiment_info`.
-2. When the engine is free to start the next run, it starts the staged head and
-   emits `RunStarted{spec_id}`, or `Verdict` refused `{spec_id, reason}`.
-3. The GUI removes the spec from its queue **only** on `RunStarted` for that
-   `spec_id`. A refusal leaves it in place, flagged.
-4. A queue edit replaces the staged head. If the engine already started the old
-   head, the `RunStarted` for it wins, and the edit applies to the remainder.
-5. The tick never waits on the GUI. `ThreadBridge.ask` loses its last user and
-   is deleted, so the rule "no engine→client ask exists" holds by construction.
+The GUI keeps owning the queue. The engine is offered at most one **staged
+head** and answers every claim exactly once.
+
+* **Identity.**
+  * Every queued spec carries a `spec_id` (uuid) for its whole life.
+  * The id is persisted in `QueueItemState`/`export_items`
+    (`gui/form_autosave.py:61-89`, `queue_panel.py:682-694`). A restore keeps
+    it and does not mint a new one (`run_queue.py:149`).
+  * The engine writes `spec_id` into the run manifest, and the run record
+    stores it.
+* **Staging.**
+  * The GUI stages the first **unflagged** spec with every queue push.
+  * Each `stage` frame carries the last engine `seq` the GUI had applied. The
+    engine ignores a stage older than its latest claim.
+  * The engine keeps a **consumed ledger** of `spec_id`s, persisted (it is
+    rebuilt from the manifests on start). It refuses any `spec_id` it has
+    already claimed.
+  * Together these make a stale re-stage of a started run impossible, whatever
+    the timing.
+* **Start trigger.** A claim happens only on the `run_queue` command or on the
+  finish/abort chain (`orchestrator.py:4228-4241`). Staging never starts
+  anything on its own.
+* **Claim answers.**
+  * The moment the engine takes the head it emits `Claimed{spec_id}`.
+  * Then exactly one of `RunStarted{spec_id}` or
+    `ClaimFailed{spec_id, stage: build|placement|setup, reason}`. Every refusal
+    path in `_start_run`/`_fail_to_error` (`orchestrator.py:1494-1572`) maps to
+    one `stage`.
+  * The GUI moves the spec out of the waiting list on `Claimed`, to "running" on
+    `RunStarted`, or to "failed, not retried" on `ClaimFailed`. A spec whose
+    setup touched hardware is never re-run automatically.
+* **After a refusal.** The chain stops and notifies, as today's ERROR path does.
+  Nothing advances until the operator runs the queue again, and the refused spec
+  stays visible and flagged.
+* **Experiment context.**
+  * `experiment_info` is not part of the staged spec.
+  * It travels with `set_run_folder` as **one atomic command**
+    (`_install_run_folder`, `manager.py:1492-1520`), so the folder a run writes
+    to and the experiment it is stamped with cannot diverge. Today's "stamped
+    with the experiment open when it actually gets built" still holds.
+  * Releasing the run folder (a session switch, a held session) also clears the
+    staged head.
+* **No hidden queue.** The engine holds no queue of its own (§5.1). On client
+  loss it clears the staged head, and a reattached GUI must reconcile (§7)
+  before it stages again.
+* **The ask is deleted.** `ThreadBridge.ask` loses its last user and is removed,
+  so "no engine→client ask exists" holds by construction.
 
 ### 5.4 One codec, one ordered stream
 
@@ -207,6 +260,10 @@ procedures would break any snapshot. Instead:
     `bye`.
   * engine→client: one sequenced `out` stream (events, passthrough signals,
     validation answers, log records at WARNING and above) plus `hb`.
+* **Ordering, both ways.** Client→engine frames (`cmd`, `stage`, `validate`)
+  share one ordered channel and are applied in arrival order. The engine
+  applies `cmd` and `stage` through the existing single courier FIFO, so
+  session switches and envelope edits keep today's ordering.
 * **Engine side.** `EngineServer` runs on the engine process's main thread and
   calls the in-process `OrchestratorProxy`, which posts to the instrument thread
   as today.
@@ -217,6 +274,9 @@ procedures would break any snapshot. Instead:
   * `measurement_ready`, `Datapoint` and every event are **never** coalesced.
   * Over a byte cap, the client is disconnected with a logged reason. The run
     continues, and the client reattaches.
+  * A cap disconnect is **not** a GUI loss. The same token reconnecting within
+    a 30 s grace changes no policy: attendance stays as it was, there is no
+    `client_lost` condition, and the staged head is kept.
 
 ## 7. Phase 3: lifecycle and failure
 
@@ -227,54 +287,94 @@ procedures would break any snapshot. Instead:
     * Unix: `start_new_session=True`.
   * It does not use `QProcess`, whose destructor kills the child.
   * The engine ignores console control events.
-  * The token is created by the engine and written to `engine.json`, and the
-    GUI reads it there.
+  * **Windows jobs.** If breakaway is denied (the parent's job lacks
+    `JOB_OBJECT_LIMIT_BREAKAWAY_OK`: some IDEs, terminals, CI, Citrix), fall
+    back in this order:
+    1. launch through a tiny launcher created outside the job, via the Task
+       Scheduler / WMI create path;
+    2. failing that, launch inside the job. If that job has
+       `KILL_ON_JOB_CLOSE` (detected with `IsProcessInJob` +
+       `QueryInformationJobObject`), show a persistent warning: "a GUI crash
+       will stop the engine on this PC".
+    * Windows CI tests both job configurations.
+  * The GUI passes a launch nonce in argv. The engine writes it into
+    `engine.json` with its token, and the GUI accepts only the descriptor that
+    carries its nonce, never a stale one.
   * Test: a GUI that raises in a slot, or exits, leaves the engine and its run
     alive.
-* **"Engine lost" means the process died, and nothing else.**
-  * Liveness comes from the OS: wait on the process handle or PID, not from
-    heartbeats.
-  * A silent socket only shows *"engine busy, no reply for N s"* with what it
+* **"Engine alive" is decided by the rack lock.** The engine holds the
+  machine-wide rack lock (below) for its whole life, and the OS releases it on
+  death.
+  * Lock held means an engine is alive; free means it is dead. This is used
+    for liveness, for reattach-or-launch, and after a reattach when the GUI is
+    not the parent, so it is immune to PID reuse.
+  * A silent socket only shows *"engine busy, no reply for N s"*, with what it
     was last reading.
-  * Restart is offered only after the process is gone.
+  * Restart is offered only once the lock is free.
   * Killing a live engine is a separate, confirmed action that names the
     consequence.
 * **Engine death.**
   * The GUI shows a non-dismissible `engine_lost` alert, marks every reading
     stale, and refuses commands with a clear verdict.
   * A new session-layer handler files the active run FAILED with reason "engine
-    process exited". No such path exists today; the startup sweep at
-    `manager.py:1679` is the only one.
-  * Data, notebook and analysis stay usable.
-* **GUI loss** (a crash, a kill, or a socket drop with the GUI alive):
+    process exited".
+  * Data, notebook and analysis stay usable. Validation answers "engine not
+    running".
+* **GUI loss** (a crash, a kill, a deliberate "leave the engine running", or a
+  socket drop not recovered within the grace period):
   * the engine sets attendance false (actor = system) and raises a
     `client_lost` condition, so spool and agent policy tighten;
   * the run in progress finishes normally;
-  * the staged head is **not** started, because a queue nobody can see must not
-    advance;
+  * the staged head is cleared, and the engine holds no other queue;
   * monitoring and safety keep running, and nothing is ramped down because the
     GUI left.
-* **Reattach is in v1.**
-  * On start, the GUI looks for `engine.json`. If the PID there is alive and the
-    rack matches, it connects with the token instead of launching.
-  * The engine sends a `ready` with the primed snapshot, the active run (if any)
-    and its `spec_id`.
-  * The session layer's startup sweep **skips** a RUNNING record whose run the
-    attached engine reports as active.
+* **Runs that finish while detached.** The engine keeps a bounded, persisted
+  **outbox** of terminal manifests (`RunFinished` plus `spec_id`) for runs that
+  ended with no client attached. The outbox sits next to the run log, and the
+  engine replays it in `ready`.
+* **Reattach, in v1, in this order:**
+  1. The GUI finds the rack lock held, reads `engine.json` (owner-only) and
+     connects with the token.
+  2. `ready` carries the primed snapshot, the active run with its `spec_id`,
+     the outbox, and the engine's current session root and run folder.
+  3. `ready` is handled **before** `ExperimentManager` is constructed
+     (`main.py:647`):
+     * the outbox is applied to the run records first;
+     * the startup sweep (`manager.py:1679-1683`) then skips the active run
+       and fails only RUNNING records the engine knows nothing about.
+  4. **Session ownership.** If the engine has an active run, the GUI adopts
+     the engine's session root and run folder, and refuses to change them until
+     the engine is IDLE. A different OS user cannot reattach at all, because
+     `engine.json` is per-user; they see "rack in use by <user>".
+  5. **Queue reconciliation, before any stage.**
+     * The restored queue is matched by `spec_id` against the engine's active
+       run, the outbox, the run records and the consumed ledger.
+     * Matched specs are marked running or done, never PENDING. The old
+       "RUNNING → PENDING on restore" rule (`queue_panel.py:661-664`) applies
+       only when no engine was attached.
+  6. **Attendance is never restored from the record after a real loss.** The
+     adopt path's push of `record.attended` (`manager.py:555, 1690`) is
+     suppressed. The operator confirms attendance explicitly, and the queue
+     stays stopped until they run it.
 * **Quit.**
   * With no run in progress: `bye` → the engine runs today's bounded
-    `shutdown()` and exits. If it is still alive 10 s later, the GUI kills it
-    and logs CRITICAL with the `polling_vi()` diagnostic the engine sent ahead.
+    `shutdown()` and exits. If the rack lock is still held 10 s later, the GUI
+    kills the engine and logs CRITICAL with the `polling_vi()` diagnostic the
+    engine sent ahead.
   * During a run: *"A run is in progress: stop it safely / leave the engine
-    running (reopen I2AS to reattach) / cancel"*.
-* **One engine per rack.**
-  * The lock is a real OS lock held on an open handle (`msvcrt.locking` /
-    `fcntl.flock`) on `<user data dir>/racks/<rack id>.lock`. It does not sit in
-    the config dir, which may be read-only or shared.
-  * The lock is released by the OS on process death, so PID reuse does not
-    matter.
-  * The same lock is checked by `ctl` offline mode (`ctl/client.py:660-685`), by
-    `troubleshoot` and by `run_scenario`.
+    running (reopen I2AS to reattach) / cancel"*. Leaving it running is a GUI
+    loss for attendance and the queue.
+* **One opener per rack, in every mode.**
+  * The lock is machine-wide: `%ProgramData%\I2AS\racks\` (ACL'd for Users),
+    or `/var/lock/i2as` with a user fallback. It is held with
+    `msvcrt.locking(LK_NBLCK)` / `fcntl.flock` on an open handle.
+  * It is keyed on a declared `rack_id` in the config (default: a hash of the
+    sorted VISA resource strings), so two configs for one rack collide.
+  * Every Station builder **acquires** it for its lifetime, in `threaded` and
+    `inline` too: `InstrumentHost._build`, ctl offline (`ctl/client.py:660-685`),
+    troubleshoot and `run_scenario`.
+  * The lock file holds the owner's user and host, for "rack in use by
+    <user>".
 * **Logging.** The engine writes `logs/engine.log` and forwards WARNING and
   above. Every line in both processes carries the run id or request id.
 
@@ -296,12 +396,19 @@ procedures would break any snapshot. Instead:
     * a busy (GIL-held) engine is never reported as lost;
     * a wedged-read shutdown is bounded;
     * a token-less client is refused;
-    * the rack lock refuses a second engine, ctl offline and troubleshoot.
+    * the rack lock refuses a second engine, ctl offline and troubleshoot;
+    * reattach after a GUI crash: no run executes twice, the run that finished
+      while detached is filed done, and attendance stays false until confirmed;
+    * Windows: breakaway allowed, breakaway denied (with the fallback), and a
+      `KILL_ON_JOB_CLOSE` job (warning shown).
 * **Unit tests.**
   * codec round trip of every registered type;
   * ordering, `run_started` before `RunStarted` with the mirror first;
   * coalescing never drops `measurement_ready`/`Datapoint`/events;
-  * the claim protocol, including edit-during-start;
+  * the claim protocol: edit-during-start, stale stage, ledger refusal, every
+    `ClaimFailed` stage, a session switch with a head staged, refusal stops the
+    chain;
+  * `spec_id` survives autosave and restore;
   * engine-side validation parity with today's results.
 * **CI.** A Windows job is required.
 * **Rollout.** The default flips to `process` after one lab release without a
@@ -357,3 +464,28 @@ Verdict: **approve with changes.** Every finding is adopted.
 | 19 | minor | Run now already submits JSON; the real issue is the kept throwaway instance | Plot from class plus `ProcedureInfo` (§5.1) |
 | 20 | minor | The freeze fix arrived only at Phase 3; the cause was unconfirmed on the rig | Phase 0, a native stack capture and targeted binding fix (§4) |
 | 21 | nit | §9: exclude the armed VI's bus; state the emergency latency | Added (§1.2, §9) |
+
+## 12. Audit, round 2
+
+Verdict: **approve with changes.** §5.3 and reattach were not to be
+implemented until the three blockers were fixed. All findings are adopted.
+
+| # | Sev | Finding | Revision |
+|---|---|---|---|
+| N1 | blocker | An edit before `RunStarted` arrives re-stages a started head, and it runs twice | Persisted consumed ledger; `stage` carries the last applied `seq`; stale stages ignored (§5.3) |
+| N2 | blocker | The persisted queue has no `spec_id` and restores RUNNING as PENDING, so a reattach re-runs the in-flight run | `spec_id` persisted; reconciliation against active run, outbox, records and ledger before staging (§5.3, §7) |
+| N3 | blocker | A run that finishes while detached is filed FAILED by the startup sweep | Persisted outbox replayed in `ready`, applied before `ExperimentManager` and its sweep (§7) |
+| N4 | major | Setup refusals and errors give no per-spec answer; the spec stays staged after touching hardware | `Claimed` plus exactly one `RunStarted`/`ClaimFailed{stage}`; never auto re-run (§5.3) |
+| N5 | major | A refused head blocks the queue | Stage the first unflagged spec; the chain stops and notifies (§5.3) |
+| N6 | major | Pre-staged `experiment_info` goes stale | Sent atomically with `set_run_folder`; release clears the head (§5.3) |
+| N7 | major | The engine's own `_procedure_queue` still advances after GUI loss | Deleted; `run_spec` only when IDLE (§5.1) |
+| N8 | major | A cap disconnect flips attendance; reattach restores `attended` from the record | Grace period for the same token; explicit confirmation after a real loss (§6, §7) |
+| N9 | major | Breakaway can be denied; fallback missing; stale descriptor | Fallback chain, `KILL_ON_JOB_CLOSE` warning, launch nonce, CI for both configurations (§7) |
+| N10 | major | Engine-side validation: latency behind `measure()`, envelope race, synchronous APIs, engine-down | Main-thread guard view; envelope in the request; async surfaces; engine-down answer; parity test (§5.2) |
+| N11 | major | `ProcedureInfo` forms frozen at startup | Rebuilt with every `StationInfo` (§5.2) |
+| N12 | minor | PID-based liveness after reattach | Liveness from the rack lock (§7) |
+| N13 | minor | Client→engine ordering unstated | One ordered channel through the courier FIFO (§6) |
+| N14 | major | Per-user, per-config, check-only, process-mode-only lock | Machine-wide, `rack_id`-keyed, acquired by every Station builder in all modes (§7) |
+| N15 | minor | Session ownership on reattach undefined | The GUI adopts the engine's session and run folder while a run is active (§7) |
+| N16 | nit | Start trigger and quit semantics | Stated (§5.3, §7) |
+| R1-8, R1-12 | caveats | System-VI numeric filter; partial `RunBuffer` after reattach | Added (§5.1) |
