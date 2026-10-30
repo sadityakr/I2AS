@@ -730,6 +730,12 @@ class ExperimentManager(QObject):
         """
         return self._queue_host.take_next_spec()
 
+    def return_spec(self, spec: Any) -> None:
+        """Restore a queue handoff that timed out while its pop was running."""
+        if spec is not None:
+            self._queue_host.add_spec(spec)
+            self.move_queued_run(spec.spec_id, -len(self.queue_snapshot()))
+
     def build_spec(self, spec: Any) -> Any:
         """Build the live run a popped spec describes.
 

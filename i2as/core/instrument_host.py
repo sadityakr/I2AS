@@ -149,22 +149,36 @@ class _Ask:
         call: The zero-argument callable to run on the receiving thread.
     """
 
-    __slots__ = ("call", "done", "error", "result")
+    __slots__ = ("call", "done", "error", "result", "lock", "cancelled", "on_abandoned")
 
-    def __init__(self, call: Callable[[], Any]) -> None:
+    def __init__(self, call: Callable[[], Any], on_abandoned=None) -> None:
+        self.on_abandoned = on_abandoned
         self.call = call
         self.result: Any = None
         self.error: BaseException | None = None
         self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.cancelled = False
 
     def __call__(self) -> None:
         """Run the question on the receiving thread and release the asker."""
+        with self.lock:
+            if self.cancelled:
+                self.done.set()
+                return
         try:
-            self.result = self.call()
-        except BaseException as exc:  # noqa: BLE001 — carried back, not swallowed
-            self.error = exc
-        finally:
+            result = self.call()
+        except BaseException as exc:
+            with self.lock:
+                self.error = exc
+                self.done.set()
+            return
+        with self.lock:
+            self.result = result
+            abandoned = self.cancelled
             self.done.set()
+        if abandoned and self.on_abandoned is not None:
+            self.on_abandoned(result)
 
 
 class _Courier(QObject):
@@ -259,12 +273,15 @@ class ThreadBridge:
         """
         self._engine.dispatch.emit(call)
 
-    def ask(self, call: Callable[[], Any], *, default: Any = None) -> Any:
+    def ask(self, call: Callable[[], Any], *, default: Any = None, on_abandoned=None) -> Any:
         """Run *call* on the client thread and wait, bounded, for its answer.
 
         Args:
             call: A zero-argument callable evaluated on the client thread.
             default: What to return if the client does not answer in time.
+            on_abandoned: Optional client-thread recovery for a callback that
+                had already started when the timeout fired. Receives its late
+                result; queue pops use this to restore an unconsumed run.
 
         Returns:
             The callable's return value, or *default* on timeout.
@@ -275,9 +292,15 @@ class ThreadBridge:
                 failing client callback as "the queue did not advance") see
                 it.
         """
-        question = _Ask(call)
+        question = _Ask(call, on_abandoned)
         self._client.dispatch.emit(question)
         if not question.done.wait(self._callback_timeout_s):
+            with question.lock:
+                if question.done.is_set():
+                    if question.error is not None:
+                        raise question.error
+                    return question.result
+                question.cancelled = True
             logger.critical(
                 "The client thread did not answer an engine callback within "
                 "%.1f s; carrying on without it. The client's event loop is "

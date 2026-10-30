@@ -2201,6 +2201,26 @@ class SweepMeasureProcedure(BaseProcedure):
         )
 
     def measure(self) -> None:
+        """Complete a point synchronously for standalone callers."""
+        for _ in self._measure_steps():
+            pass
+
+    def measure_step(self) -> bool:
+        """Advance one reading, yielding between readings for engine commands."""
+        if type(self).measure is not SweepMeasureProcedure.measure or "measure" in self.__dict__:
+            self.measure()
+            return True
+        iterator = getattr(self, "_measurement_iterator", None)
+        if iterator is None:
+            iterator = self._measurement_iterator = self._measure_steps()
+        try:
+            next(iterator)
+            return False
+        except StopIteration:
+            self._measurement_iterator = None
+            return True
+
+    def _measure_steps(self):
         """Run the reading loop, tag on the axis read-back, and save.
 
         The reading loop takes one grid of readings per datapoint: axis 1
@@ -2276,7 +2296,16 @@ class SweepMeasureProcedure(BaseProcedure):
             for i2 in range(n_loop2):
                 if axis2 is not None:
                     _dispatch(axis2, axis2["values"][i2])
-                reading = vi.take_reading()
+                steps = getattr(vi, "take_reading_steps", None)
+                custom_reading = (
+                    "take_reading" in vi.__dict__
+                    or ("take_reading" in type(vi).__dict__
+                        and "take_reading_steps" not in type(vi).__dict__)
+                )
+                if callable(steps) and not custom_reading:
+                    reading = yield from steps()
+                else:
+                    reading = vi.take_reading()
                 for key, value in reading.items():
                     grids[key][i1][i2] = value
                 for block_name, labels in vi.measurement_raw_blocks.items():
@@ -2285,6 +2314,8 @@ class SweepMeasureProcedure(BaseProcedure):
                         grids[label][i1][i2] = _nanmean(
                             row[col_index] for row in block_rows
                         )
+
+                yield
 
         measured_data: dict[str, Any] = dict(grids)
         if (n_loop1, n_loop2) == (1, 1):
@@ -2319,6 +2350,10 @@ class SweepMeasureProcedure(BaseProcedure):
             The measurement safe-off command(s) for the Orchestrator to
             dispatch, plus each participating loop VI's ``reading_safe_off``.
         """
+        iterator = getattr(self, "_measurement_iterator", None)
+        if iterator is not None:
+            iterator.close()
+            self._measurement_iterator = None
         super().abort()
         return self._safe_off_commands()
 

@@ -767,7 +767,11 @@ class ProcedureWindow(QMainWindow):
         Args:
             datapoint: Latest enriched data dict emitted by the Orchestrator.
         """
-        self._datapoints.append(datapoint)
+        # Keep scalar columns and loop grids; raw arrays/images belong on disk.
+        keys = self._plot1.available_keys | self._plot2.available_keys
+        self._datapoints.append({key: value for key, value in datapoint.items() if key in keys})
+        if len(self._datapoints) > 10000:
+            del self._datapoints[:len(self._datapoints) - 10000]
         self._plot1.redraw(self._datapoints)
         self._plot2.redraw(self._datapoints)
 

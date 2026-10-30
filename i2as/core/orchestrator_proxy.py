@@ -550,6 +550,7 @@ class OrchestratorProxy(QObject):
         queue_entries: Callable[[], Sequence[Mapping[str, Any]]],
         take_next_spec: Callable[[], Any] | None = None,
         build_spec: Callable[[Any], Any] | None = None,
+        return_spec: Callable[[Any], None] | None = None,
     ) -> None:
         """Wire the client's run queue to the engine's two pull seams.
 
@@ -580,6 +581,7 @@ class OrchestratorProxy(QObject):
             queue_entries: The waiting entries as JSON-safe mappings.
             take_next_spec: Pops the next spec and returns it without
                 building. Required in ``threaded`` mode.
+            return_spec: Restores a spec if a running queue pop answers after timeout.
             build_spec: Builds one popped spec into a live run. Required in
                 ``threaded`` mode.
 
@@ -606,7 +608,7 @@ class OrchestratorProxy(QObject):
 
         def _pull_next_run() -> Any:
             """Take one spec on the client thread, build it on this one."""
-            spec = bridge.ask(take_next_spec)
+            spec = bridge.ask(take_next_spec, on_abandoned=return_spec)
             if spec is None:
                 return None
             return build_spec(spec)

@@ -154,7 +154,16 @@ class DCSeparateMeasurementVI(DCMeasurementBase):
         meter.set_continuous_initiation(False)
         meter.set_range(self._voltmeter_range_V)
 
-    def take_reading(self) -> dict[str, list[float] | float]:
+    def take_reading(self):
+        """Complete a reading for synchronous callers."""
+        steps = self.take_reading_steps()
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+
+    def take_reading_steps(self):
         """Acquire ``readings_per_point`` DC voltage samples at the fixed current.
 
         Returns:
@@ -177,6 +186,7 @@ class DCSeparateMeasurementVI(DCMeasurementBase):
         for _ in range(self._readings_per_point):
             voltages.append(float(meter.get_voltage()))
             currents.append(current)
+            yield
 
         v_mean, v_error = self.mean_and_sem(voltages)
         c_mean, c_error = self.mean_and_sem(currents)

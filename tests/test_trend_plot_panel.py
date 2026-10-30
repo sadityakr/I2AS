@@ -243,6 +243,7 @@ def test_selecting_7d_reads_3min_tier_from_disk(qtbot, history, tmp_path):
     panel.set_selected_key(key)
     window_selector = panel.findChild(QComboBox, "trend_window_selector_p7")
     window_selector.setCurrentText("7 d")
+    qtbot.waitUntil(lambda: panel._disk_future is None)
 
     x_data, y_data = panel._curve.getData()
     assert len(x_data) == 2
@@ -270,6 +271,7 @@ def test_selecting_1y_reads_hourly_tier_from_disk(qtbot, history, tmp_path):
     panel.set_selected_key(key)
     window_selector = panel.findChild(QComboBox, "trend_window_selector_p8")
     window_selector.setCurrentText("1 y")
+    qtbot.waitUntil(lambda: panel._disk_future is None)
 
     x_data, y_data = panel._curve.getData()
     assert len(x_data) == 1
@@ -308,6 +310,7 @@ def test_disk_read_failure_or_empty_renders_empty_plot(qtbot, history, tmp_path)
     panel.set_selected_key(key)
     window_selector = panel.findChild(QComboBox, "trend_window_selector_p10")
     window_selector.setCurrentText("1 y")
+    qtbot.waitUntil(lambda: panel._disk_future is None)
 
     x_data, y_data = panel._curve.getData()
     assert x_data is None or len(x_data) == 0
@@ -341,6 +344,7 @@ def test_measurement_vi_key_plottable_live_but_empty_on_disk_window(qtbot, histo
 
     # Same key, long (disk-backed) window: empty, not an error.
     window_selector.setCurrentText("1 y")
+    qtbot.waitUntil(lambda: panel._disk_future is None)
     x_data, y_data = panel._curve.getData()
     assert x_data is None or len(x_data) == 0
     assert y_data is None or len(y_data) == 0

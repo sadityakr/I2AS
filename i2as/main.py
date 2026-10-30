@@ -620,6 +620,7 @@ def main(
         queue_entries=session_manager.queue_entries,
         take_next_spec=session_manager.take_next_spec,
         build_spec=session_manager.build_spec,
+        return_spec=session_manager.return_spec,
     )
 
     # The Gateway server (i2as/session/gateway/local_server.py,

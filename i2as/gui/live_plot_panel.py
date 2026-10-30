@@ -83,6 +83,7 @@ class LivePlotPanel(QGroupBox):
         # Last datapoint history handed to redraw(); a selector change redraws
         # against this without the parent re-supplying it.
         self._datapoints: list[dict] = []
+        self._available_keys: frozenset[str] = frozenset()
 
         vlay = QVBoxLayout(self)
 
@@ -125,6 +126,10 @@ class LivePlotPanel(QGroupBox):
 
         self._plot_widget = pg.PlotWidget()
         self._plot_widget.setObjectName(plot_object_name)
+        self._plot_widget.setToolTip(
+            "Shows up to 10,000 recent points, sampled for display. "
+            "Full-resolution data is saved in the run file."
+        )
         self._plot_widget.setMinimumHeight(150)
         self._plot_widget.setLabel("bottom", "Field (T)")
         self._plot_widget.setLabel("left", "Value")
@@ -157,6 +162,7 @@ class LivePlotPanel(QGroupBox):
             default_y: The Y-axis key to fall back to when the current Y choice
                 is not in ``keys``, or ``None`` for no Y default.
         """
+        self._available_keys = frozenset(keys)
         if not keys:
             return
 
@@ -220,6 +226,11 @@ class LivePlotPanel(QGroupBox):
                 selector.blockSignals(False)
         self._redraw()
 
+    @property
+    def available_keys(self) -> frozenset[str]:
+        """Scalar/loop-grid columns the live plot can display."""
+        return self._available_keys
+
     def redraw(self, datapoints: list[dict]) -> None:
         """Store the datapoint history and redraw the curve from it.
 
@@ -274,11 +285,12 @@ class LivePlotPanel(QGroupBox):
 
         xs = []
         ys = []
-        for dp in self._datapoints:
+        for dp in self._datapoints[-10000:]:
             xs.append(_to_float(_lookup(dp, x_key)))
             ys.append(_to_float(_lookup(dp, y_key)))
 
-        self._curve.setData(xs, ys)
+        # Peak downsampling preserves narrow extrema in scientific traces.
+        self._curve.setData(xs, ys, autoDownsample=True, downsampleMethod="peak")
         x_label = x_key.replace("_", " ")
         y_label = y_key.replace("_", " ")
         qualifier_text = ", ".join(qualifiers)

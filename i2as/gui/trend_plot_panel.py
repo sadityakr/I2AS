@@ -10,11 +10,14 @@ widget never talks to the Orchestrator directly.
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from pathlib import Path
 
 import pyqtgraph as pg
 import qtawesome as qta
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QGroupBox,
@@ -30,6 +33,24 @@ from i2as.gui.monitor_history import MonitorHistory
 from i2as.gui.theme import PLOT_SERIES, TEXT_PRIMARY
 
 logger = logging.getLogger(__name__)
+_HISTORY_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trend-history")
+_HISTORY_REQUESTS = OrderedDict()
+
+
+def _request_history(log_dir, keys, window_s):
+    """Share bounded, short-lived disk snapshots between panels on the UI thread."""
+    identity = (str(log_dir), tuple(keys), window_s)
+    cached = _HISTORY_REQUESTS.get(identity)
+    now = time.monotonic()
+    if cached is not None and (not cached[1].done() or now - cached[0] < 60):
+        return cached[1]
+    future = _HISTORY_WORKERS.submit(trend_history.read_window, log_dir, keys, window_s)
+    _HISTORY_REQUESTS[identity] = (now, future)
+    _HISTORY_REQUESTS.move_to_end(identity)
+    while len(_HISTORY_REQUESTS) > 16:
+        _HISTORY_REQUESTS.popitem(last=False)
+    return future
+
 
 # (label, window in seconds) — module constant so the Monitor window and
 # tests can both reference the same option list without duplicating it.
@@ -101,6 +122,12 @@ class TrendPlotPanel(QGroupBox):
     ) -> None:
         super().__init__(f"Trend — {panel_id}", parent)
 
+        self._disk_future = None
+        self._disk_request = None
+        self._disk_cache = {}
+        self._disk_timer = QTimer(self)
+        self._disk_timer.setInterval(100)
+        self._disk_timer.timeout.connect(self._collect_disk)
         self._history = history
         self._panel_id = panel_id
         self._known_keys: list[str] = []
@@ -248,44 +275,31 @@ class TrendPlotPanel(QGroupBox):
         if window_s <= _RAM_WINDOW_CEILING_S:
             times, values = self._history.series(key, window_s=window_s)
         else:
-            times, values = self._read_disk_series(key, window_s)
+            request = (key, window_s)
+            cached = self._disk_cache.get(request)
+            times, values = cached[1] if cached else ([], [])
+            if self._disk_future is None and (cached is None or time.monotonic() - cached[0] > 60):
+                self._disk_request = request
+                self._disk_future = _request_history(self._log_dir, self._known_keys, window_s)
+                self._disk_timer.start()
         self._curve.setData(times, values)
         self._update_y_label()
 
-    def _read_disk_series(self, key: str, window_s: float) -> tuple[list[float], list[float]]:
-        """Read a disk-backed series for a window beyond MonitorHistory's retention.
-
-        Delegates tier selection entirely to ``trend_history.read_window()``
-        (that decision belongs in the store, not the GUI). Synchronous by
-        design: the disk reads involved (~3,840 lines for a week, ~8,760 for
-        a year) are small enough to read on the tick/redraw path without a
-        thread, which this codebase's single-threaded cooperative scheduling
-        forbids anyway.
-
-        Args:
-            key: The flat key to plot.
-            window_s: The requested window length in seconds.
-
-        Returns:
-            ``(times, values)`` parallel lists, empty on any read failure or
-            if the key has no persisted data in the window — including a
-            measurement-VI key, which ``Station.last_state_flat()`` excludes
-            from every tier, so it plots live but is always empty here (see
-            GLOSSARY.md "Trend history").
-        """
+    def _collect_disk(self) -> None:
+        future = self._disk_future
+        if future is None or not future.done():
+            return
+        request = self._disk_request
+        self._disk_future = None
+        self._disk_timer.stop()
         try:
-            series = trend_history.read_window(self._log_dir, [key], window_s)[key]
+            series = future.result()[request[0]]
+            data = ([t for t, _ in series], [v for _, v in series])
         except Exception:
-            logger.exception(
-                "trend_plot_panel[%s]: disk read failed for key=%r window_s=%s",
-                self._panel_id, key, window_s,
-            )
-            return [], []
-        if not series:
-            return [], []
-        times = [t for t, _ in series]
-        values = [v for _, v in series]
-        return times, values
+            logger.exception("Trend history read failed")
+            data = ([], [])
+        self._disk_cache = {request: (time.monotonic(), data)}
+        self._redraw()
 
     def _update_y_label(self) -> None:
         """Set the Y-axis label to the currently selected key string."""

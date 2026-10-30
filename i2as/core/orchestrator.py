@@ -3532,6 +3532,54 @@ class Orchestrator(QObject):
         except Exception:  # noqa: BLE001
             return "Measuring"
 
+    def _resume_measurement(self, generation, procedure) -> None:
+        """Discard continuations superseded by a tick, abort, or new run."""
+        if generation == self._measurement_generation and procedure is self._procedure:
+            self._advance_measurement()
+
+    def _advance_measurement(self) -> None:
+        """Guard asynchronous acquisition callbacks just like timer ticks."""
+        try:
+            self._advance_measurement_body()
+        except Exception as exc:
+            logger.exception("Acquisition step failed")
+            self._fail_to_error(f"Internal error: {exc}")
+
+    def _advance_measurement_body(self) -> None:
+        """Continue acquisition without repeating the monitor poll per sample."""
+        self._measurement_generation = getattr(self, "_measurement_generation", 0) + 1
+        if self._state != OrchestratorState.MEASURING:
+            return
+        if self._procedure:
+            if getattr(self._procedure, "_measurement_iterator", None) is None:
+                self._emit_status(self._measure_status_line())
+            step = getattr(self._procedure, "measure_step", None)
+            if callable(step):
+                if not step():
+                    if self._timer.isActive():
+                        generation = self._measurement_generation
+                        procedure = self._procedure
+                        QTimer.singleShot(0, lambda: self._resume_measurement(generation, procedure))
+                    return
+            else:
+                self._procedure.measure()
+            if hasattr(self._procedure, "get_progress"):
+                self.procedure_progress.emit(self._procedure.get_progress())
+            last_datapoint = getattr(self._procedure, "last_datapoint", None)
+            if last_datapoint:
+                self.measurement_ready.emit(dict(last_datapoint))
+                manifest = self._active_run_manifest or {}
+                self._emit_event(
+                    ev.Datapoint(
+                        run_id=str(manifest.get("run_id", "")),
+                        index=self._datapoint_index,
+                        values=_json_safe(last_datapoint),
+                        seq=self._next_seq(),
+                    )
+                )
+                self._datapoint_index += 1
+        self._change_state(OrchestratorState.SWEEPING)
+
     def _tick(self) -> None:
         """One cooperative cycle, inside the exception boundary.
 
@@ -3907,25 +3955,7 @@ class Orchestrator(QObject):
             # rate just because two ticks of every measurement cycle are
             # spent in states that historically never saw a live ramp.
             self._station.advance_ramps()
-            if self._procedure:
-                self._emit_status(self._measure_status_line())
-                self._procedure.measure()
-                if hasattr(self._procedure, "get_progress"):
-                    self.procedure_progress.emit(self._procedure.get_progress())
-                last_datapoint = getattr(self._procedure, "last_datapoint", None)
-                if last_datapoint:
-                    self.measurement_ready.emit(dict(last_datapoint))
-                    manifest = self._active_run_manifest or {}
-                    self._emit_event(
-                        ev.Datapoint(
-                            run_id=str(manifest.get("run_id", "")),
-                            index=self._datapoint_index,
-                            values=_json_safe(last_datapoint),
-                            seq=self._next_seq(),
-                        )
-                    )
-                    self._datapoint_index += 1
-            self._change_state(OrchestratorState.SWEEPING)
+            self._advance_measurement()
         elif self._state == OrchestratorState.SWEEPING:
             self._station.advance_ramps()  # see MEASURING above
             if self._pause_requested:

@@ -238,7 +238,16 @@ class CameraMeasurementVI(MeasurementInstrumentBase):
         camera.set_roi(0, 0, FRAME_WIDTH_PX, FRAME_HEIGHT_PX)
         camera.arm()
 
-    def take_reading(self) -> dict[str, Any]:
+    def take_reading(self):
+        """Complete a reading for synchronous callers."""
+        steps = self.take_reading_steps()
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+
+    def take_reading_steps(self):
         """Take ``frames_per_step`` exposures and return the averaged frame.
 
         Returns:
@@ -263,6 +272,7 @@ class CameraMeasurementVI(MeasurementInstrumentBase):
             frame = self._on_sensor_grid(np.asarray(camera.get_frame(), dtype=np.float64))
             frames.append(frame)
             roi_means.append(float(frame[y0 : y0 + height, x0 : x0 + width].mean()))
+            yield
 
         averaged = np.mean(np.stack(frames), axis=0)
         region = averaged[y0 : y0 + height, x0 : x0 + width]
