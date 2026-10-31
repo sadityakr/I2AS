@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -134,7 +135,7 @@ def main() -> int:
         headline, detail = edit["headlines"][index]
         text = "{\\c&HFFE066&\\b1}AGENT  {\\c&HFFFFFF&}" + ass_escape(headline)
         if detail:
-            text += "\\N{\\fs26\\b0\\c&HC8C8C8&}" + ass_escape(detail)
+            text += "\\N{\\fs24\\b0\\c&HC8C8C8&}" + ass_escape(detail)
         events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(stop)},Narr,,0,0,0,,{text}")
 
     calls = [r for r in records if r["kind"] == "result" and (r.get("params") or {}).get("name") not in skip]
@@ -158,17 +159,25 @@ def main() -> int:
         text = "{\\c&H999999&\\fs22}MCP tool calls\\N" + "\\N".join(window)
         events.append(f"Dialogue: 1,{ass_time(t)},{ass_time(max(stop, t + 0.05))},Calls,,0,0,0,,{text}")
 
-    # The clock: real elapsed time and the current speed-up, every 0.25 s of video.
-    step = 0.25
+    # The real-time timer: elapsed real time since the capture started (large),
+    # the wall-clock time and the current speed-up beneath it — one event per
+    # video frame, so it visibly races through the compressed stretches.
+    step = 1.0 / FPS
     t = time_map[0][2]
     while t < end_of_body:
         segment = next(((e0, o0, speed) for e0, e1, o0, speed in time_map if o0 <= t < o0 + (e1 - e0) / speed), None)
         if segment is not None:
             e0, o0, speed = segment
-            elapsed = e0 + (t - o0) * speed - first_epoch
-            m, s = divmod(int(elapsed), 60)
-            text = f"{{\\c&HB0B0B0&}}real time {m:02d}:{s:02d}   {{\\c&HFFE066&}}×{speed:g}"
-            events.append(f"Dialogue: 2,{ass_time(t)},{ass_time(t + step)},Clock,,0,0,0,,{text}")
+            epoch = e0 + (t - o0) * speed
+            h, rem = divmod(int(epoch - first_epoch), 3600)
+            m, s = divmod(rem, 60)
+            wall = time.strftime("%H:%M:%S", time.gmtime(epoch))
+            text = (
+                "{\\fs20\\c&H999999&}REAL TIME\\N"
+                f"{{\\fs60\\b1\\c&HFFFFFF&}}{h:02d}:{m:02d}:{s:02d}\\N"
+                f"{{\\fs22\\b0\\c&HB0B0B0&}}{wall} UTC   {{\\c&HFFE066&}}×{speed:g}"
+            )
+            events.append(f"Dialogue: 2,{ass_time(t)},{ass_time(t + step)},Timer,,0,0,0,,{text}")
         t += step
 
     band_mid = band_top + (height - band_top) // 2
@@ -180,9 +189,9 @@ WrapStyle: 0
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Narr,DejaVu Sans,34,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,4,36,820,0,1
+Style: Narr,DejaVu Sans,31,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,4,36,1100,0,1
 Style: Calls,DejaVu Sans Mono,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,4,1830,30,0,1
-Style: Clock,DejaVu Sans Mono,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,9,30,36,{band_top + 6},1
+Style: Timer,DejaVu Sans Mono,24,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -191,6 +200,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = [
         e.replace(",Narr,,0,0,0,,", f",Narr,,0,0,0,,{{\\pos(36,{band_mid})}}")
         .replace(",Calls,,0,0,0,,", f",Calls,,0,0,0,,{{\\pos(1840,{band_mid})}}")
+        .replace(",Timer,,0,0,0,,", f",Timer,,0,0,0,,{{\\pos(1655,{band_mid})}}")
         for e in events
     ]
     (out_dir / "overlay.ass").write_text(ass + "\n".join(events) + "\n", encoding="utf-8")
