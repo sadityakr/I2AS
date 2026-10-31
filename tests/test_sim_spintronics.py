@@ -6,7 +6,8 @@ Hall bar respond to come from the magnet and the cryostat), that the sample
 models produce the physics their docstrings promise (TMR magnitude and its
 bias and temperature dependence, switching fields, a square anomalous-Hall
 loop), that the cryostat's PID loop holds a setpoint once tuned, and that
-``BiasSweep`` steps the measurement's own bias through the Station.
+the 2400's two measurement methods — DC mode in either source function,
+and an I–V curve per point — return what they declare against the junction.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from i2as.drivers.sim_cryostat_lakeshore_335 import SimCryostatLakeshore335
 from i2as.drivers.sim_hall_keithley_2182a import OVERFLOW_READING_V, SimHallKeithley2182A
 from i2as.drivers.sim_keithley_2400 import SimKeithley2400
 from i2as.drivers.sim_keithley_6221 import SimKeithley6221
-from i2as.procedures.bias_sweep import BiasSweep
 
 SPIN_CONFIG = "i2as/configs/sim_spintronics"
 
@@ -45,7 +45,7 @@ def _environment(name: str, temperature_K: float) -> sim_environment.SimEnvironm
 
 def _resistance(smu: SimKeithley2400, bias_V: float, n: int = 20) -> float:
     smu.set_source_voltage(bias_V)
-    return bias_V / float(np.mean([smu.measure_current() for _ in range(n)]))
+    return bias_V / float(np.mean([smu.measure()[1] for _ in range(n)]))
 
 
 def _sweep_loop(smu: SimKeithley2400, environment, bias_V: float, limit_T: float = 0.1):
@@ -100,7 +100,7 @@ def test_smu_clips_at_compliance_and_reports_it() -> None:
     smu.set_current_compliance(1e-4)
     smu.set_output(True)
     smu.set_source_voltage(0.8)
-    assert smu.measure_current() == pytest.approx(1e-4)
+    assert smu.measure()[1] == pytest.approx(1e-4)
     assert smu.is_in_compliance()
 
 
@@ -158,58 +158,61 @@ def test_cryostat_holds_10_k_once_tuned(monkeypatch: pytest.MonkeyPatch) -> None
     assert sim_environment.get("t_cryo").sample_temperature_K == pytest.approx(10.0, abs=0.02)
 
 
-def test_bias_sweep_steps_the_bias_through_the_station(tmp_path) -> None:
-    """Every point dispatches set_bias_voltage with that point's bias."""
+def _spin_station():
+    sim_environment._registry.pop("spin", None)
     station = build_station(SPIN_CONFIG)
-    proc = BiasSweep(
-        station,
-        {"sample_name": "S", "sample_id": "S-1", "comments": ""},
-        str(tmp_path),
-        measurement_vi="mtj_bias",
-        bias_start=-0.2,
-        bias_end=0.2,
-        bias_steps=5,
-        compliance_A=0.01,
-        readings_per_point=1,
+    environment = sim_environment.get("spin")
+    environment.temperature_source = lambda: 10.0
+    return station, environment
+
+
+def test_dc_mode_current_source_reads_the_junction_and_respects_compliance() -> None:
+    """Current mode: R = V/I is the junction's; a large current hits the voltage compliance."""
+    station, environment = _spin_station()
+    environment.applied_field_T = 0.1  # parallel
+    vi = station.get_vi("k2400_dc")
+    vi.initiate_measurement(source_function="current", source_current_A=2e-5, compliance_V=1.0, readings_per_point=5)
+    reading = vi.take_reading()
+    assert reading["resistance_ohm"] == pytest.approx(2160, rel=0.03)
+    vi.initiate_measurement(source_function="current", source_current_A=1.9e-3, compliance_V=0.3, readings_per_point=2)
+    reading = vi.take_reading()
+    assert max(abs(v) for v in reading["voltage_V_array"]) <= 0.3 + 1e-3
+    assert max(abs(i) for i in reading["current_A_array"]) < 1.9e-3
+    vi.standby()
+
+
+def test_dc_mode_voltage_source_measures_the_antiparallel_state() -> None:
+    station, environment = _spin_station()
+    environment.applied_field_T = -0.1  # antiparallel
+    vi = station.get_vi("k2400_dc")
+    vi.initiate_measurement(source_function="voltage", source_voltage_V=0.02, compliance_A=1e-3)
+    assert vi.take_reading()["resistance_ohm"] == pytest.approx(6040, rel=0.04)
+    vi.standby()
+
+
+def test_iv_sweep_returns_one_curve_and_its_low_bias_resistance() -> None:
+    station, environment = _spin_station()
+    environment.applied_field_T = 0.1
+    vi = station.get_vi("k2400_iv")
+    vi.initiate_measurement(
+        source_function="voltage", sweep_start_V=-0.8, sweep_stop_V=0.8, points=41, compliance_A=3e-3
     )
-    sent = []
-    original = station.send_measurement_commands
-
-    def _record(commands):
-        sent.extend(commands)
-        return original(commands)
-
-    station.send_measurement_commands = _record  # type: ignore[method-assign]
-    plan = proc.initiate()
-    station.send_measurement_commands(plan.commands)
-    sent.clear()
-    biases = []
-    while True:
-        proc.measure()
-        biases.append(sent[-1].kwargs["bias_V"])
-        if proc.change_sweep_step() is None:
-            break
-    proc.standby()
-    assert biases == pytest.approx([-0.2, -0.1, 0.0, 0.1, 0.2])
-    assert all(command.method == "set_bias_voltage" for command in sent)
+    reading = vi.take_reading()
+    voltages, currents = reading["voltage_V_array"], reading["current_A_array"]
+    assert len(voltages) == len(currents) == 41
+    assert voltages[0] == pytest.approx(-0.8) and voltages[-1] == pytest.approx(0.8)
+    assert reading["resistance_ohm"] == pytest.approx(2160, rel=0.03)
+    # Strongly non-linear: the current at 0.8 V is far above the ohmic line.
+    assert currents[-1] > 2.0 * 0.8 / reading["resistance_ohm"]
+    vi.standby()
 
 
-def test_bias_sweep_refuses_a_measurement_without_a_bias(tmp_path) -> None:
-    from i2as.core.exceptions import I2ASConfigError
+def test_source_limits_refuse_a_breakdown_bias() -> None:
+    """The setup's max_source_voltage_V stops a bias that would destroy the barrier."""
+    from i2as.core.exceptions import I2ASSafetyError
 
-    station = build_station(SPIN_CONFIG)
-    proc = BiasSweep(
-        station,
-        {"sample_name": "S", "sample_id": "S-1", "comments": ""},
-        str(tmp_path),
-        measurement_vi="hall",
-    )
-    with pytest.raises(I2ASConfigError, match="bias_V"):
-        proc.initiate()
-
-
-def test_bias_ceiling_refuses_a_breakdown_bias() -> None:
-    """The setup's max_bias_V stops a bias that would destroy the barrier."""
-    station = build_station(SPIN_CONFIG)
-    vi = station.get_vi("mtj_bias")
-    assert vi._limits["bias_V"] == (-1.0, 1.0)
+    station, _ = _spin_station()
+    with pytest.raises(I2ASSafetyError):
+        station.get_vi("k2400_dc").initiate_measurement(source_function="voltage", source_voltage_V=1.4)
+    with pytest.raises(I2ASSafetyError):
+        station.get_vi("k2400_iv").initiate_measurement(sweep_start_V=-1.5, sweep_stop_V=1.5)

@@ -1749,17 +1749,36 @@ CONTROL_LIMIT_EXEMPTIONS: dict[tuple[str, str, str], str] = {
         "The source's own protective ceiling; the sourced current is already "
         "bounded, so this only sets headroom, and the instrument clamps it."
     ),
-    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "compliance_A"): (
-        "The SMU's own protective current ceiling; the applied bias is already "
-        "bounded by max_bias_V, so this only caps the current, and the "
-        "instrument clamps it to its range."
+    ("SMUDCMeasurementVI", "initiate_measurement", "compliance_A"): (
+        "The SMU's own protective current ceiling in voltage mode; the "
+        "sourced voltage is already bounded by max_source_voltage_V."
     ),
-    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "nplc"): (
-        "Integration time per conversion: a receive-side setting that costs "
-        "time, sources nothing, and the instrument refuses outside 0.01-10."
+    ("SMUDCMeasurementVI", "initiate_measurement", "compliance_V"): (
+        "The SMU's own protective voltage ceiling in current mode; the "
+        "sourced current is already bounded by max_source_current_A."
     ),
-    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "readings_per_point"): (
+    ("SMUDCMeasurementVI", "initiate_measurement", "nplc"): (
+        "Integration time per conversion: costs time, sources nothing; the "
+        "instrument refuses outside 0.01-10."
+    ),
+    ("SMUDCMeasurementVI", "initiate_measurement", "readings_per_point"): (
         "Dimensionless sample count; it costs time, not energy in the sample."
+    ),
+    ("SMUIVSweepMeasurementVI", "initiate_measurement", "compliance_A"): (
+        "The SMU's own protective current ceiling in voltage mode; the "
+        "sweep end points are already bounded by max_source_voltage_V."
+    ),
+    ("SMUIVSweepMeasurementVI", "initiate_measurement", "compliance_V"): (
+        "The SMU's own protective voltage ceiling in current mode; the "
+        "sweep end points are already bounded by max_source_current_A."
+    ),
+    ("SMUIVSweepMeasurementVI", "initiate_measurement", "nplc"): (
+        "Integration time per level: costs time, sources nothing; the "
+        "instrument refuses outside 0.01-10."
+    ),
+    ("SMUIVSweepMeasurementVI", "initiate_measurement", "points"): (
+        "Dimensionless level count; the levels lie between the bounded end "
+        "points, so more of them adds time, not excitation."
     ),
     # -- Closed-loop tuning constants and open-loop heater drive.
     ("SampleTemperatureControllerVI", "set_heater_output", "output_pct"): (
@@ -2704,6 +2723,29 @@ def test_measurement_vi_reading_setters_contract(vi_cls: type) -> None:
             f"{vi_cls.__name__}.{setter_name}() must accept the looped "
             f"parameter as a keyword named {param_name!r}"
         )
+
+
+@pytest.mark.parametrize(
+    "vi_cls", _all_measurement_vi_classes(), ids=lambda c: c.__name__
+)
+def test_measurement_vi_curve_keys_name_a_pair_of_its_arrays(vi_cls: type) -> None:
+    """``measurement_curve_keys`` is empty or an (x, y) pair of declared arrays.
+
+    The live plot draws each point's curve from exactly these two arrays,
+    so they must exist and be equally long for every reading.
+    """
+    keys = tuple(vi_cls.measurement_curve_keys)
+    if not keys:
+        return
+    assert len(keys) == 2, f"{vi_cls.__name__}.measurement_curve_keys must be an (x, y) pair"
+    assert set(keys) <= set(vi_cls.measurement_data_keys), (
+        f"{vi_cls.__name__}.measurement_curve_keys {keys} are not all measurement_data_keys"
+    )
+    vi = vi_cls(_build_sim_measurement_drivers())
+    defaults = {name: spec.default for name, spec in vi_cls.measurement_parameters.items()}
+    vi.initiate_measurement(**defaults)
+    data = vi.take_reading()
+    assert len(data[keys[0]]) == len(data[keys[1]]) > 1
 
 
 @pytest.mark.parametrize(

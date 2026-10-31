@@ -129,7 +129,7 @@ from i2as.core.capability_manifest import build_manifest, validate_manifest
 from i2as.core.events import CommandName, StationInfo
 from i2as.core.orchestrator import Orchestrator
 from i2as.core.paths import log_directory
-from i2as.core.plan import blocks_from_json, resolve_form
+from i2as.core.plan import EnvelopeBound, ExperimentEnvelope, blocks_from_json, resolve_form
 from i2as.analysis.bundle import new_bundle_id
 from i2as.session.drafting import (
     AssistantSettings,
@@ -1573,6 +1573,95 @@ SESSION_TOOLS: tuple[ToolSpec, ...] = (
         session_function="save_analysis_script_as_recipe",
         recorded=True,
     ),
+    ToolSpec(
+        name="start_experiment",
+        description=(
+            "Open a new experiment — the folder every following run, analysis "
+            "and agent-feed record is written into — exactly as the operator's "
+            "Start Experiment dialog does. Refused while another experiment is "
+            "open ('experiment_open'; close it first) or while the engine is "
+            "not IDLE ('engine_busy'). The experiment is owned by the station's "
+            "logged-in user and always starts ATTENDED: whether a human is "
+            "watching is the human's to declare, never an agent's. An optional "
+            "sample envelope may only NARROW the setup's own limits: every "
+            "bound must name an enveloped instrument (read_experiment / "
+            "read_status 'envelope_variables') and lie inside its configured "
+            "range ('envelope_wider_than_setup' otherwise)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "The experiment's title."},
+                "sample_name": {"type": "string", "description": "The sample's name."},
+                "sample_id": {"type": "string", "description": "The sample's identifier."},
+                "comments": {"type": "string", "description": "Free-text sample notes."},
+                "folder_label": {
+                    "type": "string",
+                    "description": "Label for the experiment folder; defaults to the title.",
+                },
+                "envelope": {
+                    "type": "object",
+                    "description": (
+                        "Per-instrument sample bounds, {vi_name: {min_value, "
+                        "max_value}}, in the instrument's setpoint unit."
+                    ),
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "min_value": {"type": ["number", "null"]},
+                            "max_value": {"type": ["number", "null"]},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["title", "sample_name"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.RUN_CONTROL,
+        session_function="start_experiment",
+        recorded=True,
+    ),
+    ToolSpec(
+        name="add_finding",
+        description=(
+            "Append one finding to the open experiment's findings — the "
+            "science notes a human reads first. Each finding is stamped with "
+            "the UTC time and the agent that wrote it, and the record keeps "
+            "every earlier finding: an agent adds to the notes, never rewrites "
+            "them. State the result, its uncertainty and which runs support it."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The finding (markdown)."},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.ANALYSIS,
+        session_function="add_finding",
+        recorded=True,
+    ),
+    ToolSpec(
+        name="close_experiment",
+        description=(
+            "Close the open experiment, as the operator's Close Experiment "
+            "does: its record is finalised, its sample envelope is lifted and "
+            "no further run writes into it. Refused while a run is in flight "
+            "or queued ('engine_busy') — finish or abort it first — and when "
+            "no experiment is open ('no_experiment')."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        action_class=ActionClass.RUN_CONTROL,
+        session_function="close_experiment",
+        recorded=True,
+    ),
 )
 
 
@@ -1730,6 +1819,9 @@ class ToolContext:
             ``call_session_tool()`` in a test), which stamps an unknown
             actor rather than refusing: the stamp is a record, not a
             permission.
+        current_user: Returns the roster id of the station's logged-in user,
+            who owns an experiment ``start_experiment`` opens. ``None`` uses
+            the Guest identity.
     """
 
     experiments: Any | None = None
@@ -1744,6 +1836,7 @@ class ToolContext:
     settings_source: Callable[[], Any] | None = None
     analysis_runner: Any | None = None
     actor: Any | None = None
+    current_user: Callable[[], str] | None = None
 
     def require_experiments(self, tool_name: str) -> Any:
         """Return the experiment façade, or refuse by name.
@@ -3479,6 +3572,183 @@ def feed_arguments(tool: ToolSpec, args: Mapping[str, Any]) -> dict[str, Any]:
     return recorded
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# The experiment lifecycle: start, findings, close
+# ══════════════════════════════════════════════════════════════════════════
+
+#: The roster id an experiment is owned by when no user is logged in.
+_GUEST_USER_ID = "guest"
+
+
+def _require_idle(context: ToolContext, tool_name: str) -> None:
+    """Refuse unless the engine is IDLE with no run in flight and none queued."""
+    snapshot = context.status_source() if context.status_source else None
+    state = str(getattr(snapshot, "state", "") or "")
+    run = getattr(snapshot, "run", None)
+    experiments = context.require_experiments(tool_name)
+    queued = list(experiments.queue_entries()) if hasattr(experiments, "queue_entries") else []
+    if state != "IDLE" or run or queued:
+        raise ToolError(
+            f"{tool_name} refused: the engine is {state or 'not reporting'}"
+            + (" with a run in flight" if run else "")
+            + (f" and {len(queued)} run(s) queued" if queued else "")
+            + "; finish, abort or dequeue first",
+            {"rule": "engine_busy", "state": state, "queued": len(queued)},
+        )
+
+
+def _variable_field(variable: Any, name: str) -> Any:
+    """Read one field of an envelope variable — a rendered dict or the typed object."""
+    if isinstance(variable, Mapping):
+        return variable.get(name)
+    return getattr(variable, name, None)
+
+
+def _agent_envelope(
+    tool_name: str, requested: Mapping[str, Any], variables: Mapping[str, Any]
+) -> ExperimentEnvelope | None:
+    """Build the envelope an agent asked for, refusing anything not a narrowing.
+
+    Args:
+        tool_name: The tool asking, for messages.
+        requested: ``{vi_name: {"min_value", "max_value"}}``.
+        variables: ``envelope_variables()`` — each enveloped VI's configured range.
+
+    Returns:
+        The envelope, or ``None`` when nothing was asked for.
+
+    Raises:
+        ToolError: For an unknown VI, an inverted range, or a bound outside
+            the setup's configured range.
+    """
+    bounds: dict[str, EnvelopeBound] = {}
+    for vi_name, entry in requested.items():
+        variable = variables.get(vi_name)
+        if variable is None:
+            raise ToolError(
+                f"{tool_name}: {vi_name!r} has no envelope; enveloped: {sorted(variables)}",
+                {"rule": "unknown_envelope_variable", "vi_name": vi_name},
+            )
+        low, high = entry.get("min_value"), entry.get("max_value")
+        config_min, config_max = _variable_field(variable, "config_min"), _variable_field(
+            variable, "config_max"
+        )
+        lower = config_min if low is None else float(low)
+        upper = config_max if high is None else float(high)
+        if lower is not None and upper is not None and lower > upper:
+            raise ToolError(
+                f"{tool_name}: {vi_name} envelope {lower}..{upper} is inverted",
+                {"rule": "inverted_envelope", "vi_name": vi_name},
+            )
+        too_low = config_min is not None and lower is not None and lower < config_min
+        too_high = config_max is not None and upper is not None and upper > config_max
+        if too_low or too_high:
+            raise ToolError(
+                f"{tool_name}: {vi_name} envelope {lower}..{upper} is wider than the "
+                f"setup allows ({config_min}..{config_max}); an envelope may only narrow",
+                {"rule": "envelope_wider_than_setup", "vi_name": vi_name,
+                 "config_min": config_min, "config_max": config_max},
+            )
+        bounds[vi_name] = EnvelopeBound(min_value=lower, max_value=upper)
+    return ExperimentEnvelope(bounds=bounds) if bounds else None
+
+
+def _experiment_summary(record: Any) -> dict[str, Any]:
+    """Return the fields an agent needs from an experiment record."""
+    return {
+        "experiment_id": record.experiment_id,
+        "title": record.title,
+        "user_id": record.user_id,
+        "sample_info": dict(record.sample_info),
+        "attended": bool(record.attended),
+        "envelope": dict(record.envelope),
+        "status": record.status,
+    }
+
+
+def _tool_start_experiment(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``start_experiment``: open an attended experiment, envelope narrowed only.
+
+    Raises:
+        ToolError: If one is already open, the engine is busy, the title is
+            empty or the envelope is not a narrowing of the setup's limits.
+    """
+    tool_name = "start_experiment"
+    experiments = context.require_experiments(tool_name)
+    current = experiments.current_experiment()
+    if current is not None:
+        raise ToolError(
+            f"{tool_name} refused: experiment {current.experiment_id!r} is open; "
+            "close it first",
+            {"rule": "experiment_open", "experiment_id": current.experiment_id},
+        )
+    _require_idle(context, tool_name)
+    title = str(args["title"]).strip()
+    if not title:
+        raise ToolError(f"{tool_name}: the title must not be empty", {"rule": "empty_title"})
+    envelope = _agent_envelope(
+        tool_name, dict(args.get("envelope") or {}), experiments.envelope_variables()
+    )
+    user_id = (context.current_user() if context.current_user else "") or _GUEST_USER_ID
+    try:
+        record = experiments.start_experiment(
+            title,
+            user_id,
+            {
+                "sample_name": str(args.get("sample_name", "")),
+                "sample_id": str(args.get("sample_id", "")),
+                "comments": str(args.get("comments", "")),
+            },
+            envelope=envelope,
+            attended=True,
+            experiment_dirname=str(args["folder_label"]) if args.get("folder_label") else None,
+        )
+    except ValueError as error:
+        raise ToolError(f"{tool_name} refused: {error}", {"rule": "invalid"}) from error
+    return _experiment_summary(record)
+
+
+def _tool_add_finding(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``add_finding``: append one stamped finding to the open experiment.
+
+    Raises:
+        ToolError: If no experiment is open or the text is empty.
+    """
+    tool_name = "add_finding"
+    experiments = context.require_experiments(tool_name)
+    record = experiments.current_experiment()
+    if record is None:
+        raise ToolError(f"{tool_name}: no experiment is open", {"rule": "no_experiment"})
+    text = str(args["text"]).strip()
+    if not text:
+        raise ToolError(f"{tool_name}: the finding is empty", {"rule": "empty_finding"})
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    entry = f"- **{stamp}** ({_actor_stamp(context)}): {text}"
+    existing = str(record.findings or "").rstrip()
+    experiments.set_findings(f"{existing}\n{entry}" if existing else entry)
+    return {
+        "experiment_id": record.experiment_id,
+        "findings_count": sum(1 for line in str(record.findings).splitlines() if line.startswith("- **")),
+    }
+
+
+def _tool_close_experiment(args: Mapping[str, Any], context: ToolContext) -> Any:
+    """Answer ``close_experiment``: finalise the open experiment.
+
+    Raises:
+        ToolError: If none is open or the engine is busy.
+    """
+    tool_name = "close_experiment"
+    experiments = context.require_experiments(tool_name)
+    record = experiments.current_experiment()
+    if record is None:
+        raise ToolError(f"{tool_name}: no experiment is open", {"rule": "no_experiment"})
+    _require_idle(context, tool_name)
+    experiment_id = record.experiment_id
+    experiments.close_experiment()
+    return {"experiment_id": experiment_id, "status": "closed"}
+
+
 #: One implementation per session tool answered here, keyed by
 #: ``ToolSpec.session_function``. ``probe_run`` is deliberately absent: it
 #: wraps ``run_procedure`` and is submitted like any other command.
@@ -3510,6 +3780,9 @@ SESSION_TOOL_FUNCTIONS: dict[str, Callable[[Mapping[str, Any], ToolContext], Any
     "select_analysis_bundle": _tool_select_analysis_bundle,
     "draft_analysis_summary": _tool_draft_analysis_summary,
     "save_analysis_script_as_recipe": _tool_save_analysis_script_as_recipe,
+    "start_experiment": _tool_start_experiment,
+    "add_finding": _tool_add_finding,
+    "close_experiment": _tool_close_experiment,
 }
 
 

@@ -30,12 +30,12 @@ def _range_for(current_A: float) -> float:
 
 
 class SimKeithley2400:
-    """Simulated Keithley 2400 SourceMeter sourcing voltage, measuring current.
+    """Simulated Keithley 2400 SourceMeter: source V or I, measure both.
 
-    The instrument is modelled in its constant-voltage configuration (source
-    ``VOLT``, sense ``CURR``, autorange on), which is how a tunnel junction is
-    measured: the bias across the barrier is what sets the tunnelling physics,
-    so it is the quantity held fixed. Its terminals are wired to the
+    Both source functions of the real instrument are modelled — ``VOLT``
+    (source voltage, measure current, limited by a current compliance) and
+    ``CURR`` (source current, measure voltage, limited by a voltage
+    compliance) — with autoranging measurement. Its terminals are wired to the
     ``PerpendicularMTJ`` on the sample holder of the sim environment named by
     the resource string's ``@<name>`` suffix (the sim-coupling standard,
     ``core/sim_environment.py``); field and temperature come from that same
@@ -46,13 +46,15 @@ class SimKeithley2400:
     * **Noise** per conversion: ``30 ppm of range + 60 ppm of reading`` rms
       at 1 PLC, scaling as ``1/sqrt(NPLC)``, plus a 0.4 pA offset.
     * **Conversion time**: ``NPLC / 50`` s per reading (50 Hz mains).
-    * **Compliance**: the measured current clips at the current compliance
-      and ``is_in_compliance()`` reports it, as the front-panel CMPL flag does.
+    * **Compliance**: in ``VOLT`` the current clips at the current
+      compliance; in ``CURR`` the voltage clips at the voltage compliance and
+      less current flows. ``is_in_compliance()`` reports it, as the
+      front-panel CMPL flag does.
     * **Output off**: no voltage reaches the sample; a reading returns only
       the offset and noise.
 
-    Safe state (the safe-shutdown standard): output OFF with the source level
-    at 0 V.
+    Safe state (the safe-shutdown standard): output OFF with both source
+    levels at zero.
     """
 
     def __init__(self, resource_string: str) -> None:
@@ -65,8 +67,11 @@ class SimKeithley2400:
         self._environment = sim_environment.for_resource(resource_string)
         self._rng = np.random.default_rng(2400)
         self._output_on: bool = False
+        self._source_function: str = "VOLT"
         self._source_voltage_V: float = 0.0
+        self._source_current_A: float = 0.0
         self._compliance_A: float = 105e-6
+        self._compliance_V: float = 21.0
         self._nplc: float = 1.0
         self._in_compliance: bool = False
         self._last_current_A: float = 0.0
@@ -86,6 +91,56 @@ class SimKeithley2400:
         """Return whether the output is on."""
         self._check_error()
         return self._output_on
+
+    def set_source_function(self, function: str) -> None:
+        """Select what the instrument sources (``:SOUR:FUNC VOLT|CURR``).
+
+        Raises:
+            I2ASInstrumentError: ``-224`` for anything but ``VOLT``/``CURR``.
+        """
+        self._check_error()
+        value = str(function).upper()
+        if value not in ("VOLT", "CURR"):
+            self._refuse(f"set_source_function({function!r})", "-224", "Illegal parameter value")
+        self._source_function = value
+
+    def get_source_function(self) -> str:
+        """Return ``"VOLT"`` or ``"CURR"``."""
+        self._check_error()
+        return self._source_function
+
+    def set_source_current(self, current_A: float) -> None:
+        """Set the source current level (``:SOUR:CURR:LEV``).
+
+        Raises:
+            I2ASInstrumentError: ``-222`` if outside the ±1.05 A source range.
+        """
+        self._check_error()
+        if abs(float(current_A)) > 1.05:
+            self._refuse(f"set_source_current({current_A!r})", "-222", "Parameter data out of range")
+        self._source_current_A = float(current_A)
+
+    def get_source_current(self) -> float:
+        """Return the programmed source current, amperes."""
+        self._check_error()
+        return self._source_current_A
+
+    def set_voltage_compliance(self, compliance_V: float) -> None:
+        """Set the voltage compliance (``:SENS:VOLT:PROT``), volts.
+
+        Raises:
+            I2ASInstrumentError: ``-222`` if outside ``(0, 210] V``.
+        """
+        self._check_error()
+        value = float(compliance_V)
+        if not 0.0 < value <= _MAX_SOURCE_V:
+            self._refuse(f"set_voltage_compliance({compliance_V!r})", "-222", "Parameter data out of range")
+        self._compliance_V = value
+
+    def get_voltage_compliance(self) -> float:
+        """Return the voltage compliance, volts."""
+        self._check_error()
+        return self._compliance_V
 
     def set_source_voltage(self, voltage_V: float) -> None:
         """Set the source voltage level (``:SOUR:VOLT:LEV``).
@@ -145,28 +200,37 @@ class SimKeithley2400:
     # Measure
     # ------------------------------------------------------------------
 
-    def measure_current(self) -> float:
-        """Trigger one conversion and return the measured current (``:READ?``).
+    def measure(self) -> tuple[float, float]:
+        """Trigger one conversion and return ``(voltage_V, current_A)`` (``:READ?``).
 
-        Returns:
-            The current in amperes, clipped at the compliance.
+        In ``VOLT`` the voltage is the programmed level and the current is
+        measured; in ``CURR`` the reverse. With the output off nothing
+        reaches the sample and only the offsets and noise are read.
         """
         self._check_error()
         time.sleep(self._nplc / 50.0)
-        if self._output_on:
-            mtj = sim_samples.sample_for(self._environment, sim_samples.MTJ)
-            true_current = mtj.current_A(self._source_voltage_V)
-        else:
-            true_current = 0.0
-        full_scale = _range_for(true_current)
         scale = 1.0 / np.sqrt(self._nplc)
-        noise_rms = (30e-6 * full_scale + 60e-6 * abs(true_current)) * scale
-        reading = true_current + 0.4e-12 + noise_rms * float(self._rng.standard_normal())
-        self._in_compliance = abs(reading) >= self._compliance_A
-        if self._in_compliance:
-            reading = float(np.copysign(self._compliance_A, reading))
-        self._last_current_A = reading
-        return reading
+        mtj = sim_samples.sample_for(self._environment, sim_samples.MTJ)
+        if self._source_function == "VOLT":
+            true_current = mtj.current_A(self._source_voltage_V) if self._output_on else 0.0
+            noise = (30e-6 * _range_for(true_current) + 60e-6 * abs(true_current)) * scale
+            current = true_current + 0.4e-12 + noise * float(self._rng.standard_normal())
+            self._in_compliance = abs(current) >= self._compliance_A
+            if self._in_compliance:
+                current = float(np.copysign(self._compliance_A, current))
+            voltage = self._source_voltage_V if self._output_on else 0.0
+        else:
+            if self._output_on:
+                voltage, current = mtj.voltage_for_current(self._source_current_A, self._compliance_V)
+            else:
+                voltage, current = 0.0, 0.0
+            self._in_compliance = self._output_on and abs(voltage) >= self._compliance_V * 0.999
+            # 1 V range: 15 ppm of range + 30 ppm of reading, plus 1 uV offset.
+            voltage = voltage + 1e-6 + (15e-6 + 30e-6 * abs(voltage)) * scale * float(
+                self._rng.standard_normal()
+            )
+        self._last_current_A = current
+        return voltage, current
 
     def is_in_compliance(self) -> bool:
         """Return whether the last conversion hit the current compliance."""
@@ -184,13 +248,18 @@ class SimKeithley2400:
 
     def safe_shutdown(self) -> None:
         """Turn the output off and zero the source level; idempotent, never raises."""
-        log.info("SimKeithley2400: safe shutdown — output OFF, 0 V.")
+        log.info("SimKeithley2400: safe shutdown — output OFF, levels zeroed.")
         self._output_on = False
         self._source_voltage_V = 0.0
+        self._source_current_A = 0.0
 
     def _is_in_safe_state(self) -> bool:
-        """Return True when no voltage can reach the sample."""
-        return not self._output_on and self._source_voltage_V == 0.0
+        """Return True when nothing can reach the sample."""
+        return (
+            not self._output_on
+            and self._source_voltage_V == 0.0
+            and self._source_current_A == 0.0
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle (the connection-lifecycle standard)

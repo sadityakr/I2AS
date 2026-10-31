@@ -606,7 +606,9 @@ class GatewayServer(QLocalServer):
             actor_id,
             station_info=self._station_info,
             tool_context=self._tool_context,
-            feed=self._resolve_feed(),
+            # The source, not one feed: the connection records each action
+            # into the experiment open when it acts (see Gateway).
+            feed=self._feed_source(),
         )
         logger.info(
             "Gateway server admitted %r under role %r", actor_id, role.value
@@ -620,6 +622,14 @@ class GatewayServer(QLocalServer):
                 "max_role": self.max_role.value,
             },
         )
+
+    def _feed_source(self) -> AgentFeed | Callable[[], AgentFeed | None] | None:
+        """Return what a new connection resolves its feed through.
+
+        A callable source is handed over as it is, so the connection follows
+        the open experiment; a fixed feed (tests) is handed over as the feed.
+        """
+        return self._feed if callable(self._feed) else self._resolve_feed()
 
     def _resolve_feed(self) -> AgentFeed | None:
         """Return the **Agent feed** a connection opening now records into.

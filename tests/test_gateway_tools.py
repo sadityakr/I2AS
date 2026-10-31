@@ -741,6 +741,9 @@ def test_no_tool_reaches_the_notebook(tools):
         "select_analysis_bundle",
         "draft_analysis_summary",
         "save_analysis_script_as_recipe",
+        "start_experiment",
+        "add_finding",
+        "close_experiment",
     }, "a tool an agent polls must not drown the accountability trail"
     assert tools["draft_analysis_summary"].action_class is ActionClass.ANALYSIS
 

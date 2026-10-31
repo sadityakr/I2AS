@@ -368,6 +368,28 @@ class BaseProcedure:
         return list(cls.measurement_data_keys)
 
     @classmethod
+    def live_plot_curve_keys(
+        cls, station: Station, selections: Mapping[str, Any] | None = None
+    ) -> list[str]:
+        """Return the measurement's per-point curve array keys, for curve plots.
+
+        A measurement whose arrays are a curve taken at every sweep point (an
+        I–V sweep) declares the ``(x, y)`` pair as
+        ``measurement_curve_keys``; the live plot offers those ``*_array``
+        keys as axes and, when both axes are curve keys, draws each point's
+        curve instead of one value per point. The default: none.
+
+        Args:
+            station: The active Station (unused by the default).
+            selections: Current structural-parameter values (unused by the default).
+
+        Returns:
+            The curve keys, ``[]`` by default.
+        """
+        _ = (station, selections)
+        return []
+
+    @classmethod
     def live_plot_loop_labels(
         cls, station: Station, selections: Mapping[str, Any] | None = None
     ) -> tuple[dict[str, str] | None, dict[str, str] | None]:
@@ -1667,6 +1689,19 @@ class SweepMeasureProcedure(BaseProcedure):
             params=dict(vi.active_measurement_parameters),
             when=When({"measurement_vi": (vi_name,)}),
         )
+
+    @classmethod
+    def live_plot_curve_keys(
+        cls, station: Station, selections: Mapping[str, Any] | None = None
+    ) -> list[str]:
+        """Return the selected measurement VI's per-point curve keys (may be empty)."""
+        names = station.measurement_vi_names()
+        if not names:
+            return []
+        selected = (selections or {}).get("measurement_vi")
+        if selected not in names:
+            selected = names[0]
+        return list(getattr(station.get_vi(selected), "measurement_curve_keys", ()))
 
     @classmethod
     def live_plot_measurement_keys(

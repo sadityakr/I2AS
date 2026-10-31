@@ -227,8 +227,54 @@ class PerpendicularMTJ:
             self.free = -1
             self._noise_down = float(self._rng.standard_normal())
 
+    def _reading_state(self, bias_V: float) -> dict[str, Any]:
+        """Draw everything one conversion shares: state, drift, noise.
+
+        Advances the magnetic state for *bias_V*, then fixes for this one
+        reading the drifting resistances, whether the free layer reads as
+        parallel (random telegraph noise near a switching field at high
+        temperature) and the per-reading noise factor — so a solver may
+        evaluate the junction at many trial biases within one reading.
+        """
+        self._advance(bias_V)
+        temperature = self.temperature_K
+        parallel = self.free == self.reference
+        if temperature > 150.0:
+            # Random telegraph noise close to a switching field at high
+            # temperature: the free layer hops thermally for one reading
+            # without switching for good.
+            h_down, h_up = self.switching_fields(temperature, bias_V)
+            margin = abs(self.field_T - (h_up if self.free < 0 else h_down))
+            if margin < 0.0012 and self._rng.random() < 0.22:
+                parallel = not parallel
+        white = self.WHITE_NOISE_P if parallel else self.WHITE_NOISE_AP
+        return {
+            "temperature": temperature,
+            "parallel": parallel,
+            "r_p": self.resistance_p(temperature) * (1.0 + self._drift.value()),
+            "lead": 22.0 + self._lead.value(),
+            "noise": 1.0 + white * float(self._rng.standard_normal()),
+        }
+
+    def _transport(self, v: float, state: dict[str, Any]) -> float:
+        """Return the current at bias *v* for one reading's fixed *state*."""
+        if self.broken:
+            return v / (self.SHORTED_R + state["lead"])
+        if v == 0.0:
+            return 0.0
+        r_p, temperature = state["r_p"], state["temperature"]
+        i_p = (self.V0 / r_p) * math.sinh(v / self.V0) * (1.0 + self.ASYMMETRY * v)
+        if state["parallel"]:
+            i_junction = i_p
+        else:
+            tmr = self.tmr_zero_bias(temperature) / (1.0 + (v / self.v_half(temperature)) ** 2)
+            i_junction = i_p / (1.0 + tmr)
+        i_junction *= state["noise"]
+        # Leads in series: a small correction, solved to first order.
+        return v / (v / i_junction + state["lead"])
+
     def current_A(self, bias_V: float) -> float:
-        """Return the noiseless-but-drifting tunnelling current at *bias_V*.
+        """Apply a bias and return the tunnelling current (one reading).
 
         Args:
             bias_V: The voltage across the junction, volts.
@@ -237,34 +283,41 @@ class PerpendicularMTJ:
             The current, amperes (sign follows the bias).
         """
         self._bias_V = float(bias_V)
-        self._advance(self._bias_V)
-        temperature = self.temperature_K
-        lead_ohm = 22.0 + self._lead.value()
-        if self.broken:
-            return self._bias_V / (self.SHORTED_R + lead_ohm)
-        r_p = self.resistance_p(temperature) * (1.0 + self._drift.value())
-        v = self._bias_V
-        i_p = (self.V0 / r_p) * math.sinh(v / self.V0) * (1.0 + self.ASYMMETRY * v)
-        parallel = self.free == self.reference
-        if temperature > 150.0:
-            # Random telegraph noise close to a switching field at high
-            # temperature: the free layer hops thermally for one reading
-            # without switching for good.
-            h_down, h_up = self.switching_fields(temperature, v)
-            margin = abs(self.field_T - (h_up if self.free < 0 else h_down))
-            if margin < 0.0012 and self._rng.random() < 0.22:
-                parallel = not parallel
-        if parallel:
-            i_junction = i_p * (1.0 + self.WHITE_NOISE_P * float(self._rng.standard_normal()))
+        state = self._reading_state(self._bias_V)
+        return self._transport(self._bias_V, state)
+
+    def voltage_for_current(self, current_A: float, compliance_V: float) -> tuple[float, float]:
+        """Drive a current through the junction and return what develops (one reading).
+
+        The voltage the junction needs is found by bisection on the
+        (monotonic) I–V of this reading. If it exceeds *compliance_V* the
+        source clamps at the compliance and less current flows — exactly
+        what protects a barrier from a mistyped current.
+
+        Args:
+            current_A: The sourced current, amperes.
+            compliance_V: The source's voltage compliance, volts (> 0).
+
+        Returns:
+            ``(voltage_V, current_A)`` actually across and through the junction.
+        """
+        state = self._reading_state(self._bias_V)
+        limit = abs(float(compliance_V))
+        target = float(current_A)
+        if abs(self._transport(math.copysign(limit, target), state)) <= abs(target):
+            v = math.copysign(limit, target) if target != 0.0 else 0.0
         else:
-            tmr = self.tmr_zero_bias(temperature) / (1.0 + (v / self.v_half(temperature)) ** 2)
-            i_junction = i_p / (1.0 + tmr)
-            i_junction *= 1.0 + self.WHITE_NOISE_AP * float(self._rng.standard_normal())
-        # Leads in series: a small correction, solved to first order.
-        if v != 0.0:
-            r_junction = v / i_junction
-            return v / (r_junction + lead_ohm)
-        return 0.0
+            lo, hi = (0.0, limit) if target > 0 else (-limit, 0.0)
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if self._transport(mid, state) < target:
+                    lo = mid
+                else:
+                    hi = mid
+            v = 0.5 * (lo + hi)
+        self._bias_V = v
+        self._advance(v)
+        return v, self._transport(v, state)
 
 
 class PerpendicularHallBar:

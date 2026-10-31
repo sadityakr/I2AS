@@ -314,6 +314,28 @@ class AgentFeed:
             self._path,
         )
 
+    def detach(self, engine: _Engine) -> None:
+        """Unsubscribe from the streams ``attach()`` connected; idempotent.
+
+        Called when this feed's experiment closes, so verdicts the engine
+        answers afterwards are not written into a finished experiment's trail.
+
+        Args:
+            engine: The engine (or client adapter) passed to ``attach()``.
+        """
+        verdict_stream = getattr(engine, "verdict_emitted", None)
+        if verdict_stream is None:
+            verdict_stream = engine.verdict
+        event_stream = getattr(engine, "event_emitted", None)
+        if event_stream is None:
+            event_stream = engine.event
+        for stream, slot in ((verdict_stream, self.record_verdict), (event_stream, self.record_event)):
+            try:
+                stream.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass  # never connected, or already detached
+        logger.info("Agent feed detached for experiment %r", self.experiment_id)
+
     # ── Recording ─────────────────────────────────────────────────────
 
     def record_command(self, command: Command) -> None:

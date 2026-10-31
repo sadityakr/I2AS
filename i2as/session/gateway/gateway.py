@@ -51,7 +51,7 @@ the contract's own names, ``verdict``/``event``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any, Protocol
 
@@ -194,7 +194,7 @@ class Gateway:
         *,
         station_info: StationInfo | Any | None = None,
         tool_context: ToolContext | None = None,
-        feed: AgentFeed | None = None,
+        feed: AgentFeed | Callable[[], AgentFeed | None] | None = None,
     ) -> None:
         """Attach to an engine under a declared role.
 
@@ -219,8 +219,12 @@ class Gateway:
                 it every command tool still works and the three
                 declaration-reading tools still answer from the mirror, while
                 a tool whose collaborator is absent is refused by name.
-            feed: The experiment's **Agent feed**, or ``None`` to record
-                nothing. Given one, every command this connection submits is
+            feed: The experiment's **Agent feed**, a zero-argument callable
+                returning the open experiment's feed (resolved at every
+                action, so a connection that outlives an experiment — or
+                opens and closes experiments itself — records each action
+                into the experiment open when it acted), or ``None`` to
+                record nothing. Every command this connection submits is
                 written to it before it is forwarded or refused. Attaching
                 the same feed to the engine (``AgentFeed.attach()``) is what
                 records the answering verdicts and the state changes; the
@@ -498,6 +502,17 @@ class Gateway:
         """
         return Command(name=name, actor=self.actor, args=dict(args or {}))
 
+    def _current_feed(self) -> AgentFeed | None:
+        """Return the feed to record into now (resolving a callable source)."""
+        feed = self._feed
+        if callable(feed) and not isinstance(feed, AgentFeed):
+            try:
+                feed = feed()
+            except Exception:  # noqa: BLE001 — no trail is better than a failed action
+                logger.exception("Gateway could not resolve the agent feed")
+                return None
+        return feed if isinstance(feed, AgentFeed) else None
+
     def _record(self, command: Command) -> None:
         """Write one submitted command to the **Agent feed**, when there is one.
 
@@ -508,8 +523,9 @@ class Gateway:
         Args:
             command: The command about to be authorized.
         """
-        if self._feed is not None:
-            self._feed.record_command(command)
+        feed = self._current_feed()
+        if feed is not None:
+            feed.record_command(command)
 
     def _authorize(self, command: Command) -> Verdict | None:
         """Run the permission check for one command against the current mirror.
@@ -720,14 +736,18 @@ class Gateway:
         Returns:
             The answer dict, carrying ``result`` on success.
         """
+        # The trail this call belongs to is the experiment open when it was
+        # asked — resolved first, so start/close_experiment are recorded in
+        # the experiment they closed or (for start) into the one they opened.
+        feed = self._current_feed()
         refusal = self._authorize_session_tool(tool)
         if refusal is not None:
-            return self._record_tool_call(tool, args, refusal)
+            return self._record_tool_call(tool, args, refusal, feed)
         try:
             result = call_session_tool(tool, args, self._tool_context)
         except ToolError as error:
             return self._record_tool_call(
-                tool, args, self._tool_failure(tool.name, str(error), error.detail)
+                tool, args, self._tool_failure(tool.name, str(error), error.detail), feed
             )
         except Exception as error:  # noqa: BLE001 — a tool never raises at its caller
             logger.exception("call_tool(%s) failed", tool.name)
@@ -739,6 +759,7 @@ class Gateway:
                     f"{tool.name} failed: {error}",
                     {"rule": "unexpected_error", "error": type(error).__name__},
                 ),
+                feed,
             )
         return self._record_tool_call(
             tool,
@@ -751,10 +772,15 @@ class Gateway:
                 "detail": {},
                 "result": result,
             },
+            feed,
         )
 
     def _record_tool_call(
-        self, tool: ToolSpec, args: Mapping[str, Any], answer: dict[str, Any]
+        self,
+        tool: ToolSpec,
+        args: Mapping[str, Any],
+        answer: dict[str, Any],
+        feed: AgentFeed | None = None,
     ) -> dict[str, Any]:
         """Write one answered session tool to the **Agent feed**, and pass it on.
 
@@ -774,13 +800,18 @@ class Gateway:
             tool: The tool that was called.
             args: The arguments it was called with.
             answer: The answer about to be returned, refusal or success.
+            feed: The feed resolved when the call was asked; when that was
+                none (no experiment open — e.g. ``start_experiment``) the
+                feed open now is used, so the call that opened an
+                experiment is the first record in its trail.
 
         Returns:
             *answer*, unchanged, so this sits on the return path.
         """
-        if self._feed is None or not tool.recorded:
+        feed = feed if feed is not None else self._current_feed()
+        if feed is None or not tool.recorded:
             return answer
-        self._feed.record_tool_call(
+        feed.record_tool_call(
             self.actor,
             tool.name,
             feed_arguments(tool, args),

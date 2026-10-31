@@ -239,6 +239,9 @@ def gateway_tool_context(
         settings_source=(lambda: config_store.current) if config_store is not None else None,
         draft_client=draft_client,
         assistant_settings=assistant_settings,
+        # The logged-in user owns an experiment an agent opens (Guest when
+        # nobody is), exactly as the Start Experiment dialog defaults it.
+        current_user=lambda: app_settings.current_user_id() or GUEST_USER_ID,
     )
 
 
@@ -294,6 +297,21 @@ class ExperimentFeeds:
         self._manager = manager
         self._engine = engine
         self._feeds: dict[str, AgentFeed] = {}
+        # Exactly one feed is attached to the engine: the open experiment's.
+        # A closed experiment's feed is detached, so verdicts answered after
+        # it closed never land in its trail; the next experiment's is
+        # attached as soon as it opens, so its first verdict is not missed.
+        manager.experiment_changed.connect(self._sync)
+        self._sync()
+
+    def _sync(self, _record: object = None) -> None:
+        """Attach the open experiment's feed and detach every other one."""
+        experiment = self._manager.current_experiment()
+        open_id = experiment.experiment_id if experiment is not None else None
+        for experiment_id in [eid for eid in self._feeds if eid != open_id]:
+            self._feeds.pop(experiment_id).detach(self._engine)
+        if open_id is not None:
+            self.current()
 
     def current(self) -> AgentFeed | None:
         """Return the open experiment's feed, attached, or ``None``.

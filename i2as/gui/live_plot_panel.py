@@ -24,9 +24,9 @@ def _to_float(raw: Any) -> float:
     Every plottable column is already a scalar: computing it — the mean of
     a quantity's raw samples — is the measurement method's responsibility
     (``MeasurementInstrumentBase.mean_and_sem``), never the plot panel's.
-    ``*_array`` columns are excluded from the plottable key list, so this
-    function does no array reduction; a non-scalar reaching it is a bug
-    upstream, not something to paper over here.
+    ``*_array`` columns are offered only as per-point curve keys, which are
+    drawn whole (curve mode, see ``_curve_values``) and never reduced here; a
+    non-scalar reaching this function is a bug upstream.
 
     Args:
         raw: The raw value pulled from a datapoint dict (may be ``None``
@@ -36,6 +36,17 @@ def _to_float(raw: Any) -> float:
         The value as a float, or NaN when the value is ``None``.
     """
     return float("nan") if raw is None else float(raw)
+
+
+#: How many earlier points' curves a curve plot keeps on screen, faded.
+CURVE_HISTORY = 6
+
+
+def _curve_values(raw: Any) -> list[float]:
+    """Return a per-point curve column (one reading's array) as floats."""
+    if raw is None or not hasattr(raw, "__len__"):
+        return []
+    return [_to_float(value) for value in raw]
 
 
 class LivePlotPanel(QGroupBox):
@@ -83,6 +94,10 @@ class LivePlotPanel(QGroupBox):
         # Last datapoint history handed to redraw(); a selector change redraws
         # against this without the parent re-supplying it.
         self._datapoints: list[dict] = []
+        # The measurement's per-point curve pair (see set_curve_default) and
+        # whether the next set_available_keys must select it.
+        self._curve_pair: tuple[str | None, str | None] = (None, None)
+        self._force_curve = False
 
         vlay = QVBoxLayout(self)
 
@@ -134,11 +149,36 @@ class LivePlotPanel(QGroupBox):
             [], [], pen=pen, symbol="o", symbolSize=5,
             symbolBrush=series_color, symbolPen=series_color,
         )
+        # Curve mode (a measurement's per-point curve, e.g. an I–V sweep, on
+        # both axes): earlier points' curves stay on screen, faded, behind the
+        # newest one, which is drawn with self._curve.
+        faded = pg.mkColor(series_color)
+        faded.setAlpha(70)
+        self._history_curves = [
+            self._plot_widget.plot([], [], pen=pg.mkPen(faded, width=1.5))
+            for _ in range(CURVE_HISTORY)
+        ]
         vlay.addWidget(self._plot_widget)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_curve_default(self, x_key: str | None, y_key: str | None) -> None:
+        """Declare the measurement's per-point curve pair (or ``None, None``).
+
+        When the pair changes — a curve-producing method was just selected —
+        the next ``set_available_keys`` selects it on both axes even though
+        the previous choices may still be valid keys: a new curve method is
+        a reason to show its curve.
+
+        Args:
+            x_key: The curve's x ``*_array`` key, or ``None``.
+            y_key: The curve's y ``*_array`` key, or ``None``.
+        """
+        pair = (x_key, y_key)
+        self._force_curve = pair != self._curve_pair and x_key is not None and y_key is not None
+        self._curve_pair = pair
 
     def set_available_keys(
         self, keys: list[str], default_x: str, default_y: str | None
@@ -176,6 +216,11 @@ class LivePlotPanel(QGroupBox):
             else:
                 sel.setCurrentText(keys[0])
             sel.blockSignals(False)
+        x_curve, y_curve = self._curve_pair
+        if self._force_curve and x_curve in keys and y_curve in keys:
+            self._x_selector.setCurrentText(x_curve)
+            self._y_selector.setCurrentText(y_curve)
+        self._force_curve = False
 
     def set_available_loop_labels(
         self, label_maps: tuple[dict[int, str] | None, dict[int, str] | None]
@@ -232,6 +277,8 @@ class LivePlotPanel(QGroupBox):
         """Empty the curve (does not touch the selectors)."""
         self._datapoints = []
         self._curve.setData([], [])
+        for item in self._history_curves:
+            item.setData([], [])
 
     # ------------------------------------------------------------------
     # Internals
@@ -271,13 +318,34 @@ class LivePlotPanel(QGroupBox):
             except (IndexError, TypeError):
                 return None
 
-        xs = []
-        ys = []
-        for dp in self._datapoints:
-            xs.append(_to_float(_lookup(dp, x_key)))
-            ys.append(_to_float(_lookup(dp, y_key)))
-
-        self._curve.setData(xs, ys)
+        if x_key.endswith("_array") and y_key.endswith("_array"):
+            # Curve mode: each datapoint carries a whole curve; draw the
+            # newest in full and the few before it faded behind.
+            recent = self._datapoints[-(CURVE_HISTORY + 1):]
+            curves = [
+                (_curve_values(_lookup(dp, x_key)), _curve_values(_lookup(dp, y_key)))
+                for dp in recent
+            ]
+            newest = curves[-1] if curves else ([], [])
+            self._curve.setData(*newest)
+            older = curves[:-1][::-1]
+            for index, item in enumerate(self._history_curves):
+                item.setData(*(older[index] if index < len(older) else ([], [])))
+        elif x_key.endswith("_array") or y_key.endswith("_array"):
+            # A curve key against a scalar has no meaning: draw nothing until
+            # the other axis is chosen too.
+            self._curve.setData([], [])
+            for item in self._history_curves:
+                item.setData([], [])
+        else:
+            xs = []
+            ys = []
+            for dp in self._datapoints:
+                xs.append(_to_float(_lookup(dp, x_key)))
+                ys.append(_to_float(_lookup(dp, y_key)))
+            self._curve.setData(xs, ys)
+            for item in self._history_curves:
+                item.setData([], [])
         x_label = x_key.replace("_", " ")
         y_label = y_key.replace("_", " ")
         qualifier_text = ", ".join(qualifiers)

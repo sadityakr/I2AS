@@ -801,18 +801,29 @@ class ProcedureWindow(QMainWindow):
         meas_keys = cls.live_plot_measurement_keys(
             self._station, self._params_panel.current_selections()
         )
-        keys = ["unix_time"] + list(cls.sweep_data_keys) + system_keys + meas_keys
+        curve_keys = cls.live_plot_curve_keys(
+            self._station, self._params_panel.current_selections()
+        )
+        keys = (
+            ["unix_time"] + list(cls.sweep_data_keys) + system_keys + meas_keys + curve_keys
+        )
         if not keys:
             return
 
         default_x = cls.default_x_key if cls.default_x_key in keys else keys[0]
-
-        # Per-panel Y defaults: Plot 1 → resistance when the measurement
-        # derives one (a voltage-biased junction, whose voltage is the
-        # constant it holds), else voltage; Plot 2 → current.
-        plot1_y = "resistance_ohm" if "resistance_ohm" in keys else "voltage_V"
-        self._plot1.set_available_keys(keys, default_x, plot1_y)
-        self._plot2.set_available_keys(keys, default_x, "current_A")
+        plot_r = "resistance_ohm" if "resistance_ohm" in keys else "voltage_V"
+        if len(curve_keys) >= 2:
+            # A per-point curve (an I–V sweep): Plot 1 draws each point's
+            # curve, Plot 2 the curve's reduction (resistance) along the axis.
+            self._plot1.set_curve_default(curve_keys[0], curve_keys[1])
+            self._plot1.set_available_keys(keys, curve_keys[0], curve_keys[1])
+            self._plot2.set_available_keys(keys, default_x, plot_r)
+        else:
+            # Plot 1 → resistance when the measurement derives one, else
+            # voltage; Plot 2 → current.
+            self._plot1.set_curve_default(None, None)
+            self._plot1.set_available_keys(keys, default_x, plot_r)
+            self._plot2.set_available_keys(keys, default_x, "current_A")
 
         # Refresh the loop selectors based on the current selections.
         self._refresh_loop_selectors()

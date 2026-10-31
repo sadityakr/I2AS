@@ -1816,6 +1816,12 @@ class MeasurementInstrumentBase(BaseVirtualInstrument):
     # image-block standard): block name -> ImageBlock declaration. Empty
     # (the default) means the VI takes no frames.
     measurement_image_blocks: ClassVar[dict[str, ImageBlock]] = {}
+    # Per-point curves: an (x, y) pair of measurement_data_keys whose arrays
+    # are not repeated samples of one value but a curve taken at every sweep
+    # point — an I–V sweep's (voltage_V_array, current_A_array). The live
+    # plot offers the pair as axes and draws each point's curve; empty (the
+    # default) means every array is repeated samples, reduced to mean/SEM.
+    measurement_curve_keys: ClassVar[tuple[str, ...]] = ()
     # Reading-loop declaration: parameter name -> per-reading setter method.
     # Empty (the default) means no parameter of this VI can be looped.
     reading_setters: ClassVar[dict[str, str]] = {}
