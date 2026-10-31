@@ -807,8 +807,11 @@ class ProcedureWindow(QMainWindow):
 
         default_x = cls.default_x_key if cls.default_x_key in keys else keys[0]
 
-        # Per-panel Y defaults: Plot 1 → voltage, Plot 2 → current.
-        self._plot1.set_available_keys(keys, default_x, "voltage_V")
+        # Per-panel Y defaults: Plot 1 → resistance when the measurement
+        # derives one (a voltage-biased junction, whose voltage is the
+        # constant it holds), else voltage; Plot 2 → current.
+        plot1_y = "resistance_ohm" if "resistance_ohm" in keys else "voltage_V"
+        self._plot1.set_available_keys(keys, default_x, plot1_y)
         self._plot2.set_available_keys(keys, default_x, "current_A")
 
         # Refresh the loop selectors based on the current selections.

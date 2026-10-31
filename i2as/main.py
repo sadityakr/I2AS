@@ -23,6 +23,7 @@ from i2as.core.config import (
     read_panels_config,
     read_request_spool_config,
     read_safety_config,
+    read_tick_interval_ms,
     read_trends_config,
 )
 from i2as.core.procedure_catalog import build_procedure_infos, discover_run_catalog
@@ -497,7 +498,10 @@ def main(
             else None
         )
         return {
-            "tick_interval_ms": 3000,
+            # The setup's own cadence (monitor.yaml's tick_interval_ms): a
+            # fast-stepping rack declares a shorter tick, and every
+            # tick-counted duration downstream is converted with it.
+            "tick_interval_ms": read_tick_interval_ms(build["used_path"]),
             "manual_override_timeout_s": safety_config["manual_override_timeout_s"],
             "stall_seconds": safety_config["stall_seconds"],
             "hold_enforcement_interval_s": safety_config[

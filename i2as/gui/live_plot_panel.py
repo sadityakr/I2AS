@@ -160,23 +160,22 @@ class LivePlotPanel(QGroupBox):
         if not keys:
             return
 
-        for sel in (self._x_selector, self._y_selector):
+        # A still-valid previous choice is kept; otherwise the declared
+        # default applies (when it is one of the keys), and only then the
+        # first key. The previous choice must be read BEFORE the combo is
+        # cleared — after addItems() it always names some key.
+        for sel, default in ((self._x_selector, default_x), (self._y_selector, default_y)):
             prev = sel.currentText()
             sel.blockSignals(True)
             sel.clear()
             sel.addItems(keys)
-            sel.setCurrentText(prev if prev in keys else keys[0])
+            if prev in keys:
+                sel.setCurrentText(prev)
+            elif default is not None and default in keys:
+                sel.setCurrentText(default)
+            else:
+                sel.setCurrentText(keys[0])
             sel.blockSignals(False)
-
-        # Apply sensible defaults only when the current selection is blank/unknown.
-        if self._x_selector.currentText() not in keys:
-            self._x_selector.setCurrentText(default_x)
-        if (
-            default_y is not None
-            and self._y_selector.currentText() not in keys
-            and default_y in keys
-        ):
-            self._y_selector.setCurrentText(default_y)
 
     def set_available_loop_labels(
         self, label_maps: tuple[dict[int, str] | None, dict[int, str] | None]
