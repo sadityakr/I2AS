@@ -1642,14 +1642,22 @@ class Orchestrator(QObject):
             A JSON-safe dict.
         """
         actor = self._queued_actors.get(id(run), ev.OPERATOR)
+        # What a queue view needs to say WHAT will run: the run's own label
+        # and its scalar parameters (a live run has no spec to read them from).
+        raw_params = getattr(run, "params", None)
+        params = {
+            str(key): value
+            for key, value in (raw_params.items() if isinstance(raw_params, dict) else ())
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
         return {
             "spec_id": "",
             "kind": kind,
             "run_class": type(run).__name__,
-            "params": {},
+            "params": params,
             "sample_info": {},
             "data_directory": "",
-            "file_prefix": "",
+            "file_prefix": str(getattr(run, "file_prefix", "") or ""),
             "actor": actor.to_json(),
             "queued_at": 0.0,
         }

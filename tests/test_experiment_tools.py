@@ -67,6 +67,7 @@ def lab(qtbot, tmp_path):
         qtbot.waitUntil(lambda: gateway.status() is not None, timeout=3000)
         return gateway
 
+    build.station = station
     yield build, manager, store
     orch.shutdown()
 
@@ -148,3 +149,27 @@ def test_an_observer_cannot_open_or_close(lab) -> None:
     answer = build(Role.OBSERVER).call_tool("start_experiment", {"title": "t", "sample_name": "s"})
     assert not answer["ok"]
     assert manager.current_experiment() is None
+
+
+def test_an_agent_queued_run_is_visible_in_the_queue_panel(lab, qtbot) -> None:
+    """A run an agent hands to the engine is listed, labelled with who queued it."""
+    from i2as.gui.queue_panel import QueuePanel
+
+    build, manager, _ = lab
+    gateway = build()
+    gateway.call_tool("start_experiment", {"title": "t", "sample_name": "s"})
+    panel = QueuePanel(
+        build.station, gateway._engine, get_experiment_info=lambda: {},
+        queue_host=manager.run_queue_host, procedure_classes=[FieldSweep],
+    )
+    qtbot.addWidget(panel)
+    for prefix in ("first", "RH_0.05V"):
+        gateway.call_tool(
+            "queue_procedure" if prefix != "first" else "run_procedure",
+            {"procedure": "FieldSweep", "file_prefix": prefix,
+             "params": {"field_steps": 3, "init_wait": 30.0, "set_temperature": False},
+             "sample_info": {"sample_name": "s", "sample_id": "", "comments": ""}},
+        )
+    qtbot.waitUntil(lambda: panel._queue_list.count() >= 1, timeout=3000)
+    text = panel._queue_list.item(0).text()
+    assert "[RH_0.05V] Field Sweep" in text and "queued by agent 'agent-7'" in text

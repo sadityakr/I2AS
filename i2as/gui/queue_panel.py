@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import qtawesome as qta
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -140,6 +141,9 @@ class QueuePanel(QGroupBox):
         # The rendered rows: every pending spec the queue holds, plus the
         # running/finished ones it no longer does.
         self._queue: list[QueueEntry] = []
+        # Runs queued straight to the engine (an agent's queue_procedure),
+        # shown read-only ahead of the session queue — see _on_event.
+        self._engine_entries: list[dict] = []
         # The entry a reorder wants to stay selected. Held across the
         # rebuild rather than applied once, because the QueueChanged that
         # rebuilds the list can arrive after the reorder call has
@@ -326,6 +330,13 @@ class QueuePanel(QGroupBox):
                 ``QueueChanged`` is ignored.
         """
         if isinstance(event, QueueChanged):
+            # Runs handed to the engine directly (an agent's queue_procedure)
+            # carry no spec id; they are not this panel's to reorder, but the
+            # operator must SEE them — and who queued them — so they are
+            # listed, read-only, ahead of the session queue they run before.
+            self._engine_entries = [
+                dict(entry) for entry in event.entries if not entry.get("spec_id")
+            ]
             self._sync_from_queue()
 
     def _sync_from_queue(self) -> None:
@@ -408,7 +419,7 @@ class QueuePanel(QGroupBox):
         A row that is running or finished has already left the queue, so there
         is nothing to remove or reorder.
         """
-        row = self._queue_list.currentRow()
+        row = self._queue_list.currentRow() - len(self._engine_entries)
         if row < 0 or row >= len(self._queue):
             return None
         entry = self._queue[row]
@@ -585,10 +596,32 @@ class QueuePanel(QGroupBox):
         summary_parts = self._queue_summary_parts(cls, spec.params)
         return f"{label} ({', '.join(summary_parts)})"
 
+    def _engine_entry_summary(self, raw: dict) -> str:
+        """Return the one-line summary of a run queued straight to the engine."""
+        cls = self._classes.get(str(raw.get("run_class", "")))
+        name = getattr(cls, "name", "") or str(raw.get("run_class", "run"))
+        prefix = str(raw.get("file_prefix") or "")
+        label = f"[{prefix}] {name}" if prefix else name
+        params = dict(raw.get("params") or {})
+        if cls is not None and params:
+            try:
+                label = f"{label} ({', '.join(self._queue_summary_parts(cls, params))})"
+            except (KeyError, TypeError):
+                pass
+        actor = raw.get("actor") or {}
+        if actor.get("kind") and actor.get("kind") != "operator":
+            label = f"{label} — queued by {actor.get('kind')} '{actor.get('id', '?')}'"
+        return label
+
     def _refresh_queue_list(self) -> None:
         """Rebuild the QListWidget from self._queue, annotating non-pending status."""
         self._queue_list.clear()
-        for idx, entry in enumerate(self._queue):
+        engine_entries = self._engine_entries
+        for idx, raw in enumerate(engine_entries):
+            item = QListWidgetItem(f"{idx + 1}. {self._engine_entry_summary(raw)}")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self._queue_list.addItem(item)
+        for idx, entry in enumerate(self._queue, start=len(engine_entries)):
             label = f"{idx + 1}. {self._entry_summary(entry)}"
             if entry.status != STATUS_PENDING:
                 label = f"{label}  — {entry.status}"

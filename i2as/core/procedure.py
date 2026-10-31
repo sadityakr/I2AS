@@ -613,6 +613,11 @@ class BaseProcedure:
     # ------------------------------------------------------------------
 
     @property
+    def params(self) -> dict[str, Any]:
+        """A copy of the run's resolved parameter values (read-only view)."""
+        return dict(self._params)
+
+    @property
     def file_prefix(self) -> str:
         """The operator's optional label for this run's data file ("" for none)."""
         return self._file_prefix
