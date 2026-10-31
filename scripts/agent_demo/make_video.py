@@ -8,6 +8,7 @@ Inputs are described by an edit file (JSON):
                   {"card": "Text shown full-screen", "seconds": 2.0}, ... ],
       "transcript": "transcript.jsonl",
       "headlines": [[headline, detail], ...],   # one per narration, in order
+      "extra_narrations": [[epoch, headline, detail], ...],   # optional
       "skip_tools": ["read_readings", ...],     # calls not shown in the overlay
       "title": [...lines...], "end": [...lines...],
       "size": [2560, 1440], "band_top": 1312
@@ -116,23 +117,29 @@ def main() -> int:
     # ── 2. The overlay, in the output timeline ──
     records = [json.loads(line) for line in (base / edit["transcript"]).read_text().splitlines() if line.strip()]
     skip = set(edit.get("skip_tools", []))
-    first_epoch = time_map[0][0]
+    first_epoch = float(edit.get("timer_epoch", time_map[0][0]))
     events: list[str] = []
 
-    narrations = [r for r in records if r["kind"] == "narration"]
+    # The agent's narrations, each with its overlay headline, plus any extra
+    # headlines the edit pins to a moment (to open a clip that starts after
+    # the agent last spoke).
+    spoken = [r for r in records if r["kind"] == "narration"]
+    narrations = [
+        (record["t"], *edit["headlines"][index]) for index, record in enumerate(spoken)
+    ] + [tuple(extra) for extra in edit.get("extra_narrations", [])]
+    narrations.sort(key=lambda item: item[0])
     shown_until = 0.0
-    starts: list[tuple[float, int]] = []
-    for index, record in enumerate(narrations):
-        t = to_out(record["t"])
+    starts: list[tuple[float, str, str]] = []
+    for epoch, headline, detail in narrations:
+        t = to_out(epoch)
         if t is None:
             continue
         start = max(t, shown_until)
-        starts.append((start, index))
+        starts.append((start, headline, detail))
         shown_until = start + MIN_HOLD
     end_of_body = total - edit.get("end_seconds", 7.0)
-    for position, (start, index) in enumerate(starts):
+    for position, (start, headline, detail) in enumerate(starts):
         stop = starts[position + 1][0] if position + 1 < len(starts) else end_of_body
-        headline, detail = edit["headlines"][index]
         text = "{\\c&HFFE066&\\b1}AGENT  {\\c&HFFFFFF&}" + ass_escape(headline)
         if detail:
             text += "\\N{\\fs24\\b0\\c&HC8C8C8&}" + ass_escape(detail)
