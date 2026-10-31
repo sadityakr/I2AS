@@ -1749,6 +1749,18 @@ CONTROL_LIMIT_EXEMPTIONS: dict[tuple[str, str, str], str] = {
         "The source's own protective ceiling; the sourced current is already "
         "bounded, so this only sets headroom, and the instrument clamps it."
     ),
+    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "compliance_A"): (
+        "The SMU's own protective current ceiling; the applied bias is already "
+        "bounded by max_bias_V, so this only caps the current, and the "
+        "instrument clamps it to its range."
+    ),
+    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "nplc"): (
+        "Integration time per conversion: a receive-side setting that costs "
+        "time, sources nothing, and the instrument refuses outside 0.01-10."
+    ),
+    ("SMUVoltageBiasMeasurementVI", "initiate_measurement", "readings_per_point"): (
+        "Dimensionless sample count; it costs time, not energy in the sample."
+    ),
     # -- Closed-loop tuning constants and open-loop heater drive.
     ("SampleTemperatureControllerVI", "set_heater_output", "output_pct"): (
         "Heater drive as a percentage of the range the controller is set to; "
@@ -2108,6 +2120,7 @@ _SIM_MEASUREMENT_DRIVER_CLASSES = {
     "source": f"{PACKAGE}.drivers.sim_keithley_6221.SimKeithley6221",
     "meter": f"{PACKAGE}.drivers.sim_keithley_2182a.SimKeithley2182A",
     "main": f"{PACKAGE}.drivers.sim_camera.SimCamera",
+    "smu": f"{PACKAGE}.drivers.sim_keithley_2400.SimKeithley2400",
 }
 
 

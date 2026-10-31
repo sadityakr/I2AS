@@ -1,0 +1,18 @@
+# Trend checks (the Trend check standard, core/trend_checks.py): advisory
+# judgements over the trend-history store — they report, never enforce.
+trends:
+  refresh_interval_s: 60.0
+  store_live_stale_ticks: 10
+  checks:
+    - key: temperature_temperature
+      low: 1.0
+      high: 320.0
+      window_s: 3600.0
+monitor:
+  # A fast tick: field loops step every few hundred milliseconds here.
+  tick_interval_ms: 250
+  max_vi_errors: 3
+  # This rack is built to be operated by an agent: the gateway server starts
+  # with the app, and a connection may claim up to the session role.
+  gateway_server: true
+  gateway_max_role: session

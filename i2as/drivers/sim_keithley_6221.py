@@ -3,6 +3,7 @@
 import logging
 from typing import TYPE_CHECKING
 
+from i2as.core import sim_environment
 from i2as.core.exceptions import (
     I2ASCommunicationError,
     I2ASInstrumentError,
@@ -53,7 +54,11 @@ class SimKeithley6221:
         Args:
             resource_string: VISA address (e.g. 'GPIB0::22::INSTR'). Ignored.
         """
-        _ = resource_string  # Explicitly ignored per driver contract
+        # The sim-coupling standard (core/sim_environment.py): the only part
+        # of the resource string a sim reads is its optional "@<environment>"
+        # suffix. The current this source pushes is published there, so a sim
+        # voltmeter wired across the same sample can respond to it.
+        self._environment = sim_environment.for_resource(resource_string)
 
         self._source_enabled: bool = False
         self._current: float = 0.0         # Amperes
@@ -341,6 +346,7 @@ class SimKeithley6221:
         self._current = 0.0
         self._source_enabled = False
         self._delta_readings = []
+        self._environment.source_current_A = 0.0
 
     def is_in_compliance(self) -> bool:
         """Return True if the simulated current source is in compliance."""
@@ -423,6 +429,7 @@ class SimKeithley6221:
                 f"{self._fixed_range_A:.3e} A range left with autorange off",
             )
         self._current = float(current)
+        self._environment.source_current_A = self._current
 
     # ------------------------------------------------------------------
     # Safe state (the safe-shutdown standard)
@@ -446,6 +453,7 @@ class SimKeithley6221:
         self._current = 0.0
         self._source_enabled = False
         self._delta_readings = []
+        self._environment.source_current_A = 0.0
 
     def _is_in_safe_state(self) -> bool:
         """Return True when the sim is in the safe idle state defined above.

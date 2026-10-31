@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,10 @@ ENVIRONMENT_SUFFIX_SEPARATOR = "@"
 #: ``tests/test_l0_sim_camera_stage.py`` holds the two together.
 DEFAULT_AMPERES_PER_TESLA = 10.0
 
+#: The sample temperature, in kelvin, an environment reports when no sim
+#: temperature controller has installed a thermal model in it.
+DEFAULT_TEMPERATURE_K = 295.0
+
 
 class SimEnvironment:
     """One shared physical world for coupled sims.
@@ -49,6 +55,15 @@ class SimEnvironment:
             changes. ``0.0`` until a PSU has published.
         amperes_per_tesla: The simulated coil constant that turns that
             current into the field at the sample.
+        source_current_A: The excitation current a sim current source
+            (e.g. the 6221) is pushing through the sample, in amperes — what a
+            sim voltmeter wired across the same sample responds to.
+        temperature_source: The callable a sim temperature controller
+            installs so every other sim reads the sample's temperature from
+            the one thermal model that owns it; ``None`` until one does.
+        samples: The simulated devices on the sample holder, by kind (see
+            ``i2as.core.sim_samples.sample_for``): created on first use and
+            shared by every sim wired to the same device.
     """
 
     def __init__(self, name: str = "") -> None:
@@ -61,6 +76,19 @@ class SimEnvironment:
         self.name = name
         self.psu_current_A: float = 0.0
         self.amperes_per_tesla: float = DEFAULT_AMPERES_PER_TESLA
+        self.source_current_A: float = 0.0
+        self.temperature_source: Callable[[], float] | None = None
+        self.samples: dict[str, Any] = {}
+
+    @property
+    def sample_temperature_K(self) -> float:
+        """The sample's temperature, in kelvin, from the installed thermal model.
+
+        Room temperature (``DEFAULT_TEMPERATURE_K``) when no sim temperature
+        controller has joined this environment — a bench with no cryostat.
+        """
+        source = self.temperature_source
+        return float(source()) if source is not None else DEFAULT_TEMPERATURE_K
 
     @property
     def applied_field_T(self) -> float:
@@ -132,6 +160,7 @@ def for_resource(resource_string: str) -> SimEnvironment:
 
 __all__ = [
     "DEFAULT_AMPERES_PER_TESLA",
+    "DEFAULT_TEMPERATURE_K",
     "ENVIRONMENT_SUFFIX_SEPARATOR",
     "SimEnvironment",
     "for_resource",

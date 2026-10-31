@@ -1,0 +1,92 @@
+# Simulated spintronics cryostat: a VTI with a z-axis superconducting magnet,
+# and two devices from one perpendicular-anisotropy CoFeB/MgO stack on the
+# sample holder — a perpendicular magnetic tunnel junction (p-MTJ) measured
+# at constant voltage by a Keithley 2400, and a Hall cross measured for the
+# anomalous Hall effect by a 6221 current source and a 2182A nanovoltmeter.
+#
+# Every sim joins the sim environment "spin" (the "@spin" suffix, the
+# sim-coupling standard in core/sim_environment.py): the magnet publishes the
+# field, the cryostat publishes the sample temperature, the 6221 publishes the
+# current it pushes, and the 2400 and the 2182A read the devices modelled in
+# core/sim_samples.py. The cryostat starts at 15 K, regulating on the Low
+# heater range ("?T0=15"), as a station left cold overnight does.
+data_directory: "C:/Users/Supervisor/CryoData"
+
+real_drivers:
+  ips_z:
+    class: i2as.drivers.sim_oxford_ips120.SimOxfordIPS120
+    address: "SIM::IPS_Z@spin"
+  lakeshore_vti:
+    class: i2as.drivers.sim_cryostat_lakeshore_335.SimCryostatLakeshore335
+    address: "SIM::LS335?T0=15@spin"
+  keithley_2400:
+    class: i2as.drivers.sim_keithley_2400.SimKeithley2400
+    address: "SIM::K2400@spin"
+  keithley_6221:
+    class: i2as.drivers.sim_keithley_6221.SimKeithley6221
+    address: "SIM::K6221@spin"
+  keithley_2182a:
+    class: i2as.drivers.sim_hall_keithley_2182a.SimHallKeithley2182A
+    address: "SIM::K2182A@spin"
+
+virtual_instruments:
+  magnet_z:
+    class: i2as.virtual_instruments.magnet.superconducting_magnet.SuperconductingMagnetVI
+    drivers: {main: ips_z}
+    vi_type: system
+    init_params:
+      # The sim environment's coil constant, so the field this VI reports is
+      # the field the devices see.
+      amperes_per_tesla: 10.0
+      max_current: 90.0
+      min_current: -90.0
+      default_ramp_rate: 6.0
+      ramp_segments:
+        - {max_current_A: 40.0, rate_A_per_min: 6.0}
+        - {max_current_A: 70.0, rate_A_per_min: 3.0}
+        - {max_current_A: 90.0, rate_A_per_min: 1.0}
+    metadata:
+      role: Out-of-plane field at the sample
+      manufacturer: Oxford Instruments
+      model: IPS120-10
+  temperature:
+    class: i2as.virtual_instruments.temperature.lakeshore_335_sample_temperature_controller.Lakeshore335SampleTemperatureControllerVI
+    drivers: {main: lakeshore_vti}
+    vi_type: system
+    init_params:
+      default_ramp_rate: 3.0
+      tolerance: 0.05
+      # Low is the range that holds the insert below ~50 K; above that the
+      # operator (or agent) selects Medium/High — the insert loses ~7 W at 300 K.
+      initiate_heater_range: LOW
+      min_temperature_K: 1.6
+      max_temperature_K: 320.0
+      max_ramp_rate_K_per_min: 60.0
+    metadata:
+      role: VTI sample-space temperature controller
+      manufacturer: Lakeshore
+      model: 335
+  mtj_bias:
+    class: i2as.virtual_instruments.measurement.smu_voltage_bias_measurement.SMUVoltageBiasMeasurementVI
+    drivers: {smu: keithley_2400}
+    vi_type: measurement
+    init_params:
+      # The p-MTJ's MgO barrier breaks down irreversibly near 1.3 V; the
+      # ceiling keeps every bias this setup applies well inside it.
+      max_bias_V: 1.0
+    metadata:
+      role: p-MTJ constant-voltage transport (TMR, I–V)
+      manufacturer: Keithley
+      model: 2400 SourceMeter
+  hall:
+    class: i2as.virtual_instruments.measurement.dc_separate_measurement.DCSeparateMeasurementVI
+    drivers: {source: keithley_6221, meter: keithley_2182a}
+    vi_type: measurement
+    init_params:
+      # The Hall cross's Ta/CoFeB channel: 1 mA is the electromigration-safe
+      # ceiling for a 5 µm wide bar.
+      max_source_current_A: 1.0e-3
+    metadata:
+      role: CoFeB Hall cross — anomalous Hall effect
+      manufacturer: Keithley
+      model: 6221 + 2182A
