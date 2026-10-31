@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 _MIN_TREND_PANELS = 1
 _MAX_TREND_PANELS = 4
+
+#: The shortest interval, in seconds, between two redraws of the trend panels.
+TREND_REFRESH_MIN_S = 1.0
 _DEFAULT_TREND_PANEL_COUNT = 2
 
 # Default key-selection hints applied to the default trend panels, in
@@ -88,6 +92,8 @@ class TrendsQuadrant(QWidget):
         # states_updated tick, so set_selected_key() at restore time is a
         # harmless no-op that we retry from on_states_updated).
         self._pending_trend_keys: dict[str, str] = {}
+        # When the panels were last redrawn (see on_states_updated).
+        self._last_trend_refresh = float("-inf")
         # Same retry pattern for the DEFAULT (non-restored) trend panels'
         # opportunistic default key selection.
         self._default_trend_key_hints: dict[str, str] = {}
@@ -306,6 +312,14 @@ class TrendsQuadrant(QWidget):
             state: ``{vi_name: {field: value, ...}}`` from the Orchestrator.
         """
         self._history.record(state)
+        # Every tick is recorded, but the panels are redrawn at most once per
+        # TREND_REFRESH_MIN_S: a setup ticking fast (field loops stepping every
+        # few hundred ms) must not spend the GUI thread repainting trends,
+        # which starves everything else on it — the gateway server included.
+        now = time.monotonic()
+        if now - self._last_trend_refresh < TREND_REFRESH_MIN_S and not self._pending_trend_keys:
+            return
+        self._last_trend_refresh = now
         for panel_id, panel in self._trend_panels.items():
             panel.refresh()
 

@@ -194,6 +194,14 @@ class MonitorHistory:
         if now is None:
             now = time.time()
         cutoff = now - window_s
-        times = [t for t, v in points if t >= cutoff]
-        values = [v for t, v in points if t >= cutoff]
-        return times, values
+        # Points are recorded in time order, so the window is a suffix: walk
+        # back from the newest point and stop at the cutoff. Proportional to
+        # the window, not to the retained history — a 15-minute trend redrawn
+        # every tick must not rescan a day of points each time.
+        window: list[tuple[float, float]] = []
+        for t, v in reversed(points):
+            if t < cutoff:
+                break
+            window.append((t, v))
+        window.reverse()
+        return [t for t, _ in window], [v for _, v in window]

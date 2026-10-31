@@ -191,3 +191,53 @@ def test_record_flat_matches_record_bool_handling():
     times, values = history.series("vi_flag")
     assert times == []
     assert values == []
+
+
+def test_windowed_series_matches_a_full_scan_and_reads_only_the_window() -> None:
+    """series(window_s=...) is the suffix of the history a full filter would return."""
+    from i2as.gui.monitor_history import MonitorHistory
+
+    history = MonitorHistory(retention_s=3600.0, tick_interval_s=0.25)
+    points = [(1000.0 + 0.25 * i, float(i)) for i in range(4000)]
+    for t, v in points:
+        history._history.setdefault("vi_x", __import__("collections").deque(maxlen=history._maxlen)).append((t, v))
+    now = points[-1][0]
+    times, values = history.series("vi_x", window_s=60.0, now=now)
+    expected = [(t, v) for t, v in points if t >= now - 60.0]
+    assert list(zip(times, values)) == expected
+    assert len(times) == 241
+
+
+def test_trend_panels_redraw_at_most_once_per_interval(qtbot, monkeypatch) -> None:
+    """A fast tick records every state but repaints the trends at most once per second."""
+    import i2as.gui.trends_quadrant as tq
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(tq.time, "monotonic", lambda: clock["t"])
+    quadrant = tq.TrendsQuadrant.__new__(tq.TrendsQuadrant)
+    refreshed = []
+
+    class _Panel:
+        def refresh(self):
+            refreshed.append(clock["t"])
+
+        def selected_key(self):
+            return None
+
+    class _History:
+        def __init__(self):
+            self.recorded = 0
+
+        def record(self, _state):
+            self.recorded += 1
+
+    quadrant._history = _History()
+    quadrant._trend_panels = {"trend_0": _Panel()}
+    quadrant._pending_trend_keys = {}
+    quadrant._default_trend_key_hints = {}
+    quadrant._last_trend_refresh = float("-inf")
+    for _ in range(12):  # 3 s of 250 ms ticks
+        quadrant.on_states_updated({"vi": {"x": 1.0}})
+        clock["t"] += 0.25
+    assert quadrant._history.recorded == 12
+    assert len(refreshed) == 3
