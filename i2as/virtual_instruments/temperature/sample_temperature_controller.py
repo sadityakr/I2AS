@@ -490,7 +490,19 @@ class SampleTemperatureControllerVI(TemperatureControllerBase, RampableVI):
         building the Station changes nothing the instrument is doing, and
         the operator decides when the loop is handed to I2AS by
         pressing Initiate.
+
+        A loop already in AUTO is left exactly as it is: initiate() is also
+        each run's claim on the controller, and a claim must never move the
+        setpoint of a cryostat that is already regulating.
         """
+        # Idempotent for a loop that is already closed. initiate() is also
+        # how every procedure CLAIMS the controller at run start (see
+        # PhasePlan.claim_commands), so it is called on an instrument already
+        # regulating where the operator or an agent put it: re-pinning the
+        # setpoint there would move a regulated target to the rounded present
+        # reading — and, on a sagging cryostat, make the sag permanent.
+        if self._driver.get_heater_mode() == "AUTO":  # type: ignore[attr-defined]
+            return
         current_T = self._driver.get_temperature()  # type: ignore[attr-defined]
         self._driver.set_setpoint(round(current_T))  # type: ignore[attr-defined]
         self._driver.set_heater_mode("AUTO")  # type: ignore[attr-defined]

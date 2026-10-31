@@ -682,3 +682,41 @@ class TestDCSeparateMeasurementVI:
         """current_A is loopable via set_source_current (the reading loop)."""
         vi = self._make_vi(source_driver, meter_driver)
         assert vi.reading_setters == {"current_A": "set_source_current"}
+
+
+class TestTemperatureClaimIsIdempotent:
+    """initiate() is every run's claim on the controller: it must not disturb a regulating loop.
+
+    Regression for a cryostat that collapsed from 300 K in the middle of a
+    measurement: each run start re-initiated the controller, which reset the
+    heater range from High to the configured Low and re-pinned the setpoint
+    to the (sagging) present reading.
+    """
+
+    def _vi(self, driver, **params):
+        from i2as.virtual_instruments.temperature.lakeshore_335_sample_temperature_controller import (
+            Lakeshore335SampleTemperatureControllerVI,
+        )
+
+        return Lakeshore335SampleTemperatureControllerVI({"main": driver}, initiate_heater_range="LOW", **params)
+
+    def test_a_regulating_loop_keeps_its_range_and_setpoint(self, lakeshore_driver):
+        vi = self._vi(lakeshore_driver)
+        vi.initiate()
+        lakeshore_driver.set_heater_range("HIGH")
+        lakeshore_driver.set_setpoint(300.0)
+        lakeshore_driver._temperature = 298.6
+        vi.initiate()  # the next run's claim
+        assert vi.heater_range() == "HIGH"
+        assert lakeshore_driver.get_setpoint() == pytest.approx(300.0)
+        assert vi.heater_mode() == "AUTO"
+
+    def test_a_loop_left_in_manual_is_still_taken_over(self, lakeshore_driver):
+        vi = self._vi(lakeshore_driver)
+        lakeshore_driver.set_heater_range("MEDIUM")
+        vi.set_heater_mode("MANUAL")
+        lakeshore_driver._temperature = 77.4
+        vi.initiate()
+        assert vi.heater_mode() == "AUTO"
+        assert lakeshore_driver.get_setpoint() == pytest.approx(77.0)
+        assert vi.heater_range() == "MEDIUM"  # powered already: kept

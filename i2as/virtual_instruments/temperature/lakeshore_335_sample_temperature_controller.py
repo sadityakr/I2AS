@@ -105,14 +105,22 @@ class Lakeshore335SampleTemperatureControllerVI(SampleTemperatureControllerVI):
 
         Ordering mirrors the inherited method's reasoning: the loop is put in
         order first, and only then is power allowed to reach the heater.
-        ``standby()`` is deliberately NOT the mirror of this: it leaves the
+        A range that is already powered is kept — see the body: a run's claim
+        must not lower the range the controller is holding its temperature
+        with. ``standby()`` is deliberately NOT the mirror of this: it leaves the
         range where it stands, because switching heater power back off is the
         operator's call (the range is also the gate they use by hand), and
         the inherited standby has already taken the loop out of circuit and
         commanded zero output.
         """
         super().initiate()
-        self._driver.set_heater_range(self._initiate_heater_range)  # type: ignore[attr-defined]
+        # Only switch power ON. A range already powered was chosen by the
+        # operator or an agent for the temperature it is holding (Low cannot
+        # hold 300 K on most inserts): initiate() is also every run's claim on
+        # this controller, and lowering the range there would let the
+        # cryostat sag in the middle of a measurement.
+        if self._driver.get_heater_range() == "OFF":  # type: ignore[attr-defined]
+            self._driver.set_heater_range(self._initiate_heater_range)  # type: ignore[attr-defined]
 
     def _cached_choice(
         self, field: str, choices: dict[str, Any], fallback: Any
